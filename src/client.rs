@@ -5,6 +5,10 @@ pub mod payments {
     tonic::include_proto!("payments");
 }
 
+pub mod raft_service {
+    tonic::include_proto!("raft_service");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = BitcoinClient::connect("http://[::1]:50051").await?;
