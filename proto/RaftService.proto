@@ -2,7 +2,52 @@ syntax = "proto3";
 package RaftService;
 
 service Raft {
-
+  rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
+  rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
 }
+
+message Transaction {
+  string sender = 1;
+  string receiver = 2;
+  double amount = 3;
+  string id = 4;
+}
+message LogEntry {
+  int32 logIndex = 1;
+  int32 term = 2;
+  Transaction t = 3;
+}
+
+message Log {
+  repeated LogEntry log = 1;
+}
+
+message AppendEntriesArgument {
+  int32 leadersTerm = 1;
+  int32 prevLogIndex = 2;
+  int32 leadersId = 3;
+  int32 prevLogTerm = 4;
+  Log entriesToAppend = 5;
+  int32 leadersCommit = 6;
+}
+
+message RequestVoteArguments {
+  int32 candidatesTerm = 1;
+  int32 candidateId = 2;
+  int32 lastLogIndex = 3;
+  int32 lastLogTerm = 4;
+}
+
+message AppendEntriesResult {
+  int32 currentTerm = 1;
+  bool isSuccessFull = 2;
+}
+message RequestVoteResult {
+  int32 currentTerm = 1;
+  bool isVoteGranted = 2;
+}
+
+
+
 
 
