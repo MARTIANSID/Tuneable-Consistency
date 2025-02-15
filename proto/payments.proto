@@ -10,9 +10,6 @@ message BTCPaymentRequest {
     string to_addr   = 2;
     uint32 amount   = 3;
 }
-message Test {
-    
-}
 
 message BTCPaymentResponse {
     bool   successful = 1;
