@@ -2,8 +2,17 @@ syntax = "proto3";
 package RaftService;
 
 service Raft {
+  rpc SendTransaction(ClientMessage) returns (Empty);
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
+}
+
+message Empty{
+
+}
+
+message ClientMessage {
+  Transaction t = 1;
 }
 
 message Transaction {
