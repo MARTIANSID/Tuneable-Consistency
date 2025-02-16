@@ -33,16 +33,7 @@ pub struct RaftService {
 
 impl RaftService {
     pub async fn new(server_id : i32) -> Result<Self, Box<dyn Error>> {
-
         // creating peers vector
-
-        let addresses = ["[::1]:50051", "[::1]:50052", "[::1]:50053","[::1]:50054","[::1]:50055"];
-        let mut peers : Vec<RaftClient<Channel>> = vec![];
-
-        for address in addresses.iter(){
-            let mut client = RaftClient::connect(format!("http://{address}")).await?;
-            peers.push(client);
-        }
         Ok(RaftService {
             current_term:Mutex::new(0),
             voted_for: Mutex::new(None),
@@ -77,7 +68,7 @@ impl Raft for RaftService {
 }
 
 // for now fixing the number of threads
-#[tokio::main]
+// #[tokio::main]
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // starting 5 servers
@@ -89,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for addr in addresses {
         let addr = addr.parse()?;
-        let raft_service = RaftService::new(server_id);
+        let raft_service = RaftService::new(server_id).await?;
         servers.push(tokio::spawn(async move {
             println!("Server listening on {:?}", addr);
             Server::builder()
