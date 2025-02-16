@@ -50,11 +50,12 @@ impl Raft for RaftService {
     }
     async fn send_transaction(&self, request: Request<ClientMessage>) -> Result<Response<Empty>, Status> {
         println!("Got a request: {:?}", request);
-        Ok(Response::new(Empty {
-            data: 2
-        })).expect("TODO: panic message");
+        let result = Empty {
+            data : 2
+        };
 
-        todo!()
+        Ok(Response::new(result))
+
     }
 }
 

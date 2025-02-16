@@ -28,5 +28,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let response = client.send_transaction(request).await?;
+    println!("{}",response.into_inner().data);
     Ok(())
 }
