@@ -1,20 +1,40 @@
+use std::sync::{Arc, Mutex};
+// imports
 use tonic::{transport::Server, Request, Response, Status};
-
-
-
 use raft_service::raft_server::{RaftServer, Raft};
 use crate::raft_service::{AppendEntriesArgument, AppendEntriesResult, ClientMessage, RequestVoteArguments, RequestVoteResult, Empty};
+use utilities::log;
+use crate::utilities::log::Log;
+
+// modules
+mod utilities;
 
 
 
 pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
+// #[derive(Debug, Default)]
 
+pub struct RaftService {
+    current_term : i32,
+    voted_for: Option<i32>,
+    log :  Arc<Mutex<Vec<Log>>>,
+    commit_index : i32,
+    last_applied: i32,
+}
 
-
-#[derive(Debug, Default)]
-pub struct RaftService {}
+impl RaftService {
+    pub fn new() -> Self {
+        RaftService {
+            current_term: 0,
+            voted_for: None,
+            log: Arc::new(Mutex::new(Vec::new())),
+            commit_index : -1,
+            last_applied: 0,
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Raft for RaftService {
@@ -40,7 +60,7 @@ impl Raft for RaftService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let raft_service = RaftService::default();
+    let raft_service = RaftService::new();
     Server::builder().add_service(RaftServer::new(raft_service)).serve(addr).await?;
     Ok(())
 }
