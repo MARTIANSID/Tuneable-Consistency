@@ -32,9 +32,9 @@ pub struct RaftService {
 }
 
 impl RaftService {
-    pub async fn new(server_id : i32) -> Result<Self, Box<dyn Error>> {
+    pub fn new(server_id : i32) -> Self {
         // creating peers vector
-        Ok(RaftService {
+        RaftService {
             current_term:Mutex::new(0),
             voted_for: Mutex::new(None),
             log: Arc::new(Mutex::new(Vec::new())),
@@ -45,7 +45,7 @@ impl RaftService {
             match_index: Arc::new(Mutex::new([0,0,0,0,0])),
             peers,
             server_id
-        })
+        }
     }
 }
 
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for addr in addresses {
         let addr = addr.parse()?;
-        let raft_service = RaftService::new(server_id).await?;
+        let raft_service = RaftService::new(server_id);
         servers.push(tokio::spawn(async move {
             println!("Server listening on {:?}", addr);
             Server::builder()
