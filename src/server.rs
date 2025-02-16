@@ -1,10 +1,14 @@
+use std::error::Error;
 // imports
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
+use tonic::transport::Channel;
 use raft_service::raft_server::{RaftServer, Raft};
 use crate::raft_service::{AppendEntriesArgument, AppendEntriesResult, ClientMessage, RequestVoteArguments, RequestVoteResult, Empty};
+use crate::raft_service::raft_client::RaftClient;
 use crate::utilities::log::Log;
+use crate::utilities::statusofserver::StatusOfServer;
 
 // modules
 mod utilities;
@@ -14,34 +18,43 @@ pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
 // #[derive(Debug, Default)]
-enum StatusOfServer {
-    LEADER,
-    CANDIDATE,
-    FOLLOWER,
-}
 pub struct RaftService {
-    current_term : i32,
-    voted_for: Option<i32>,
+    current_term : Mutex<i32>,
+    voted_for: Mutex<Option<i32>>,
     log :  Arc<Mutex<Vec<Log>>>,
-    commit_index : i32,
-    last_applied: i32,
-    status_of_server: StatusOfServer,
+    commit_index : Mutex<i32>,
+    last_applied: Mutex<i32>,
+    status_of_server: Mutex<StatusOfServer>,
     next_index: Arc<Mutex<[i32; 5]>>,
     match_index: Arc<Mutex<[i32; 5]>>,
+    peers : Vec<RaftClient<Channel>>,
+    server_id : i32
 }
 
 impl RaftService {
-    pub fn new() -> Self {
-        RaftService {
-            current_term: 0,
-            voted_for: None,
-            log: Arc::new(Mutex::new(Vec::new())),
-            commit_index : -1,
-            last_applied: -1,
-            status_of_server : StatusOfServer::FOLLOWER,
-            next_index : Arc::new(Mutex::new([0,0,0,0,0])),
-            match_index: Arc::new(Mutex::new([0,0,0,0,0]))
+    pub async fn new(server_id : i32) -> Result<Self, Box<dyn Error>> {
+
+        // creating peers vector
+
+        let addresses = ["[::1]:50051", "[::1]:50052", "[::1]:50053","[::1]:50054","[::1]:50055"];
+        let mut peers : Vec<RaftClient<Channel>> = vec![];
+
+        for address in addresses.iter(){
+            let mut client = RaftClient::connect(format!("http://{address}")).await?;
+            peers.push(client);
         }
+        Ok(RaftService {
+            current_term:Mutex::new(0),
+            voted_for: Mutex::new(None),
+            log: Arc::new(Mutex::new(Vec::new())),
+            commit_index : Mutex::new(0),
+            last_applied: Mutex::new(0),
+            status_of_server : Mutex::new(StatusOfServer::FOLLOWER),
+            next_index : Arc::new(Mutex::new([0,0,0,0,0])),
+            match_index: Arc::new(Mutex::new([0,0,0,0,0])),
+            peers,
+            server_id
+        })
     }
 }
 
@@ -72,9 +85,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addresses = ["[::1]:50051", "[::1]:50052", "[::1]:50053","[::1]:50054","[::1]:50055"];
     let mut servers: Vec<JoinHandle<()>> = Vec::new();
 
+    let mut server_id : i32 = 0;
+
     for addr in addresses {
         let addr = addr.parse()?;
-        let raft_service = RaftService::new();
+        let raft_service = RaftService::new(server_id);
         servers.push(tokio::spawn(async move {
             println!("Server listening on {:?}", addr);
             Server::builder()
@@ -83,10 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .unwrap();
         }));
+        server_id += 1;
     }
     for handle in servers {
         handle.await.unwrap();
     }
-
     Ok(())
 }
