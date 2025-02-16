@@ -1,6 +1,6 @@
 use std::error::Error;
 // imports
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
 use tonic::transport::Channel;
@@ -19,12 +19,12 @@ pub mod raft_service {
 }
 // #[derive(Debug, Default)]
 pub struct RaftService {
-    current_term : Mutex<i32>,
-    voted_for: Mutex<Option<i32>>,
+    current_term : Arc<Mutex<i32>>,
+    voted_for: Arc<RwLock<Option<i32>>>,
     log :  Arc<Mutex<Vec<Log>>>,
-    commit_index : Mutex<i32>,
-    last_applied: Mutex<i32>,
-    status_of_server: Mutex<StatusOfServer>,
+    commit_index : Arc<Mutex<i32>>,
+    last_applied: Arc<Mutex<i32>>,
+    status_of_server: Arc<Mutex<StatusOfServer>>,
     next_index: Arc<Mutex<[i32; 5]>>,
     match_index: Arc<Mutex<[i32; 5]>>,
     peers : Vec<RaftClient<Channel>>,
@@ -35,12 +35,12 @@ impl RaftService {
     pub fn new(server_id : i32) -> Self {
         // creating peers vector
         RaftService {
-            current_term:Mutex::new(0),
-            voted_for: Mutex::new(None),
+            current_term:Arc::new(Mutex::new(0)),
+            voted_for: Arc::new(RwLock::new(None)),
             log: Arc::new(Mutex::new(Vec::new())),
-            commit_index : Mutex::new(0),
-            last_applied: Mutex::new(0),
-            status_of_server : Mutex::new(StatusOfServer::FOLLOWER),
+            commit_index : Arc::new(Mutex::new(0)),
+            last_applied: Arc::new(Mutex::new(0)),
+            status_of_server : Arc::new(Mutex::new(StatusOfServer::FOLLOWER)),
             next_index : Arc::new(Mutex::new([0,0,0,0,0])),
             match_index: Arc::new(Mutex::new([0,0,0,0,0])),
             peers,
