@@ -15,13 +15,21 @@ pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
 // #[derive(Debug, Default)]
-
+enum StatusOfServer {
+    LEADER,
+    CANDIDATE,
+    FOLLOWER,
+}
 pub struct RaftService {
     current_term : i32,
     voted_for: Option<i32>,
     log :  Arc<Mutex<Vec<Log>>>,
     commit_index : i32,
     last_applied: i32,
+    status_of_server: StatusOfServer,
+    next_index: Arc<Mutex<[i32; 5]>>,
+    match_index: Arc<Mutex<[i32; 5]>>,
+
 }
 
 impl RaftService {
@@ -31,7 +39,10 @@ impl RaftService {
             voted_for: None,
             log: Arc::new(Mutex::new(Vec::new())),
             commit_index : -1,
-            last_applied: 0,
+            last_applied: -1,
+            status_of_server : StatusOfServer::FOLLOWER,
+            next_index : Arc::new(Mutex::new([0,0,0,0,0])),
+            match_index: Arc::new(Mutex::new([0,0,0,0,0]))
         }
     }
 }
@@ -50,9 +61,7 @@ impl Raft for RaftService {
         let result = Empty {
             data : 2
         };
-
         Ok(Response::new(result))
-
     }
 }
 
