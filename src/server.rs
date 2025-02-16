@@ -3,8 +3,9 @@ use tonic::{transport::Server, Request, Response, Status};
 use payments::bitcoin_server::{Bitcoin, BitcoinServer};
 use payments::{BtcPaymentResponse, BtcPaymentRequest};
 
+
 use raft_service::raft_server::{RaftServer, Raft};
-use crate::raft_service::{AppendEntriesArgument, AppendEntriesResult, ClientMessage, Empty, RequestVoteArguments, RequestVoteResult};
+use crate::raft_service::{AppendEntriesArgument, AppendEntriesResult, ClientMessage, RequestVoteArguments, RequestVoteResult, Empty};
 
 pub mod payments {
     tonic::include_proto!("payments");
@@ -18,6 +19,7 @@ pub mod raft_service {
 #[derive(Debug, Default)]
 pub struct BitcoinService {}
 
+#[derive(Debug, Default)]
 pub struct RaftService {}
 
 #[tonic::async_trait]
@@ -37,7 +39,7 @@ impl Bitcoin for BitcoinService {
         Ok(Response::new(reply))
     }
 }
-
+#[tonic::async_trait]
 impl Raft for RaftService {
     async fn append_entries(&self, request: Request<AppendEntriesArgument>) -> Result<Response<AppendEntriesResult>, Status> {
         todo!()
@@ -47,6 +49,11 @@ impl Raft for RaftService {
         todo!()
     }
     async fn send_transaction(&self, request: Request<ClientMessage>) -> Result<Response<Empty>, Status> {
+        println!("Got a request: {:?}", request);
+        Ok(Response::new(Empty {
+            data: 2
+        })).expect("TODO: panic message");
+
         todo!()
     }
 }
@@ -55,12 +62,7 @@ impl Raft for RaftService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let btc_service = BitcoinService::default();
-
-    Server::builder()
-        .add_service(BitcoinServer::new(btc_service))
-        .serve(addr)
-        .await?;
-
+    let raft_service = RaftService::default();
+    Server::builder().add_service(RaftServer::new(raft_service)).serve(addr).await?;
     Ok(())
 }

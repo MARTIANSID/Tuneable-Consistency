@@ -8,7 +8,7 @@ service Raft {
 }
 
 message Empty{
-
+  int32 data = 1;
 }
 
 message ClientMessage {
