@@ -12,8 +12,6 @@ pub mod raft_service {
 }
 
 
-#[derive(Debug, Default)]
-pub struct BitcoinService {}
 
 #[derive(Debug, Default)]
 pub struct RaftService {}
