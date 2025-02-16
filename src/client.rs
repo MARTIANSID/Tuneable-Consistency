@@ -1,14 +1,9 @@
 use tonic::Request;
-use payments::bitcoin_client::BitcoinClient;
-use payments::BtcPaymentRequest;
 
 use raft_service::raft_client::RaftClient;
 use raft_service::ClientMessage;
 use raft_service::Transaction;
 
-pub mod payments {
-    tonic::include_proto!("payments");
-}
 
 pub mod raft_service {
     tonic::include_proto!("raft_service");
