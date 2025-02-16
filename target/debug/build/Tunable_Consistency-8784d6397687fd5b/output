@@ -1,4 +1,0 @@
-cargo:rerun-if-changed=proto/payments.proto
-cargo:rerun-if-changed=proto
-cargo:rerun-if-changed=proto/raft_service.proto
-cargo:rerun-if-changed=proto
