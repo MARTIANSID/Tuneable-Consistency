@@ -13,6 +13,11 @@ use crate::utilities::statusofserver::StatusOfServer;
 // modules
 mod utilities;
 
+// Add to existing imports
+use tokio::sync::mpsc;
+use utilities::timer::Timer;
+use tokio::time::{sleep, Duration};
+
 
 pub mod raft_service {
     tonic::include_proto!("raft_service");
@@ -27,7 +32,7 @@ pub struct RaftService {
     status_of_server: Arc<Mutex<StatusOfServer>>,
     next_index: Arc<Mutex<[i32; 5]>>,
     match_index: Arc<Mutex<[i32; 5]>>,
-    peers : Vec<RaftClient<Channel>>,
+    // peers : Vec<RaftClient<Channel>>,
     server_id : i32
 }
 
@@ -43,7 +48,7 @@ impl RaftService {
             status_of_server : Arc::new(Mutex::new(StatusOfServer::FOLLOWER)),
             next_index : Arc::new(Mutex::new([0,0,0,0,0])),
             match_index: Arc::new(Mutex::new([0,0,0,0,0])),
-            peers,
+            // peers,
             server_id
         }
     }
@@ -67,6 +72,19 @@ impl Raft for RaftService {
     }
 }
 
+async fn test_timer() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut timer = Timer::new(Duration::from_millis(1000), tx);
+    
+    timer.start();
+
+    tokio::select! {
+        _ = rx.recv() => {
+            println!("Timer has completed")
+        }
+    }
+}
+
 // for now fixing the number of threads
 // #[tokio::main]
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -77,6 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut servers: Vec<JoinHandle<()>> = Vec::new();
 
     let mut server_id : i32 = 0;
+    let test_handle = tokio::spawn(async {
+        test_timer().await;
+    });
+
+   
 
     for addr in addresses {
         let addr = addr.parse()?;
@@ -96,3 +119,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+

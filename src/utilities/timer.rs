@@ -1,49 +1,45 @@
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
-use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
 
-pub struct Timer<F>
-where
-    F: Fn() + Send + 'static,
-{
+pub struct Timer {
     duration: Duration,
-    callback: F,
-    handle: Option<JoinHandle<()>>,
-    is_running: Arc<Mutex<bool>>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    expired_tx: mpsc::Sender<()>,
 }
 
-impl<F> Timer<F>
-where
-    F: Fn() + Send + 'static,
-{
-    pub fn new(duration: Duration, callback: F) -> Self {
-        Self {
+impl Timer {
+    pub fn new(duration: Duration, expired_tx: mpsc::Sender<()>) -> Self {
+        Timer {
             duration,
-            callback,
-            handle: None,
-            is_running: Arc::new(Mutex::new(false)),
+            cancel_tx: None,
+            expired_tx,
         }
     }
 
     pub fn start(&mut self) {
-        let is_running = Arc::clone(&self.is_running);
-        let callback = &self.callback;
-        let duration = self.duration;
-        *is_running.lock().unwrap() = true;
+        self.stop();
 
-        self.handle = Some(tokio::spawn(async move {
-            sleep(duration).await;
-            if *is_running.lock().unwrap() {
-                callback();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let expired_tx = self.expired_tx.clone();
+        let duration = self.duration;
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sleep(duration) => {
+                    let _ = expired_tx.send(()).await;
+                }
+                _ = cancel_rx => {
+                }
             }
-        }));
+        });
+
+        self.cancel_tx = Some(cancel_tx);
     }
 
     pub fn stop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(());
         }
-        *self.is_running.lock().unwrap() = false;
     }
 
     pub fn restart(&mut self) {
@@ -52,19 +48,8 @@ where
     }
 }
 
-// Example Usage:
-#[tokio::main]
-async fn main() {
-    let mut timer = Timer::new(
-        Duration::from_secs(5),
-        || println!("Timer completed!"),
-    );
-
-    timer.start();
-    sleep(Duration::from_secs(2)).await;
-    println!("Restarting timer...");
-    timer.restart();
-    sleep(Duration::from_secs(6)).await;
-    println!("Stopping timer...");
-    timer.stop();
+impl Drop for Timer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
