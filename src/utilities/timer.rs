@@ -1,73 +1,55 @@
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
-use std::sync::Arc;
 
 pub struct Timer {
     duration: Duration,
-    callback: Arc<dyn Fn() + Send + Sync>,
-    is_running: Arc<std::sync::atomic::AtomicBool>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    expired_tx: mpsc::Sender<()>,
 }
 
 impl Timer {
-    pub fn new<F>(duration: Duration, callback: F) -> Self
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
+    pub fn new(duration: Duration, expired_tx: mpsc::Sender<()>) -> Self {
         Timer {
             duration,
-            callback: Arc::new(callback),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_tx: None,
+            expired_tx,
         }
     }
 
-    pub async fn start(&self) {
-        if self.is_running.load(std::sync::atomic::Ordering::SeqCst) {
-            println!("Timer is already running.");
-            return;
-        }
-        self.is_running.store(true, std::sync::atomic::Ordering::SeqCst);
+    pub fn start(&mut self) {
+        self.stop();
 
-        let callback = Arc::clone(&self.callback);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let expired_tx = self.expired_tx.clone();
         let duration = self.duration;
 
         tokio::spawn(async move {
-            sleep(duration).await;
-            callback();
+            tokio::select! {
+                _ = sleep(duration) => {
+                    let _ = expired_tx.send(()).await;
+                }
+                _ = cancel_rx => {
+                }
+            }
         });
 
-        println!("Timer started for {:?}", duration);
+        self.cancel_tx = Some(cancel_tx);
     }
 
-    pub async fn stop(&self) {
-        if !self.is_running.load(std::sync::atomic::Ordering::SeqCst) {
-            println!("Timer is not running.");
-            return;
+    pub fn stop(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(());
         }
-        self.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
-        println!("Timer stopped.");
     }
 
-    pub async fn restart(&self) {
-        println!("Restarting the timer...");
-        self.stop().await;
-        self.start().await;
+    pub fn restart(&mut self) {
+        self.stop();
+        self.start();
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let timer = Timer::new(Duration::from_secs(5), || {
-        println!("Timer completed!");
-    });
-
-    timer.start().await;
-
-    // Simulate waiting before stopping
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    timer.stop().await;
-
-    // Restart the timer
-    timer.restart().await;
-
-    // Allow time for the timer to finish
-    tokio::time::sleep(Duration::from_secs(10)).await;
+impl Drop for Timer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
