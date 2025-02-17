@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
-use tokio::sync::mpsc;
+// use tokio::sync::mpsc;
 // imports
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -17,6 +17,7 @@ use crate::raft_service::raft_client::RaftClient;
 use crate::utilities::log::Log;
 use crate::utilities::statusofserver::StatusOfServer;
 use utilities::timer::Timer;
+use tokio::sync::mpsc::{self, Sender, Receiver};
 
 // modules
 mod utilities;
@@ -39,12 +40,54 @@ pub struct RaftService {
     server_id : i32,
     test : Arc<Mutex<i32>>,
     addresses : [&'static str; 5],
-    election_timer : Option<Timer>
+    election_timer : Option<Timer>,
+    election_timeout_tx: Sender<()>
+
 }
 
+
 impl RaftService {
+    pub fn start_election(&self) {
+        let mut status = self.status_of_server.lock().unwrap();
+        if *status == StatusOfServer::FOLLOWER {
+            *status = StatusOfServer::CANDIDATE;
+            println!("Server {} is now a candidate!", self.server_id);
+            // More election logic will go here
+        }
+    }
+
+    pub fn start_election_timer(&mut self, mut election_timeout_rx: mpsc::Receiver<()>) {
+        let (election_timeout_tx, status_of_server, server_id) = (
+            self.election_timeout_tx.clone(),
+            Arc::clone(&self.status_of_server),
+            self.server_id,
+        );
+
+        // Create a random election timeout duration between 3 to 5 seconds
+        let timeout_duration = Duration::from_secs(3 );
+
+        let mut timer = Timer::new(timeout_duration, election_timeout_tx);
+        timer.start();
+
+        self.election_timer = Some(timer);
+        tokio::spawn(async move {
+            loop {
+                // Wait for the timeout signal using the receiver
+                let _ = election_timeout_rx.recv().await;
+
+                let mut status = status_of_server.lock().unwrap();
+                if *status == StatusOfServer::FOLLOWER {
+                    println!("Election timeout! Server {} starting election...", server_id);
+                    *status = StatusOfServer::CANDIDATE;
+                }
+            }
+        });
+    }
+
     pub fn new(server_id : i32) -> Self {
         // creating peers vector
+        let (election_timeout_tx, election_timeout_rx) = mpsc::channel(1); // Create a channel for timeouts
+
         let mut service = RaftService {
             current_term: Arc::new(Mutex::new(0)),
             voted_for: Arc::new(RwLock::new(None)),
@@ -58,25 +101,15 @@ impl RaftService {
             server_id,
             test: Arc::new(Mutex::new(0)),
             addresses: ["[::1]:50051", "[::1]:50052", "[::1]:50053", "[::1]:50054", "[::1]:50055"],
-            election_timer : None
+            election_timer: None,
+            election_timeout_tx,
         };
-        service
 
-        // let (expired_tx, mut expired_rx) = mpsc::channel(1);
-        //
-        // let mut timer = Timer::new(Duration::from_secs(5), expired_tx);
-        //
-        // service.election_timer = Some(timer);
-        //
-        // service.election_timer.as_ref().unwrap().start();
-        //
-        // let service = Arc::new(Mutex::new(service)); // Wrap service in Arc<Mutex<RaftService>>
-        // Clone the Arc to share ownership
-        // service.into_inner().unwrap()
+        service.start_election_timer(election_timeout_rx);
+        service
+    
     }
-    pub fn start_election(&self) {
-        println!("Starting election");
-    }
+   
 }
 
 #[tonic::async_trait]

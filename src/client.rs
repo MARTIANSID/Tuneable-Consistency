@@ -9,7 +9,7 @@ pub mod raft_service {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut client = RaftClient::connect("http://[::1]:50051").await?;
+    let client = RaftClient::connect("http://[::1]:50051").await?;
 
     let transactions = vec![
         ClientMessage {
