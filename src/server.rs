@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::error::Error;
+use tokio::sync::mpsc;
 // imports
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use tokio::time::sleep;
 use std::time::Duration;
 use prost::Message;
+use tokio::task;
 use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
 use tonic::transport::Channel;
@@ -36,29 +39,40 @@ pub struct RaftService {
     server_id : i32,
     test : Arc<Mutex<i32>>,
     addresses : [&'static str; 5],
-    election_timer : Timer
+    election_timer : Option<Timer>
 }
 
 impl RaftService {
     pub fn new(server_id : i32) -> Self {
         // creating peers vector
-        RaftService {
-            current_term:Arc::new(Mutex::new(0)),
+        let mut service = RaftService {
+            current_term: Arc::new(Mutex::new(0)),
             voted_for: Arc::new(RwLock::new(None)),
             log: Arc::new(Mutex::new(Vec::new())),
-            commit_index : Arc::new(Mutex::new(0)),
+            commit_index: Arc::new(Mutex::new(0)),
             last_applied: Arc::new(Mutex::new(0)),
-            status_of_server : Arc::new(Mutex::new(StatusOfServer::FOLLOWER)),
-            next_index : Arc::new(Mutex::new([0,0,0,0,0])),
-            match_index: Arc::new(Mutex::new([0,0,0,0,0])),
-            peers : HashMap::new(),
+            status_of_server: Arc::new(Mutex::new(StatusOfServer::FOLLOWER)),
+            next_index: Arc::new(Mutex::new([0, 0, 0, 0, 0])),
+            match_index: Arc::new(Mutex::new([0, 0, 0, 0, 0])),
+            peers: HashMap::new(),
             server_id,
-            test : Arc::new(Mutex::new(0)),
-            addresses : ["[::1]:50051", "[::1]:50052", "[::1]:50053","[::1]:50054","[::1]:50055"],
-            election_timer : Timer::new(Duration::from_millis(500),|| {
-                
-            })
-        }
+            test: Arc::new(Mutex::new(0)),
+            addresses: ["[::1]:50051", "[::1]:50052", "[::1]:50053", "[::1]:50054", "[::1]:50055"],
+            election_timer : None
+        };
+        service
+
+        // let (expired_tx, mut expired_rx) = mpsc::channel(1);
+        //
+        // let mut timer = Timer::new(Duration::from_secs(5), expired_tx);
+        //
+        // service.election_timer = Some(timer);
+        //
+        // service.election_timer.as_ref().unwrap().start();
+        //
+        // let service = Arc::new(Mutex::new(service)); // Wrap service in Arc<Mutex<RaftService>>
+        // Clone the Arc to share ownership
+        // service.into_inner().unwrap()
     }
     pub fn start_election(&self) {
         println!("Starting election");
