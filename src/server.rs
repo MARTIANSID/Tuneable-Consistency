@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::error::Error;
 // imports
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::time::sleep;
+use std::time::Duration;
+use prost::Message;
 use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
 use tonic::transport::Channel;
@@ -9,6 +13,7 @@ use crate::raft_service::{AppendEntriesArgument, AppendEntriesResult, ClientMess
 use crate::raft_service::raft_client::RaftClient;
 use crate::utilities::log::Log;
 use crate::utilities::statusofserver::StatusOfServer;
+use utilities::timer::Timer;
 
 // modules
 mod utilities;
@@ -27,8 +32,11 @@ pub struct RaftService {
     status_of_server: Arc<Mutex<StatusOfServer>>,
     next_index: Arc<Mutex<[i32; 5]>>,
     match_index: Arc<Mutex<[i32; 5]>>,
-    peers : Vec<RaftClient<Channel>>,
-    server_id : i32
+    peers : HashMap<String, RaftClient<Channel>>,
+    server_id : i32,
+    test : Arc<Mutex<i32>>,
+    addresses : [&'static str; 5],
+    election_timer : Timer
 }
 
 impl RaftService {
@@ -43,9 +51,17 @@ impl RaftService {
             status_of_server : Arc::new(Mutex::new(StatusOfServer::FOLLOWER)),
             next_index : Arc::new(Mutex::new([0,0,0,0,0])),
             match_index: Arc::new(Mutex::new([0,0,0,0,0])),
-            peers,
-            server_id
+            peers : HashMap::new(),
+            server_id,
+            test : Arc::new(Mutex::new(0)),
+            addresses : ["[::1]:50051", "[::1]:50052", "[::1]:50053","[::1]:50054","[::1]:50055"],
+            election_timer : Timer::new(Duration::from_millis(500),|| {
+                
+            })
         }
+    }
+    pub fn start_election(&self) {
+        println!("Starting election");
     }
 }
 
@@ -60,8 +76,10 @@ impl Raft for RaftService {
     }
     async fn send_transaction(&self, request: Request<ClientMessage>) -> Result<Response<Empty>, Status> {
         println!("Got a request: {:?}", request);
+        let mut test = self.test.lock().unwrap();
+        *test += 1;
         let result = Empty {
-            data : 2
+            data : *test
         };
         Ok(Response::new(result))
     }
@@ -91,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
         server_id += 1;
     }
+
     for handle in servers {
         handle.await.unwrap();
     }
