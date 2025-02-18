@@ -28,6 +28,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     AtomicInteger currentTerm;
     AtomicInteger votedFor;
     ConcurrentLinkedDeque<Log> log;
+
     AtomicInteger commitIndex;
     AtomicInteger lastApplied;
     AtomicIntegerArray nextIndex;
@@ -39,6 +40,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     List<RaftStub> peers;
     RaftStub[] stubs;
+
+    AtomicInteger votes;
 
     ServerCurrentStatus status;
     public ServerImpl(int serverId) {
@@ -54,6 +57,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.peers = new ArrayList<>();
         this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
+        this.votes = new AtomicInteger(0);
 
         // setting the peers list
         for(int i = 0; i < 5; i ++) {
@@ -104,14 +108,28 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
        return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
     }
 
+    private void handleRequestVoteResult(RequestVoteResult requestVoteResult) {
+        if(requestVoteResult.getCurrentTerm() > currentTerm.get()) {
+            // this node is not upto date
+            currentTerm.set(requestVoteResult.getCurrentTerm());
+        } else if(requestVoteResult.getIsVoteGranted()) {
+            // vote granted
+            int votesTillNow = votes.get();
+            votes.set(votesTillNow + 1);
+        }
+    }
+
     private void requestForVotes() {
        RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
 
-       for(int i = 0; i < 5; i++) {
+        CountDownLatch latch = new CountDownLatch(4);
+
+        for(int i = 0; i < 5; i++) {
            stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                @Override
                public void onNext(RequestVoteResult requestVoteResult) {
-                   
+                    handleRequestVoteResult(requestVoteResult);
+                    latch.countDown();
                }
 
                @Override
@@ -124,16 +142,40 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                }
            });
+
        }
+        try {
+            // Wait for up to 30ms for responses
+            boolean success = latch.await(30, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void sendAppendEntries() {
+        
     }
 
     public void startElection() {
         // Starting Election
         System.out.println("Starting Election");
-
         // first update the term
         updateTerm();
-
+        // resetting the votes
+        votes.set(0);
         requestForVotes();
+
+        if(votes.get() >= 2) {
+            // this node becomes the leader
+            this.status = ServerCurrentStatus.LEADER;
+            // start sending AppendEntries
+            sendAppendEntries();
+        } else {
+            startTheElectionTimer();
+        }
+    }
+    private void startTheElectionTimer() {
+        this.electionTimer.reset();
+        this.electionTimer.start();
     }
 }
