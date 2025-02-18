@@ -260,12 +260,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.status = ServerCurrentStatus.CANDIDATE;
         // first update the term
         currentTerm.incrementAndGet();
+        // reset the timer
+        startTheElectionTimer();
         // resetting the votes
         votes.set(0);
         isElectionOver.set(false);
         requestForVotes();
 
         if(votes.get() >= 2) {
+            // stop the election timer
+            electionTimer.stop();
             // reinitialise state
             reinitialiseIndexes();
             // this node becomes the leader
@@ -275,7 +279,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             sendAppendEntries();
         } else {
             this.status = ServerCurrentStatus.FOLLOWER;
-            startTheElectionTimer();
         }
     }
     private void startTheElectionTimer() {
