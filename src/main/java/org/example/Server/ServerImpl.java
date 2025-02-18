@@ -102,31 +102,27 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void requestVote(RequestVoteArguments requestVoteArguments, StreamObserver<RequestVoteResult> responseObserver) {
         int currentTermOfTheCandidate = requestVoteArguments.getCandidatesTerm(), lastLogIndexOfCandidate = requestVoteArguments.getLastLogIndex(), lastLogTermOfCandidate = requestVoteArguments.getLastLogTerm(), candidateId = requestVoteArguments.getCandidateId();
 
-
         boolean isVoteGranted = true;
-        // updating the term of the follower
+
+        if(currentTermOfTheCandidate > currentTerm.get()) {
+            currentTerm.set(currentTermOfTheCandidate);
+            // the node must become a follower
+            if(status == ServerCurrentStatus.LEADER) {
+                startTheElectionTimer();
+            }
+            status = ServerCurrentStatus.FOLLOWER;
+        }
+
         // all the necessary conditions to check for denying vote
         if(votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
             // reply false here
             isVoteGranted = false;
         }
-
         if(isVoteGranted) {
             votedFor.put(currentTerm.get(), candidateId);
-
-            if(currentTermOfTheCandidate > currentTerm.get()) {
-                currentTerm.set(currentTermOfTheCandidate);
-                // now if it is a leader it must step down
-                if(status == ServerCurrentStatus.LEADER) {
-                    // the node becomes follower
-                    status = ServerCurrentStatus.FOLLOWER;
-                }
-            }
-            // reset and start the election timer again, if the current node is a follower
-            if(status == ServerCurrentStatus.FOLLOWER) {
-                startTheElectionTimer();
-            }
+            startTheElectionTimer();
         }
+
         RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
         responseObserver.onNext(requestVoteResult);
         responseObserver.onCompleted();
