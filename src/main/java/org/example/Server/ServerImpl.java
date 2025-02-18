@@ -5,7 +5,6 @@ import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
-import org.ds.paxos.Client;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 import java.security.*;
@@ -21,7 +20,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 
-public class ServerImpl extends PbftGrpc.PbftImplBase {
-
+public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 }
