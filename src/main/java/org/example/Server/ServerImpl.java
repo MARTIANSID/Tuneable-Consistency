@@ -48,8 +48,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = new AtomicInteger(-1);
         this.log = new ConcurrentLinkedDeque<>();
-        this.commitIndex = new AtomicInteger();
-        this.lastApplied = new AtomicInteger();
+        this.commitIndex = new AtomicInteger(-1);
+        this.lastApplied = new AtomicInteger(-1);
         this.nextIndex = new AtomicIntegerArray(5);
         this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
@@ -59,8 +59,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
 
+
+
+
+
         // setting the peers list
         for(int i = 0; i < 5; i ++) {
+            //setting up the nextIndex and matchIndex
+
+            nextIndex.set(i, 0);
+            matchIndex.set(i, -1);
+
+            // setting up the stubs
             if(i != serverId) {
                 ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + i).usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
@@ -153,7 +163,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void sendAppendEntries() {
-        
+        // send appendEntries
+
+        for(int i = 0; i < 5; i++) {
+
+            // this is the condtion that we need to just sendHeartBeat
+            if ((log.size() == 0) || (matchIndex.get(i) == log.size() - 1)) {
+                
+            } else {
+
+            }
+        }
+
+    }
+
+    public void reinitialiseIndexes() {
+        for(int i = 0; i < 5; i++) {
+            nextIndex.set(i, 0);
+            matchIndex.set(i, -1);
+        }
     }
 
     public void startElection() {
@@ -166,6 +194,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         requestForVotes();
 
         if(votes.get() >= 2) {
+            // reinitialise state
+            reinitialiseIndexes();
+
             // this node becomes the leader
             this.status = ServerCurrentStatus.LEADER;
             // start sending AppendEntries
