@@ -127,7 +127,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 startTheElectionTimer();
             }
         }
-
         RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
         responseObserver.onNext(requestVoteResult);
         responseObserver.onCompleted();
@@ -138,10 +137,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         super.sendTransaction(request, responseObserver);
     }
 
-    private void updateTerm() {
-       int cT = currentTerm.get() + 1;
-       currentTerm.set(cT);
-    }
 
     private int getLastLogIndex() {
         if(log.size() > 0) {
@@ -171,13 +166,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return false;
         } else if(requestVoteResult.getIsVoteGranted()) {
             // vote granted
-            int votesTillNow = votes.get();
-            votes.set(votesTillNow + 1);
-
+            votes.incrementAndGet();
             // voite granted
             return true;
         }
         return true;
+    }
+
+    private void endLatchHold(CountDownLatch latch) {
+        while(latch.getCount() > 0) {
+            latch.countDown();
+        }
     }
 
     private void requestForVotes() {
@@ -186,7 +185,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         CountDownLatch latch = new CountDownLatch(4);
 
         for(int i = 0; i < 5; i++) {
-           stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
+            if(i == serverId) continue;
+            stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                @Override
                public void onNext(RequestVoteResult requestVoteResult) {
                    if(isElectionOver.get()) {
@@ -197,9 +197,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     // it is not successful when the currentTerm of the leader is not upto date
                     if(!isSuccessful) {
                         votes.set(-(int)1e9);
-                        while(latch.getCount() > 0) {
-                            latch.countDown();
-                        }
+                        endLatchHold(latch);
+                    } else if(votes.get() >= 2) {
+                        // majority is reached here
+                        endLatchHold(latch);
                     } else {
                         latch.countDown();
                     }
@@ -235,6 +236,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // send appendEntries
 
         for(int i = 0; i < 5; i++) {
+            if(i == serverId) continue;
             // this is the condtion that we need to just sendHeartBeat
             if ((log.size() == 0) || (matchIndex.get(i) == log.size() - 1)) {
                 sendAppendEntries(true);
@@ -257,7 +259,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // this node becomes a candidate
         this.status = ServerCurrentStatus.CANDIDATE;
         // first update the term
-        updateTerm();
+        currentTerm.incrementAndGet();
         // resetting the votes
         votes.set(0);
         isElectionOver.set(false);
