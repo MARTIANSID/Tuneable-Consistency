@@ -19,10 +19,10 @@ public class Servers{
     public static void main(String[] args) throws IOException, InterruptedException {
 
         List<Server> servers = new ArrayList<>();
-        for (int i = 5; i <= 8; i++) {
+        for (int i = 1; i <= 5; i++) {
             int port = 8000 + i; // Ports 8000 to 8004
             Server server = ServerBuilder.forPort(port)
-                    .addService(new ServerImpl())
+                    .addService(new ServerImpl(i))
                     .build()
                     .start();
             System.out.println("Server" + (i + 1) + " started on port " + port);

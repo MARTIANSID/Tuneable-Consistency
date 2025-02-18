@@ -18,8 +18,74 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import org.ds.paxos.RaftGrpc.*;
 
+import org.example.Utility.Log;
+import org.example.Utility.ServerStatus.*;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
+    AtomicInteger currentTerm;
+    AtomicInteger votedFor;
+    ConcurrentLinkedDeque<Log> log;
+    AtomicInteger commitIndex;
+    AtomicInteger lastApplied;
+    AtomicIntegerArray nextIndex;
+    AtomicIntegerArray matchIndex;
 
+    CustomTimer electionTimer;
+
+    int serverId;
+
+    List<RaftStub> peers;
+    RaftStub[] stubs;
+
+    ServerCurrentStatus status;
+    public ServerImpl(int serverId) {
+        this.currentTerm = new AtomicInteger(0);
+        this.votedFor = new AtomicInteger(-1);
+        this.log = new ConcurrentLinkedDeque<>();
+        this.commitIndex = new AtomicInteger();
+        this.lastApplied = new AtomicInteger();
+        this.nextIndex = new AtomicIntegerArray(5);
+        this.matchIndex = new AtomicIntegerArray(5);
+        this.serverId = serverId;
+        this.electionTimer = new CustomTimer(() -> startElection(),200, TimeUnit.MILLISECONDS);
+        this.peers = new ArrayList<>();
+        this.stubs = new RaftStub[5];
+        this.status = ServerCurrentStatus.FOLLOWER;
+
+        // setting the peers list
+        for(int i = 0; i < 5; i ++) {
+            if(i != serverId) {
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + i).usePlaintext().build();
+                stubs[i] = RaftGrpc.newStub(channel);
+            }
+        }
+        // starting the election timer
+        this.electionTimer.start();
+    }
+    @Override
+    public void appendEntries(AppendEntriesArgument request, StreamObserver<AppendEntriesResult> responseObserver) {
+    }
+
+    @Override
+    public void requestVote(RequestVoteArguments request, StreamObserver<RequestVoteResult> responseObserver) {
+        super.requestVote(request, responseObserver);
+    }
+
+    @Override
+    public void sendTransaction(ClientMessage request, StreamObserver<Empty> responseObserver) {
+        super.sendTransaction(request, responseObserver);
+    }
+
+    private void updateTerm() {
+       int cT = currentTerm.get() + 1;
+       currentTerm.set(cT);
+    }
+
+    public void startElection() {
+        // Starting Election
+        updateTerm();
+    }
 }
