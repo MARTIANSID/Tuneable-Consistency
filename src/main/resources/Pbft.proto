@@ -1,0 +1,210 @@
+syntax = "proto3";
+option java_multiple_files =  true;
+package org.ds.paxos;
+
+
+message Transaction {
+  int32 senderId = 1;
+  int32 receiverId = 2;
+  double amount = 3;
+}
+
+message Client {
+  string timestamp = 1;
+  int32 clientId = 2;
+  Transaction t = 3;
+  bytes signature = 4;
+}
+
+message PrePrepare {
+  int32 viewNo = 1;
+  int32 sequenceNo = 2;
+  Client message = 3;
+  bytes signature = 4;
+  string digest = 5;
+  string serverId = 7;
+  CurrentStatus status = 8;
+}
+
+message Prepare {
+  int32 viewNo = 1;
+  int32 sequenceNo = 2;
+  string digest = 3;
+  string serverId = 4;
+  bytes signature = 5;
+  CurrentStatus status = 6;
+}
+
+message Commit {
+  int32 viewNo = 1;
+  int32 sequenceNo = 2;
+  string digest = 3;
+  string serverId = 4;
+  bytes signature = 5;
+  CurrentStatus status = 7;
+}
+
+
+message Reply {
+  int32 viewNo = 1;
+  string timestamp = 2;
+  int32 clientId = 3;
+  string serverId = 4;
+  double result = 5;
+  bytes signature = 6;
+}
+
+message  Empty {}
+
+message Prepares {
+  repeated Prepare prepares = 1;
+  Prepare prepare = 2;
+}
+
+enum CurrentStatus  {
+  NOSTATUS =  0;
+  PREPARED = 1;
+  ABORT = 2;
+  COMMITTED = 3;
+}
+
+
+message Commits {
+  repeated Commit commits = 1;
+  Commit commit = 2;
+}
+
+message ViewChange {
+  int32 viewNo = 1;
+  repeated setP preparedRequests = 2;
+  string serverId= 3;
+  bytes signature = 4;
+
+}
+
+message NewView {
+  repeated ViewChange viewChangeMessages = 1;
+  repeated PrePrepare prePrepares = 2;
+  int32 viewNo = 3;
+  bytes signature = 4;
+  string clientId = 5;
+
+}
+message setP {
+  PrePrepare prePrepare = 1;
+  repeated Prepare matchingPrepares = 2;
+}
+message Alive {
+  bool isAlive = 1;
+}
+
+message Balance {
+  int32 clientId = 1;
+  double amount = 2;
+}
+message Balances {
+  repeated Balance balances = 1;
+  string serverId = 2;
+}
+
+message StateAtSequenceNumber {
+  string state = 1;
+  string serverId = 2;
+}
+
+message SequenceNumber {
+  int32 sequenceNumber = 1;
+}
+
+
+message NewViewMessages {
+  repeated NewView newViewMessages = 1;
+  string serverId = 2;
+}
+
+message Byzantine {
+  bool isByzantine = 1;
+}
+
+message LogProto {
+  PrePrepare prePrepare = 1;
+  Prepare prepare = 2;
+  Commit commit = 3;
+  bool inProgress = 4;
+  string state = 5;
+  repeated  Prepare prepareCertificate= 6;
+  repeated Commit commitCertificate = 7;
+  string crossShardStatus = 8;
+}
+
+message Logs {
+  repeated LogProto logs = 1;
+  string serverId = 2;
+}
+
+message Replies {
+  string timestamp = 1;
+  repeated Reply replies = 2;
+  int32 clientId = 3;
+}
+
+message Performance {
+  int64 latency = 1;
+  string serverId = 3;
+  int32 totalTransactionsProcessed = 4;
+}
+
+message Result {
+  PrePrepare prePrepare = 1;
+  repeated Commit commits = 2;
+  bytes signature = 3;
+  CurrentStatus status = 4;
+}
+
+message accId {
+  int32 id = 1;
+}
+
+message Ack {
+  Client c = 1;
+  CurrentStatus status = 2;
+}
+
+
+message DataItem {
+  Transaction t = 1;
+  string status = 2;
+  int32 sequenceNumber = 3;
+}
+
+message DataStore {
+  repeated DataItem dataItems = 1;
+}
+
+
+
+service Pbft {
+  rpc clientForwardRequest(Client) returns (Reply);
+  rpc clientRequest(Client) returns (Empty);
+  rpc sendPrePrepare(PrePrepare) returns (Prepare);
+  rpc sendAllPrepares(Prepares) returns (Commit);
+  rpc sendAllCommits(Commits) returns (Empty);
+  rpc sendReplyToClient(Reply) returns (Empty);
+  rpc sendViewChange(ViewChange) returns (Empty);
+  rpc sendNewView(NewView) returns (Empty);
+  rpc setAlive(Alive) returns (Empty);
+  rpc setByzantine(Byzantine) returns (Empty);
+  rpc printDB(accId) returns (Balance);
+  rpc printStatus(SequenceNumber) returns  (StateAtSequenceNumber);
+  rpc printView(Empty) returns (NewViewMessages);
+  rpc printLog(Empty) returns (Logs);
+  rpc printPerformance(Empty) returns (Performance);
+  rpc sendResult(Result) returns (Empty);
+  rpc sendAck(Ack) returns (Empty);
+  rpc printDataStore(Empty) returns (DataStore);
+  rpc printBalance(accId) returns (Balance);
+}
+
+
+
+
