@@ -100,13 +100,27 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void requestVote(RequestVoteArguments requestVoteArguments, StreamObserver<RequestVoteResult> responseObserver) {
-        int currentTermOfTheCandidate = requestVoteArguments.getCandidatesTerm(), lastLogIndexOfCandidate = requestVoteArguments.getLastLogIndex(), lastLogTermOfCandidate = requestVoteArguments.getLastLogIndex();
+        int currentTermOfTheCandidate = requestVoteArguments.getCandidatesTerm(), lastLogIndexOfCandidate = requestVoteArguments.getLastLogIndex(), lastLogTermOfCandidate = requestVoteArguments.getLastLogTerm(), candidateId = requestVoteArguments.getCandidateId();
 
         boolean isVoteGranted = true;
+        // updating the term of the follower
+        if(currentTermOfTheCandidate > currentTerm.get()) {
+            currentTerm.set(currentTermOfTheCandidate);
+            // now if it is a leader it must step down
+            if(status == ServerCurrentStatus.LEADER) {
+                status = ServerCurrentStatus.FOLLOWER;
+                startTheElectionTimer();
+            }
+        }
 
-        if(votedFor.containsKey(this.currentTerm) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
+        if(votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
             // reply false here
             isVoteGranted = false;
+        }
+
+
+        if(isVoteGranted) {
+            votedFor.put(currentTerm.get(), candidateId);
         }
 
         RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
