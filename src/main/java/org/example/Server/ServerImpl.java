@@ -108,16 +108,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             currentTerm.set(currentTermOfTheCandidate);
             // now if it is a leader it must step down
             if(status == ServerCurrentStatus.LEADER) {
+                // the node becomes follower
                 status = ServerCurrentStatus.FOLLOWER;
+                // it will start the election timer
                 startTheElectionTimer();
             }
         }
-
+        // all the necessary conditions to check for denying vote
         if(votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
             // reply false here
             isVoteGranted = false;
         }
-
 
         if(isVoteGranted) {
             votedFor.put(currentTerm.get(), candidateId);
