@@ -39,6 +39,7 @@ message AppendEntriesArgument {
   int32 prevLogTerm = 4;
   Log entriesToAppend = 5;
   int32 leadersCommit = 6;
+  bool isHeartBeat = 7;
 }
 
 message RequestVoteArguments {
