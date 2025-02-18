@@ -50,7 +50,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.nextIndex = new AtomicIntegerArray(5);
         this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(),200, TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(),2000, TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
@@ -84,8 +84,56 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
        currentTerm.set(cT);
     }
 
+    private int getLastLogIndex() {
+        if(log.size() > 0) {
+            return -1;
+        } else {
+            return log.peekLast().index;
+        }
+    }
+
+    private int getLastLogTerm() {
+        if(log.size() > 0) {
+            return -1;
+        } else {
+            return log.peekLast().term;
+        }
+    }
+
+    private RequestVoteArguments getRequestVoteArgumentsObject() {
+       return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+    }
+
+    private void requestForVotes() {
+       RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
+
+       for(int i = 0; i < 5; i++) {
+           stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
+               @Override
+               public void onNext(RequestVoteResult requestVoteResult) {
+                   
+               }
+
+               @Override
+               public void onError(Throwable throwable) {
+
+               }
+
+               @Override
+               public void onCompleted() {
+
+               }
+           });
+       }
+    }
+
     public void startElection() {
         // Starting Election
+        System.out.println("Starting Election");
+
+        // first update the term
         updateTerm();
+
+        requestForVotes();
     }
 }
