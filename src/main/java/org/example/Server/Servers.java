@@ -21,20 +21,6 @@ public class Servers{
 
         List<Server> servers = new ArrayList<>();
 
-        Connection connection = null;
-
-        try {
-            String url = "jdbc:mysql://localhost:3306/clientdatadb";
-            String user = "root";
-            String password = "manGla1232";
-            connection = DriverManager.getConnection(url, user, password);
-            System.out.println("Database connection established successfully!");
-        } catch (SQLException e) {
-            System.err.println("Failed to establish database connection:");
-            e.printStackTrace();
-            return;
-
-        }
 
 
         // cluster 1

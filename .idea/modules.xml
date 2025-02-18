@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Tuneable-Consistency.iml" filepath="$PROJECT_DIR$/.idea/Tuneable-Consistency.iml" />
+      <module fileurl="file://$PROJECT_DIR$/PBFT.iml" filepath="$PROJECT_DIR$/PBFT.iml" />
     </modules>
   </component>
 </project>
