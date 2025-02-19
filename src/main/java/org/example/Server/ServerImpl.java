@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
 import org.ds.paxos.RaftGrpc.*;
 
 import org.example.Utility.Log;
+import org.example.Utility.RaftLog;
 import org.example.Utility.ServerStatus.*;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
@@ -29,7 +30,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     ConcurrentHashMap<Integer, Integer> votedFor; // term : candidateId
-    ConcurrentLinkedDeque<Log> log;
+
+    RaftLog log;
 
     AtomicInteger commitIndex;
     AtomicInteger lastApplied;
@@ -53,7 +55,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public ServerImpl(int serverId) {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = new ConcurrentHashMap<>();
-        this.log = new ConcurrentLinkedDeque<>();
+        this.log = new RaftLog();
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
         this.nextIndex = new AtomicIntegerArray(5);
@@ -71,7 +73,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for(int i = 0; i < 5; i ++) {
             //setting up the nextIndex and matchIndex
 
-            nextIndex.set(i, 0);
+            nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
             // setting up the stubs
             if(i != serverId) {
@@ -138,7 +140,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if(log.size() == 0) {
             return -1;
         } else {
-            return log.peekLast().index;
+            return log.getLastLogEntry().index;
         }
     }
 
@@ -146,7 +148,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if(log.size() == 0) {
             return -1;
         } else {
-            return log.peekLast().term;
+            return log.getLastLogEntry().term;
         }
     }
 
@@ -192,7 +194,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                    }
                     boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
 
-                    // it is not successful when the currentTerm of the leader is not upto date
+                    // it is not successful when the currentTerm of the leader is not up-to date
                     if(!isSuccessful) {
                         votes.set(-(int)1e9);
                         endLatchHold(latch);
@@ -225,32 +227,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private void sendAppendEntries(boolean isHeartBeat) {
-        for(int i = 0; i < 5; i++) {
 
-        }
-    }
     private void sendAppendEntries() {
         // send appendEntries
-
         for(int i = 0; i < 5; i++) {
             if(i == serverId) continue;
+
+            // index to send from
+            int indexToSendFrom = nextIndex.get(i);
+            Log prevEntry = log.get(indexToSendFrom - 1);
+
             // this is the condtion that we need to just sendHeartBeat
             if ((log.size() == 0) || (matchIndex.get(i) == log.size() - 1)) {
-                sendAppendEntries(true);
+
             } else {
-                sendAppendEntries(false);
             }
         }
-
     }
     public void reinitialiseIndexes() {
         for(int i = 0; i < 5; i++) {
-            nextIndex.set(i, 0);
+            nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
         }
     }
-
     public void startElection() {
         // Starting Election
         System.out.println("Starting Election");
@@ -263,7 +262,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // resetting the votes
         votes.set(0);
         isElectionOver.set(false);
-        this.requestForVotes();
+        requestForVotes();
 
         if(votes.get() >= 2) {
             System.out.println(serverId +" " + "Became the leader");

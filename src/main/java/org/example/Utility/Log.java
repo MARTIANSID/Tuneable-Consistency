@@ -7,7 +7,7 @@ public class Log {
     public int term;
     public Transaction t;
 
-    Log(int index, int term, Transaction t) {
+    public Log(int index, int term, Transaction t) {
         this.index = index;
         this.term = term;
         this.t = t;
