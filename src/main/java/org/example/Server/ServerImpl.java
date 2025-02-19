@@ -87,6 +87,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             currentLeader = leaderId;
         }
 
+        if(leadersTerm > currentTerm.get()) {
+            currentTerm.set(leadersTerm);
+            if(status == ServerCurrentStatus.LEADER) {
+                startTheElectionTimer();
+            }
+            status = ServerCurrentStatus.FOLLOWER;
+        }
+
        if(leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm))  {
             responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
             responseObserver.onCompleted();
@@ -289,7 +297,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         return result;
     }
-
 
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower) {
         boolean result = appendEntriesResult.getIsSuccessFull();
