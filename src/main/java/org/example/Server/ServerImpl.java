@@ -12,6 +12,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+
 import org.ds.paxos.RaftGrpc.*;
 
 import org.example.Utility.LogEntry;
@@ -47,6 +48,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     boolean doesLeaderHasHighestTerm;
 
     int currentLeader;
+
     public ServerImpl(int serverId) {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = new ConcurrentHashMap<>();
@@ -56,7 +58,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.nextIndex = new AtomicIntegerArray(5);
         this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(),(new Random().nextInt(200) + 300), TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(200) + 300), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
@@ -65,41 +67,39 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.doesLeaderHasHighestTerm = false;
 
         // setting the peers list
-        for(int i = 0; i < 5; i ++) {
+        for (int i = 0; i < 5; i++) {
             //setting up the nextIndex and matchIndex
 
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
             // setting up the stubs
-            if(i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i+1)).usePlaintext().build();
+            if (i != serverId) {
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
             }
         }
         // starting the election timer
         this.electionTimer.start();
     }
+
     @Override
     public void appendEntries(AppendEntriesArgument appendEntriesArgument, StreamObserver<AppendEntriesResult> responseObserver) {
-       int leadersTerm = appendEntriesArgument.getLeadersTerm(), prevLogIndex = appendEntriesArgument.getPrevLogIndex(), prevLogTerm = appendEntriesArgument.getPrevLogTerm(), leadersCommitIndex = appendEntriesArgument.getLeadersCommit(), leaderId = appendEntriesArgument.getLeadersId();
+        int leadersTerm = appendEntriesArgument.getLeadersTerm(), prevLogIndex = appendEntriesArgument.getPrevLogIndex(), prevLogTerm = appendEntriesArgument.getPrevLogTerm(), leadersCommitIndex = appendEntriesArgument.getLeadersCommit(), leaderId = appendEntriesArgument.getLeadersId();
 
-        if(leadersTerm >= currentTerm.get()) {
+        if (leadersTerm >= currentTerm.get()) {
             currentLeader = leaderId;
-        }
-
-        if(leadersTerm > currentTerm.get()) {
             currentTerm.set(leadersTerm);
-            if(status == ServerCurrentStatus.LEADER) {
+            if (status == ServerCurrentStatus.LEADER) {
                 startTheElectionTimer();
             }
             status = ServerCurrentStatus.FOLLOWER;
         }
 
-       if(leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm))  {
+        if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
             responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
             responseObserver.onCompleted();
             return;
-       }
+        }
 
         Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
         // now first clear the entries starting from prevLogIndex + 1
@@ -109,7 +109,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         log.appendEntries(leadersEntries);
 
         // updating commit index of follower
-        if(leadersCommitIndex > commitIndex.get()) {
+        if (leadersCommitIndex > commitIndex.get()) {
             commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
         }
         // reset the election timer
@@ -123,7 +123,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         int lastLogTermOfCurrentNode = getLastLogTerm(), lastLogIndexOfCurrentNode = getLastLogTerm();
 
         // deny vote condition
-        if((lastLogTermOfCurrentNode > lastLogTermOfCandidate) || ((lastLogTermOfCurrentNode == lastLogTermOfCandidate) && (lastLogIndexOfCurrentNode > lastLogIndexOfCandidate))) {
+        if ((lastLogTermOfCurrentNode > lastLogTermOfCandidate) || ((lastLogTermOfCurrentNode == lastLogTermOfCandidate) && (lastLogIndexOfCurrentNode > lastLogIndexOfCandidate))) {
             return false;
         }
 
@@ -136,21 +136,21 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         boolean isVoteGranted = true;
 
-        if(currentTermOfTheCandidate > currentTerm.get()) {
+        if (currentTermOfTheCandidate > currentTerm.get()) {
             currentTerm.set(currentTermOfTheCandidate);
             // the node must become a follower
-            if(status == ServerCurrentStatus.LEADER) {
+            if (status == ServerCurrentStatus.LEADER) {
                 startTheElectionTimer();
             }
             status = ServerCurrentStatus.FOLLOWER;
         }
 
         // all the necessary conditions to check for denying vote
-        if(votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
+        if (votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
             // reply false here
             isVoteGranted = false;
         }
-        if(isVoteGranted) {
+        if (isVoteGranted) {
             votedFor.put(currentTerm.get(), candidateId);
             startTheElectionTimer();
         }
@@ -165,7 +165,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
         // check if the current node is leader or not, if not forward request to leader
         System.out.println("Here");
-        if(serverId != currentLeader) {
+        if (serverId != currentLeader) {
             stubs[currentLeader].sendTransaction(clientMessage, new StreamObserver<Empty>() {
                 @Override
                 public void onNext(Empty empty) {
@@ -198,7 +198,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     private int getLastLogIndex() {
-        if(log.size() == 0) {
+        if (log.size() == 0) {
             return -1;
         } else {
             return log.getLastLogEntry().index;
@@ -206,7 +206,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private int getLastLogTerm() {
-        if(log.size() == 0) {
+        if (log.size() == 0) {
             return -1;
         } else {
             return log.getLastLogEntry().term;
@@ -214,16 +214,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private RequestVoteArguments getRequestVoteArgumentsObject() {
-       return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+        return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
     }
 
     private boolean handleRequestVoteResult(RequestVoteResult requestVoteResult) {
-        if(requestVoteResult.getCurrentTerm() > currentTerm.get()) {
+        if (requestVoteResult.getCurrentTerm() > currentTerm.get()) {
             // this node is not upto date
             currentTerm.set(requestVoteResult.getCurrentTerm());
             // now it cannot become the leader
             return false;
-        } else if(requestVoteResult.getIsVoteGranted()) {
+        } else if (requestVoteResult.getIsVoteGranted()) {
             // vote granted
             votes.incrementAndGet();
             // voite granted
@@ -233,7 +233,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void endLatchHold(CountDownLatch latch) {
-        while(latch.getCount() > 0) {
+        while (latch.getCount() > 0) {
             latch.countDown();
         }
     }
@@ -292,7 +292,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
-        for(LogEntry entry : entries) {
+        for (LogEntry entry : entries) {
             result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).build());
         }
         return result;
@@ -302,14 +302,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
 
-        if(termOfFollower > currentTerm.get()) {
+        if (termOfFollower > currentTerm.get()) {
             // become follower
-           currentTerm.set(termOfFollower);
-           status = ServerCurrentStatus.FOLLOWER;
-           startTheElectionTimer();
-           return false;
+            currentTerm.set(termOfFollower);
+            status = ServerCurrentStatus.FOLLOWER;
+            startTheElectionTimer();
+            return false;
         }
-        if(!result) {
+        if (!result) {
             nextIndex.decrementAndGet(idOfFollower);
         } else {
             matchIndex.set(idOfFollower, matchIndexOfFollower);
@@ -321,10 +321,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private void sendAppendEntries() {
         // send appendEntries
 
-        while(status == ServerCurrentStatus.LEADER) {
+        while (status == ServerCurrentStatus.LEADER) {
 
-            for(int i = 0; i < 5; i++) {
-                if(i == serverId) continue;
+            for (int i = 0; i < 5; i++) {
+                if (i == serverId) continue;
 
                 // index to send from
                 int indexToSendFrom = nextIndex.get(i);
@@ -338,7 +338,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
-                       doesLeaderHasHighestTerm =  handleAppendEntriesResult(appendEntriesResult,matchIndexForFollower);
+                        doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexForFollower);
 
                     }
 
@@ -352,9 +352,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     }
                 });
-                if(!doesLeaderHasHighestTerm) break;
+                if (!doesLeaderHasHighestTerm) break;
             }
-            if(!doesLeaderHasHighestTerm) break;
+            if (!doesLeaderHasHighestTerm) break;
 
             try {
                 Thread.sleep(15);
@@ -363,12 +363,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
     }
+
     public void reinitialiseIndexes() {
-        for(int i = 0; i < 5; i++) {
+        for (int i = 0; i < 5; i++) {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
         }
     }
+
     public void startElection() {
         // Starting Election
         System.out.println(serverId + " is " + "Starting Election");
@@ -385,11 +387,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         isElectionOver.set(false);
         requestForVotes();
 
-        if(votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
+        if (votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
 
             doesLeaderHasHighestTerm = true;
 
-            System.out.println(serverId +" " + "Became the leader" + "The term is" + currentTerm.get());
+            System.out.println(serverId + " " + "Became the leader" + "The term is" + currentTerm.get());
             // stop the election timer
             electionTimer.stop();
             // reinitialise state

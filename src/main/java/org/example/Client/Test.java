@@ -11,7 +11,7 @@ import org.ds.paxos.Transaction;
 public class Test {
     public static void main(String[] args) {
 
-       ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8005).usePlaintext().build();
+       ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8001).usePlaintext().build();
         RaftGrpc.RaftStub stub = RaftGrpc.newStub(channel);
         Transaction t = Transaction.newBuilder().setAmount(14).setReceiver("Sid").setSender("Vansh").build();
 
