@@ -119,4 +119,7 @@ public class RaftLog {
             lock.writeLock().unlock();
         }
     }
+    public void printLog() {
+        System.out.println(log);
+    }
 }

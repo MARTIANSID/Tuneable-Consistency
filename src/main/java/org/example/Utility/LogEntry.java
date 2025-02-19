@@ -12,4 +12,8 @@ public class LogEntry {
         this.term = term;
         this.t = t;
     }
+    @Override
+    public String toString() {
+        return "The Transaction is: " + t;
+    }
 }

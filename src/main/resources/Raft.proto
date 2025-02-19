@@ -6,6 +6,7 @@ service Raft {
   rpc SendTransaction(ClientMessage) returns (Empty);
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
+  rpc printLog(Empty) returns (Empty);
 }
 
 message Empty{
@@ -51,6 +52,7 @@ message RequestVoteArguments {
 message AppendEntriesResult {
   int32 currentTerm = 1;
   bool isSuccessFull = 2;
+  int32 followerId = 3;
 }
 message RequestVoteResult {
   int32 currentTerm = 1;
