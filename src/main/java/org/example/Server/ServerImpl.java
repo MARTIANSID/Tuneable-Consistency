@@ -2,6 +2,7 @@ package org.example.Server;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
@@ -79,6 +80,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     @Override
     public void appendEntries(AppendEntriesArgument request, StreamObserver<AppendEntriesResult> responseObserver) {
         startTheElectionTimer();
+        responseObserver.onNext(null);
+        responseObserver.onCompleted();
     }
 
     private boolean isUpToDateCandidateLog(int lastLogTermOfCandidate, int lastLogIndexOfCandidate) {
@@ -212,7 +215,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
        }
         try {
             // Wait for up to 30ms for responses
-            boolean success = latch.await(30, TimeUnit.MILLISECONDS);
+            boolean success = latch.await(50, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
             isElectionOver.set(true);
         } catch (InterruptedException e) {
@@ -265,7 +268,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             }
             try {
-                Thread.sleep(20);
+                Thread.sleep(15);
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
@@ -288,10 +291,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         startTheElectionTimer();
         // resetting the votes
         votes.set(0);
+        // vote self
+        votedFor.put(currentTerm.get(), serverId);
         isElectionOver.set(false);
         requestForVotes();
 
-        if(votes.get() >= 2) {
+        if(votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
             System.out.println(serverId +" " + "Became the leader" + "The term is" + currentTerm.get());
             // stop the election timer
             electionTimer.stop();
