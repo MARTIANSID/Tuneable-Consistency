@@ -59,7 +59,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.nextIndex = new AtomicIntegerArray(5);
         this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(),2000, TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(),new Random().nextInt(201) + 200, TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
@@ -73,10 +73,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             nextIndex.set(i, 0);
             matchIndex.set(i, -1);
-
             // setting up the stubs
             if(i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + i).usePlaintext().build();
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i+1)).usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
             }
         }
@@ -123,6 +122,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             startTheElectionTimer();
         }
 
+
         RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
         responseObserver.onNext(requestVoteResult);
         responseObserver.onCompleted();
@@ -135,7 +135,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     private int getLastLogIndex() {
-        if(log.size() > 0) {
+        if(log.size() == 0) {
             return -1;
         } else {
             return log.peekLast().index;
@@ -143,7 +143,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private int getLastLogTerm() {
-        if(log.size() > 0) {
+        if(log.size() == 0) {
             return -1;
         } else {
             return log.peekLast().term;
@@ -181,7 +181,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         CountDownLatch latch = new CountDownLatch(4);
 
         for(int i = 0; i < 5; i++) {
+
             if(i == serverId) continue;
+
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                @Override
                public void onNext(RequestVoteResult requestVoteResult) {
@@ -215,7 +217,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
        }
         try {
             // Wait for up to 30ms for responses
-            boolean success = latch.await(30, TimeUnit.MILLISECONDS);
+            boolean success = latch.await(100, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
             isElectionOver.set(true);
         } catch (InterruptedException e) {
@@ -261,9 +263,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // resetting the votes
         votes.set(0);
         isElectionOver.set(false);
-        requestForVotes();
+        this.requestForVotes();
 
         if(votes.get() >= 2) {
+            System.out.println(serverId +" " + "Became the leader");
             // stop the election timer
             electionTimer.stop();
             // reinitialise state
