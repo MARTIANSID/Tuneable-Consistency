@@ -1,19 +1,11 @@
 package org.example.Server;
 
-import com.google.protobuf.ByteString;
-import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
-import java.security.*;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.time.Duration;
-import java.time.LocalTime;
+
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -21,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import org.ds.paxos.RaftGrpc.*;
 
-import org.example.Utility.Log;
+import org.example.Utility.LogEntry;
 import org.example.Utility.RaftLog;
 import org.example.Utility.ServerStatus.*;
 
@@ -61,7 +53,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.nextIndex = new AtomicIntegerArray(5);
         this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(),new Random().nextInt(201) + 200, TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(),(new Random().nextInt(200) + 300), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
@@ -86,6 +78,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
     @Override
     public void appendEntries(AppendEntriesArgument request, StreamObserver<AppendEntriesResult> responseObserver) {
+        startTheElectionTimer();
     }
 
     private boolean isUpToDateCandidateLog(int lastLogTermOfCandidate, int lastLogIndexOfCandidate) {
@@ -219,7 +212,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
        }
         try {
             // Wait for up to 30ms for responses
-            boolean success = latch.await(100, TimeUnit.MILLISECONDS);
+            boolean success = latch.await(30, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
             isElectionOver.set(true);
         } catch (InterruptedException e) {
@@ -228,16 +221,54 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
 
+    private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
+        List<LogEntryProto> result = new ArrayList<>();
+
+        for(LogEntry entry : entries) {
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).build());
+        }
+        return result;
+    }
+
+
+
     private void sendAppendEntries() {
         // send appendEntries
-        for(int i = 0; i < 5; i++) {
-            if(i == serverId) continue;
 
-            // index to send from
-            int indexToSendFrom = nextIndex.get(i);
-            Log prevEntry = log.get(indexToSendFrom - 1);
-            List<Log> entries = log.logEntriesFromIndex(indexToSendFrom);
-            
+        while(status == ServerCurrentStatus.LEADER) {
+            for(int i = 0; i < 5; i++) {
+                if(i == serverId) continue;
+
+                // index to send from
+                int indexToSendFrom = nextIndex.get(i);
+                LogEntry prevEntry = log.get(indexToSendFrom - 1);
+                List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
+                Log l = Log.newBuilder().addAllLog(entries).build();
+                AppendEntriesArgument appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).build();
+
+                stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
+                    @Override
+                    public void onNext(AppendEntriesResult appendEntriesResult) {
+
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+
+                    }
+
+                    @Override
+                    public void onCompleted() {
+
+                    }
+                });
+
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
     public void reinitialiseIndexes() {
@@ -248,7 +279,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
     public void startElection() {
         // Starting Election
-        System.out.println("Starting Election");
+        System.out.println(serverId + " is " + "Starting Election");
         // this node becomes a candidate
         this.status = ServerCurrentStatus.CANDIDATE;
         // first update the term
@@ -261,7 +292,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         requestForVotes();
 
         if(votes.get() >= 2) {
-            System.out.println(serverId +" " + "Became the leader");
+            System.out.println(serverId +" " + "Became the leader" + "The term is" + currentTerm.get());
             // stop the election timer
             electionTimer.stop();
             // reinitialise state

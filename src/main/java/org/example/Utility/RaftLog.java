@@ -3,7 +3,7 @@ import java.util.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class RaftLog {
-    private final ArrayList<Log> log;
+    private final ArrayList<LogEntry> log;
     private final ReentrantReadWriteLock lock;
 
     public RaftLog() {
@@ -11,7 +11,7 @@ public class RaftLog {
         this.lock = new ReentrantReadWriteLock();
     }
 
-    public void append(Log entry) {
+    public void append(LogEntry entry) {
         lock.writeLock().lock();
         try {
             log.add(entry);
@@ -20,9 +20,9 @@ public class RaftLog {
         }
     }
 
-    public Log get(int index) {
+    public LogEntry get(int index) {
         if(index < 0) {
-            return new Log(-1,-1, null);
+            return new LogEntry(-1,-1, null);
         }
         lock.readLock().lock();
         try {
@@ -40,7 +40,7 @@ public class RaftLog {
             lock.writeLock().unlock();
         }
     }
-    public Log getLastLogEntry() {
+    public LogEntry getLastLogEntry() {
         lock.readLock().lock();
         try {
             return log.isEmpty() ? null : log.get(log.size() - 1);
@@ -67,7 +67,7 @@ public class RaftLog {
         }
     }
 
-    public List<Log> logEntriesFromIndex(int index) {
+    public List<LogEntry> logEntriesFromIndex(int index) {
         lock.readLock().lock();
         try {
             return new ArrayList<>(log.subList(index, log.size()));

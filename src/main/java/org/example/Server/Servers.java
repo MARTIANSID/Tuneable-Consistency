@@ -22,7 +22,7 @@ public class Servers{
         for (int i = 1; i <= 5; i++) {
             int port = 8000 + i; // Ports 8000 to 8004
             Server server = ServerBuilder.forPort(port)
-                    .addService(new ServerImpl(i))
+                    .addService(new ServerImpl(i - 1))
                     .build()
                     .start();
             System.out.println("Server" + (i + 1) + " started on port " + port);

@@ -22,14 +22,14 @@ message Transaction {
   double amount = 3;
   string id = 4;
 }
-message LogEntry {
+message LogEntryProto {
   int32 logIndex = 1;
   int32 term = 2;
   Transaction t = 3;
 }
 
 message Log {
-  repeated LogEntry log = 1;
+  repeated LogEntryProto log = 1;
 }
 
 message AppendEntriesArgument {
