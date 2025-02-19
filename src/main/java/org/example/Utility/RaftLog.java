@@ -1,4 +1,8 @@
 package org.example.Utility;
+
+import org.ds.paxos.Log;
+import org.ds.paxos.LogEntryProto;
+
 import java.util.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -21,8 +25,8 @@ public class RaftLog {
     }
 
     public LogEntry get(int index) {
-        if(index < 0) {
-            return new LogEntry(-1,-1, null);
+        if (index < 0) {
+            return new LogEntry(-1, -1, null);
         }
         lock.readLock().lock();
         try {
@@ -40,6 +44,7 @@ public class RaftLog {
             lock.writeLock().unlock();
         }
     }
+
     public LogEntry getLastLogEntry() {
         lock.readLock().lock();
         try {
@@ -73,6 +78,36 @@ public class RaftLog {
             return new ArrayList<>(log.subList(index, log.size()));
         } finally {
             lock.readLock().unlock();
+        }
+    }
+
+    public boolean checkIfPrevLogIndexHasPrevLogTerm(int prevLogIndex, int prevLogTerm) {
+        lock.readLock().lock();
+
+        boolean check = false;
+        try {
+            if (prevLogIndex == -1 || (prevLogIndex < log.size() && log.get(prevLogIndex).term == prevLogTerm)) {
+                check = true;
+            }
+
+        } finally {
+            lock.readLock().unlock();
+            return check;
+        }
+    }
+
+    public void appendEntries(Log leadersEntries) {
+
+        lock.writeLock().lock();
+
+        try {
+            List<LogEntryProto> entries = leadersEntries.getLogList();
+
+            for(LogEntryProto entry : entries) {
+                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT()));
+            }
+        } finally {
+            lock.writeLock().unlock();
         }
     }
 

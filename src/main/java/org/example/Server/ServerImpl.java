@@ -78,9 +78,30 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.electionTimer.start();
     }
     @Override
-    public void appendEntries(AppendEntriesArgument request, StreamObserver<AppendEntriesResult> responseObserver) {
+    public void appendEntries(AppendEntriesArgument appendEntriesArgument, StreamObserver<AppendEntriesResult> responseObserver) {
+       int leadersTerm = appendEntriesArgument.getLeadersTerm(), prevLogIndex = appendEntriesArgument.getPrevLogIndex(), prevLogTerm = appendEntriesArgument.getPrevLogTerm(), leadersCommitIndex = appendEntriesArgument.getLeadersCommit();
+
+       if(leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm))  {
+            responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).build());
+            responseObserver.onCompleted();
+            return;
+       }
+
+        Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
+        // now first clear the entries starting from prevLogIndex + 1
+        log.truncateAfter(prevLogIndex + 1);
+
+        // appending leaders entries
+        log.appendEntries(leadersEntries);
+
+        // updating commit index of follower
+        if(leadersCommitIndex > commitIndex.get()) {
+            commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
+        }
+        // reset the election timer
         startTheElectionTimer();
-        responseObserver.onNext(null);
+
+        responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).build());
         responseObserver.onCompleted();
     }
 
@@ -174,45 +195,46 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void requestForVotes() {
-       RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
+        RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
 
         CountDownLatch latch = new CountDownLatch(4);
 
-        for(int i = 0; i < 5; i++) {
+        for (int i = 0; i < 5; i++) {
 
-            if(i == serverId) continue;
+            if (i == serverId) continue;
 
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
-               @Override
-               public void onNext(RequestVoteResult requestVoteResult) {
-                   if(isElectionOver.get()) {
-                       return;
-                   }
+                @Override
+                public void onNext(RequestVoteResult requestVoteResult) {
+                    if (isElectionOver.get()) {
+                        return;
+                    }
                     boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
 
                     // it is not successful when the currentTerm of the leader is not up-to date
-                    if(!isSuccessful) {
-                        votes.set(-(int)1e9);
+                    if (!isSuccessful) {
+                        votes.set(-(int) 1e9);
                         endLatchHold(latch);
-                    } else if(votes.get() >= 2) {
+                    } else if (votes.get() >= 2) {
                         // majority is reached here
                         endLatchHold(latch);
                     } else {
                         latch.countDown();
                     }
-               }
-               @Override
-               public void onError(Throwable throwable) {
+                }
 
-               }
+                @Override
+                public void onError(Throwable throwable) {
 
-               @Override
-               public void onCompleted() {
+                }
 
-               }
-           });
+                @Override
+                public void onCompleted() {
 
-       }
+                }
+            });
+
+        }
         try {
             // Wait for up to 30ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
@@ -222,7 +244,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             Thread.currentThread().interrupt();
         }
     }
-
 
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
