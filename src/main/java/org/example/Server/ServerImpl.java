@@ -236,12 +236,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // index to send from
             int indexToSendFrom = nextIndex.get(i);
             Log prevEntry = log.get(indexToSendFrom - 1);
-
-            // this is the condtion that we need to just sendHeartBeat
-            if ((log.size() == 0) || (matchIndex.get(i) == log.size() - 1)) {
-
-            } else {
-            }
+            List<Log> entries = log.logEntriesFromIndex(indexToSendFrom);
+            
         }
     }
     public void reinitialiseIndexes() {

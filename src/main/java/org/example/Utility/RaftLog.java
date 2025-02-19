@@ -67,6 +67,14 @@ public class RaftLog {
         }
     }
 
+    public List<Log> logEntriesFromIndex(int index) {
+        lock.readLock().lock();
+        try {
+            return new ArrayList<>(log.subList(index, log.size()));
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
 
     public void clear() {
         lock.writeLock().lock();
