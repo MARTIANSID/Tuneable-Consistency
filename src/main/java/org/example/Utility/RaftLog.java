@@ -26,7 +26,7 @@ public class RaftLog {
 
     public LogEntry get(int index) {
         if (index < 0) {
-            return new LogEntry(-1, -1, null);
+            return new LogEntry(-1, -1, null, -1);
         }
         lock.readLock().lock();
         try {
@@ -104,7 +104,7 @@ public class RaftLog {
             List<LogEntryProto> entries = leadersEntries.getLogList();
 
             for(LogEntryProto entry : entries) {
-                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT()));
+                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern()));
             }
         } finally {
             lock.writeLock().unlock();
@@ -120,6 +120,12 @@ public class RaftLog {
         }
     }
     public void printLog() {
-        System.out.println(log);
+        lock.readLock().lock();
+
+        try {
+            System.out.println(log);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 }

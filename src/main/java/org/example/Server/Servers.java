@@ -28,10 +28,19 @@ public class Servers{
             System.out.println("Server" + (i + 1) + " started on port " + port);
             servers.add(server);
         }
-
         for (Server server : servers) {
             server.awaitTermination();
         }
 
     }
 }
+
+
+
+
+
+
+
+
+
+
