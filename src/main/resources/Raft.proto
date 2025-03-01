@@ -7,10 +7,17 @@ service Raft {
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
   rpc printLog(Empty) returns (Empty);
+  rpc sendAckToClient(Ack) returns (Empty);
 }
 
 message Empty{
   int32 data = 1;
+}
+
+message Ack {
+  // later on we can add more fields like timestamp for causal consistency
+  repeated Transaction t = 1;
+
 }
 
 message ClientMessage {

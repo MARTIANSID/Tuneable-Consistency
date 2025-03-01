@@ -1,8 +1,6 @@
 package org.example.Server;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Status;
+import io.grpc.*;
 import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
@@ -12,6 +10,11 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.ds.paxos.RaftGrpc.*;
 
@@ -58,6 +61,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<Integer, Integer> matchIndexCount;
 
+    ConcurrentHashMap<String, Integer> tIdToLogIndex; // id : logIndex
+
+    RaftStub clientStub;
+
+    ReadWriteLock lock;
 
 
     public ServerImpl(int serverId) {
@@ -80,7 +88,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.ackIndex = new AtomicInteger(-1);
         this.totalAcks = new ConcurrentHashMap<>();
         this.matchIndexCount = new ConcurrentHashMap<>();
-
+        this.tIdToLogIndex = new ConcurrentHashMap<>();
+        this.lock = new ReentrantReadWriteLock();
+//        this.ackSent = new ConcurrentHashMap<>();
         // setting the peers list
         for (int i = 0; i < 5; i++) {
             //setting up the nextIndex and matchIndex
@@ -94,48 +104,67 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
             }
         }
+        // setting up the client stub
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
+        clientStub = RaftGrpc.newStub(channel);
+
         // starting the election timer
         this.electionTimer.start();
     }
 
     @Override
     public void appendEntries(AppendEntriesArgument appendEntriesArgument, StreamObserver<AppendEntriesResult> responseObserver) {
-        int leadersTerm = appendEntriesArgument.getLeadersTerm(), prevLogIndex = appendEntriesArgument.getPrevLogIndex(), prevLogTerm = appendEntriesArgument.getPrevLogTerm(), leadersCommitIndex = appendEntriesArgument.getLeadersCommit(), leaderId = appendEntriesArgument.getLeadersId(), leadersAckIndex = appendEntriesArgument.getAckIndex();
+        int leadersTerm = appendEntriesArgument.getLeadersTerm(),
+                prevLogIndex = appendEntriesArgument.getPrevLogIndex(),
+                prevLogTerm = appendEntriesArgument.getPrevLogTerm(),
+                leadersCommitIndex = appendEntriesArgument.getLeadersCommit(),
+                leaderId = appendEntriesArgument.getLeadersId(),
+                leadersAckIndex = appendEntriesArgument.getAckIndex();
 
-        if (leadersTerm >= currentTerm.get()) {
-            currentLeader = leaderId;
-            currentTerm.set(leadersTerm);
-            if (status == ServerCurrentStatus.LEADER) {
-                startTheElectionTimer();
+        lock.writeLock().lock();
+
+        try {
+            // Check if the leader's term is valid
+            if (leadersTerm >= currentTerm.get()) {
+                currentLeader = leaderId;
+                currentTerm.updateAndGet(term -> Math.max(term, leadersTerm));
+                if (status == ServerCurrentStatus.LEADER) {
+                    startTheElectionTimer();
+                }
+                status = ServerCurrentStatus.FOLLOWER;
             }
-            status = ServerCurrentStatus.FOLLOWER;
-        }
 
-        if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
-            responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
+            // If the leader's term is outdated or log mismatch, respond with failure
+            if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
+                responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
+                responseObserver.onCompleted();
+                return;
+            }
+            // Proceed with appending the entries
+            Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
+            log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
+            log.appendEntries(leadersEntries);  // Append new entries
+
+            // Update commit index
+            if (leadersCommitIndex > commitIndex.get()) {
+                commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
+            }
+
+            // Reset the election timer as the leader is active
+            startTheElectionTimer();
+            // Send success response
+            responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).build());
             responseObserver.onCompleted();
-            return;
+
+//            System.out.println("Got Append Entries for server -- " + serverId + " Time --- " +(System.currentTimeMillis()));
+
+        } finally {
+            lock.writeLock().unlock();
         }
-
-        Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
-        // now first clear the entries starting from prevLogIndex + 1
-        log.truncateAfter(prevLogIndex + 1);
-
-        // appending leaders entries
-        log.appendEntries(leadersEntries);
-
-        // updating commit index of follower
-        if (leadersCommitIndex > commitIndex.get()) {
-            commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
-        }
-
-        // reset the election timer
-        startTheElectionTimer();
-
-        responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).build());
-        responseObserver.onCompleted();
     }
 
+
+    // in lock
     private boolean isUpToDateCandidateLog(int lastLogTermOfCandidate, int lastLogIndexOfCandidate) {
         int lastLogTermOfCurrentNode = getLastLogTerm(), lastLogIndexOfCurrentNode = getLastLogTerm();
 
@@ -153,28 +182,38 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         boolean isVoteGranted = true;
 
-        if (currentTermOfTheCandidate > currentTerm.get()) {
-            currentTerm.set(currentTermOfTheCandidate);
-            // the node must become a follower
-            if (status == ServerCurrentStatus.LEADER) {
+        lock.writeLock().lock();
+
+        try {
+            if (currentTermOfTheCandidate > currentTerm.get()) {
+                currentTerm.updateAndGet(term -> Math.max(term, currentTermOfTheCandidate));
+                // the node must become a follower
+                if (status == ServerCurrentStatus.LEADER) {
+                    startTheElectionTimer();
+                }
+                status = ServerCurrentStatus.FOLLOWER;
+            }
+            // all the necessary conditions to check for denying vote
+            if (votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
+                // reply false here
+                isVoteGranted = false;
+            }
+            if (isVoteGranted) {
+                votedFor.put(currentTerm.get(), candidateId);
                 startTheElectionTimer();
             }
-            status = ServerCurrentStatus.FOLLOWER;
-        }
 
-        // all the necessary conditions to check for denying vote
-        if (votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
-            // reply false here
-            isVoteGranted = false;
-        }
-        if (isVoteGranted) {
-            votedFor.put(currentTerm.get(), candidateId);
-            startTheElectionTimer();
-        }
+            RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
+            responseObserver.onNext(requestVoteResult);
+            responseObserver.onCompleted();
 
-        RequestVoteResult requestVoteResult = RequestVoteResult.newBuilder().setIsVoteGranted(isVoteGranted).setCurrentTerm(currentTerm.get()).build();
-        responseObserver.onNext(requestVoteResult);
-        responseObserver.onCompleted();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private boolean isWriteConcernStatisfied() {
+        return true;
     }
 
     @Override
@@ -188,12 +227,39 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return;
         }
 
-        System.out.println("Got the transaction!");
         Transaction t = clientMessage.getT();
+
+        String id = t.getId();
+
+        if (tIdToLogIndex.containsKey(id)) {
+            int logIndex = tIdToLogIndex.get(id);
+            if (commitIndex.get() >= logIndex) {
+                // already committed so just send the ack
+            } else if (isWriteConcernStatisfied()) {
+
+            }
+            // now here if the writeConcernStatisfied does not have the data basically it is a replica then the replica will update the writeConcern done on its end using appendEntries
+            responseObserver.onNext(Empty.newBuilder().build());
+            responseObserver.onCompleted();
+            return;
+        }
         int writeConcern = clientMessage.getWriteConcern();
-        int index = log.size() + 1;
-        log.append(new LogEntry(log.size(), currentTerm.get(), t, writeConcern));
+
+        int index = -1;
+        // we want it to be synchronized in order to get the correct index, and not allow multiple threads to get same index
+        // log.size() takes in only read lock hence we need synchronized
+        lock.writeLock().lock();
+        try {
+            System.out.println("Got the transaction!");
+            index = log.size();
+            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern));
+            System.out.println(index);
+        } finally {
+            lock.writeLock().unlock();
+        }
+
         totalAcks.put(index, 1);
+        tIdToLogIndex.put(id, index);
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
     }
@@ -219,16 +285,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
     }
 
+
+    // do not think that I need a lock here as all are atomic variables
     private boolean handleRequestVoteResult(RequestVoteResult requestVoteResult) {
         if (requestVoteResult.getCurrentTerm() > currentTerm.get()) {
-            // this node is not upto date
-            currentTerm.set(requestVoteResult.getCurrentTerm());
-            // now it cannot become the leader
+            // making this thread safe and the term is only updated to max value
+            currentTerm.updateAndGet(term -> Math.max(term, requestVoteResult.getCurrentTerm()));
             return false;
         } else if (requestVoteResult.getIsVoteGranted()) {
             // vote granted
             votes.incrementAndGet();
-            // voite granted
+            // vote granted
             return true;
         }
         return true;
@@ -267,6 +334,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         latch.countDown();
                     }
                 }
+
                 @Override
                 public void onError(Throwable throwable) {
 
@@ -289,6 +357,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    // inside read lock
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
@@ -298,29 +367,64 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return result;
     }
 
-    private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower) {
+    // it is inside write lock
+    public boolean checkIfIndexIsAValidCommitIndex(int index) {
+
+        if (index <= commitIndex.get()) return false;
+
+        // check if majority of the servers are at-least at this index
+        int cnt = 0;
+        for (int i = 0; i < 5; i++) {
+            if (matchIndex.get(i) >= index) {
+                cnt++;
+            }
+        }
+        return (cnt >= 2 && log.get(index).term == currentTerm.get());
+    }
+
+    private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower, int prevNextIndex) {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
 
-        if (termOfFollower > currentTerm.get()) {
-            // become follower
-            currentTerm.set(termOfFollower);
-            status = ServerCurrentStatus.FOLLOWER;
-            startTheElectionTimer();
-            return false;
-        }
-        if (!result) {
-            nextIndex.decrementAndGet(idOfFollower);
-        } else {
-            matchIndex.set(idOfFollower, matchIndexOfFollower);
-            matchIndexCount.put(matchIndexOfFollower, matchIndexCount.getOrDefault(matchIndexOfFollower, 0) + 1);
-            nextIndex.set(idOfFollower, matchIndexOfFollower + 1);
+        // Lock for reading and writing shared state
+        lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
+        try {
 
-            //checking here if we need to update the commitIndex of the leader
-            if((matchIndexOfFollower > commitIndex.get()) && (matchIndexCount.get(matchIndexOfFollower) >= 2 && (log.get(matchIndexOfFollower).term == currentTerm.get())) ) {
-                commitIndex.set(matchIndexOfFollower);
-                System.out.println("The commit index of leader updated to -- " + commitIndex.get());
+            if (termOfFollower > currentTerm.get()) {
+                currentTerm.updateAndGet(term -> Math.max(term, termOfFollower));
+                // Become follower
+                status = ServerCurrentStatus.FOLLOWER;
+                startTheElectionTimer();
+                return false;
             }
+
+            if (!result) {
+                if (nextIndex.get(idOfFollower) >= prevNextIndex) {
+                    nextIndex.decrementAndGet(idOfFollower);
+                }
+            } else {
+                // Update matchIndex and nextIndex
+                if (matchIndex.get(idOfFollower) < matchIndexOfFollower) {
+                    int prevMatchIndex = matchIndex.get(idOfFollower);
+                    matchIndex.set(idOfFollower, matchIndexOfFollower);
+                    nextIndex.set(idOfFollower, matchIndexOfFollower + 1);
+
+                    int prevCommitIndex = commitIndex.get();
+                    int candidateCommitIndex = matchIndex.get(idOfFollower);
+                    // Check if we need to update the commitIndex of the leader
+                    if (checkIfIndexIsAValidCommitIndex(candidateCommitIndex)) {
+                        if (prevCommitIndex != candidateCommitIndex) {
+                            commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
+                            currentTerm.updateAndGet(term -> Math.max(term, matchIndexOfFollower));
+                            System.out.println("The commit index of leader updated to -- " + commitIndex.get());
+                            System.out.println("Log size of leader is---" + log.size());
+                            // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
+                        }
+                    }
+                }
+            }
+        } finally {
+            lock.writeLock().unlock(); // Unlock after modifying shared state
         }
         return true;
     }
@@ -334,18 +438,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 if (i == serverId) continue;
 
+                int matchIndexForFollower = -1, indexToSendFrom = log.size() - 1;
+
+                AppendEntriesArgument appendEntriesArgument = null;
+                lock.readLock().lock();
+                try {
+                    indexToSendFrom = nextIndex.get(i);
+                    LogEntry prevEntry = log.get(indexToSendFrom - 1);
+                    List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
+                    Log l = Log.newBuilder().addAllLog(entries).build();
+                    appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).build();
+                    matchIndexForFollower = entries.size() + indexToSendFrom - 1;
+                } finally {
+                    lock.readLock().unlock();
+                }
                 // index to send from
-                int indexToSendFrom = nextIndex.get(i);
-                LogEntry prevEntry = log.get(indexToSendFrom - 1);
-                List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
-                Log l = Log.newBuilder().addAllLog(entries).build();
-                AppendEntriesArgument appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).build();
-                int matchIndexForFollower = log.size() - 1;
+                int matchIndexFollowerTemp = matchIndexForFollower;
+                int nextIndexTemp = indexToSendFrom;
+
 
                 stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
-                        doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexForFollower);
+                        doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp);
 
                     }
 
@@ -372,6 +487,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+
     public void reinitialiseIndexes() {
         for (int i = 0; i < 5; i++) {
             nextIndex.set(i, log.size());
@@ -380,51 +496,60 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     public void startElection() {
-        // Starting Election
-        System.out.println(serverId + " is " + "Starting Election");
-        // this node becomes a candidate
-        this.status = ServerCurrentStatus.CANDIDATE;
-        // first update the term
-        currentTerm.incrementAndGet();
-        // reset the timer
-        startTheElectionTimer();
-        // resetting the votes
-        votes.set(0);
-        // vote self
-        votedFor.put(currentTerm.get(), serverId);
-        isElectionOver.set(false);
+        lock.writeLock().lock();  // Acquire the write lock for the entire election process
+        try {
+            System.out.println(serverId + " is " + "Starting Election" + "Time in milli Seconds" + System.currentTimeMillis());
+            // This node becomes a candidate
+            this.status = ServerCurrentStatus.CANDIDATE;
+            // First update the term
+            currentTerm.incrementAndGet();
+            // Reset the timer
+            startTheElectionTimer();
+            // Resetting the votes
+            votes.set(0);
+            // Vote for self
+            votedFor.put(currentTerm.get(), serverId);
+            isElectionOver.set(false);
+        } finally {
+            lock.writeLock().unlock();  // Release the lock after the initial election setup
+        }
+
         requestForVotes();
 
-        if (votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
+        // Now that we have finished the election setup, we can check for the election result
+        lock.writeLock().lock();  // Acquire the lock to ensure that no other thread modifies the shared state while we transition
+        try {
+            if (votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
+                doesLeaderHasHighestTerm = true;
 
-            doesLeaderHasHighestTerm = true;
-
-            System.out.println(serverId + " " + "Became the leader" + "The term is" + currentTerm.get());
-            // stop the election timer
-            electionTimer.stop();
-            // reinitialise state
-            reinitialiseIndexes();
-            // this node becomes the leader
-            this.status = ServerCurrentStatus.LEADER;
-            this.currentLeader = this.serverId;
-            // start sending AppendEntries
-            sendAppendEntries();
-        } else {
-            this.status = ServerCurrentStatus.FOLLOWER;
+                System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
+                // Stop the election timer
+                electionTimer.stop();
+                // Reinitialize state
+                reinitialiseIndexes();
+                // This node becomes the leader
+                this.status = ServerCurrentStatus.LEADER;
+                this.currentLeader = this.serverId;
+            } else {
+                this.status = ServerCurrentStatus.FOLLOWER;
+            }
+        } finally {
+            lock.writeLock().unlock();  // Release the lock after modifying shared state
+            // Start sending AppendEntries outside the critical section
+            if (votes.get() >= 2 && status == ServerCurrentStatus.LEADER) {
+                sendAppendEntries();
+            }
         }
     }
 
     @Override
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
-        System.out.println("The commit index of this node is -- " + commitIndex.get() );
+        System.out.println("The commit index of this node is -- " + commitIndex.get());
+        System.out.println("The size of log is ---" + log.size());
         log.printLog();
     }
 
     private void startTheElectionTimer() {
         this.electionTimer.reset();
-        this.electionTimer.start();
     }
-
-
-
 }

@@ -7,12 +7,22 @@ public class LogEntry {
     public int term;
     public Transaction t;
     public int writeConcern = 2;
+    boolean ackSent;
 
     public LogEntry(int index, int term, Transaction t, int writeConcern) {
         this.index = index;
         this.term = term;
         this.t = t;
         this.writeConcern = writeConcern;
+        this.ackSent = false;
+    }
+
+    public LogEntry(int index, int term, Transaction t) {
+        this.index = index;
+        this.term = term;
+        this.t = t;
+        this.writeConcern = 2;
+        this.ackSent = false;
     }
     @Override
     public String toString() {

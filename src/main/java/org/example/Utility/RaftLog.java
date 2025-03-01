@@ -36,6 +36,15 @@ public class RaftLog {
         }
     }
 
+    public List<LogEntry> getEntries(int start, int end) {
+        lock.readLock().lock();
+        try {
+           return log.subList(start, end + 1);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     public void truncateAfter(int index) {
         lock.writeLock().lock();
         try {
