@@ -63,6 +63,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<String, Integer> tIdToLogIndex; // id : logIndex
 
+    ConcurrentHashMap<String, Boolean> ackSent;
     RaftStub clientStub;
 
     ReadWriteLock lock;
@@ -90,6 +91,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.matchIndexCount = new ConcurrentHashMap<>();
         this.tIdToLogIndex = new ConcurrentHashMap<>();
         this.lock = new ReentrantReadWriteLock();
+        this.ackSent = new ConcurrentHashMap<>();
 //        this.ackSent = new ConcurrentHashMap<>();
         // setting the peers list
         for (int i = 0; i < 5; i++) {
@@ -144,6 +146,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
             log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
             log.appendEntries(leadersEntries);  // Append new entries
+
+
+            // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
+            for(LogEntryProto logEntry : leadersEntries.getLogList()) {
+                tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
+            }
 
             // Update commit index
             if (leadersCommitIndex > commitIndex.get()) {
@@ -253,10 +261,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             System.out.println("Got the transaction!");
             index = log.size();
             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern));
+            log.updateWriteConcern(index);
+            ackSent.put(id, false);
+            if(log.get(index).writeConcern == 0) {
+                List<LogEntry> entry = new ArrayList<>();
+                entry.add(log.get(index));
+                sendAckForEntries(entry);
+            }
             System.out.println(index);
         } finally {
             lock.writeLock().unlock();
         }
+
 
         totalAcks.put(index, 1);
         tIdToLogIndex.put(id, index);
@@ -382,6 +398,40 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return (cnt >= 2 && log.get(index).term == currentTerm.get());
     }
 
+
+
+    private void sendAckForEntries(List<LogEntry> entriesToBeAck) {
+
+        List<Transaction> entries = new ArrayList<>();
+
+        for(LogEntry entry : entriesToBeAck) {
+            if(ackSent.containsKey(entry.t.getId()) && !ackSent.get(entry.t.getId())) {
+                // send ack for this entry
+                System.out.println("sending ack");
+                entries.add(entry.t);
+                ackSent.put(entry.t.getId(), true);
+            }
+        }
+        clientStub.sendAckToClient(Ack.newBuilder().addAllT(entries).build(), new StreamObserver<Empty>() {
+            @Override
+            public void onNext(Empty empty) {
+
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+
+            }
+
+            @Override
+            public void onCompleted() {
+
+            }
+        });
+
+
+    }
+
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower, int prevNextIndex) {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
@@ -415,18 +465,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     if (checkIfIndexIsAValidCommitIndex(candidateCommitIndex)) {
                         if (prevCommitIndex != candidateCommitIndex) {
                             commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
-                            currentTerm.updateAndGet(term -> Math.max(term, matchIndexOfFollower));
                             System.out.println("The commit index of leader updated to -- " + commitIndex.get());
                             System.out.println("Log size of leader is---" + log.size());
                             // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
+                            List<LogEntry> entriesToBeAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
+                            sendAckForEntries(entriesToBeAck);
                         }
                     }
                 }
+                checkIfWriteConcernsAreSatisfied(matchIndex.get(idOfFollower),idOfFollower);
             }
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
         }
         return true;
+    }
+
+    private  void checkIfWriteConcernsAreSatisfied(int newMatchIndexOfFollower, int idOfFollower) {
+        List<LogEntry> entries = new ArrayList<>();
+        for(int i = commitIndex.get() + 1; i<=newMatchIndexOfFollower; i++) {
+            String id = log.get(i).t.getId();
+            if(ackSent.containsKey(id) && !ackSent.get(id)) {
+                System.out.println("This follower --"+idOfFollower + "is updating the writeConcern of" + log.get(i).t);
+                log.updateWriteConcern(i);
+                if(log.get(i).writeConcern == 0) {
+                    entries.add(log.get(i));
+                }
+            }
+        }
+        sendAckForEntries(entries);
     }
 
     private void sendAppendEntries() {

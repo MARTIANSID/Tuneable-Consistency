@@ -23,7 +23,7 @@ public class Test {
         RaftGrpc.RaftBlockingStub stub = RaftGrpc.newBlockingStub(channel);
         RaftGrpc.RaftStub stub2 = RaftGrpc.newStub(channel);
 
-        stub.printLog(Empty.newBuilder().build());
+//        stub.printLog(Empty.newBuilder().build());
 
 
         Transaction t = Transaction.newBuilder()
@@ -42,37 +42,36 @@ public class Test {
 //            throw new RuntimeException(e);
 //        }
 //
-//        // Parallel execution using threads
-//        ExecutorService executorService = Executors.newFixedThreadPool(THREAD_COUNT);
-//        CountDownLatch latch = new CountDownLatch(THREAD_COUNT);
-//
-//        for (int i = 0; i < THREAD_COUNT; i++) {
-//            executorService.execute(() -> {
-//                try {
-//                    Transaction parallelTransaction = Transaction.newBuilder()
-//                            .setId(String.valueOf(new Random().nextInt(10000)))
-//                            .setAmount(new Random().nextInt(200))
-//                            .setReceiver("Test1")
-//                            .setSender("Test2")
-//                            .build();
-//
-//                    stub.sendTransaction(ClientMessage.newBuilder().setT(parallelTransaction).build());
-//                    System.out.println("Transaction sent: " + parallelTransaction.getId());
-//                } catch (Exception e) {
-//                    System.err.println("Error sending transaction: " + e.getMessage());
-//                } finally {
-//                    latch.countDown();
-//                }
-//            });
-//        }
-//
-//        try {
-//            latch.await(); // Wait for all threads to complete
-//        } catch (InterruptedException e) {
-//            throw new RuntimeException(e);
-//        }
-//
-//        executorService.shutdown();
+        // Parallel execution using threads
+        ExecutorService executorService = Executors.newFixedThreadPool(THREAD_COUNT);
+        CountDownLatch latch = new CountDownLatch(THREAD_COUNT);
+
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            executorService.execute(() -> {
+                try {
+                    Transaction parallelTransaction = Transaction.newBuilder()
+                            .setId(String.valueOf(new Random().nextInt(10000)))
+                            .setAmount(new Random().nextInt(200))
+                            .setReceiver("Test1")
+                            .setSender("Test2")
+                            .build();
+                    stub.sendTransaction(ClientMessage.newBuilder().setT(parallelTransaction).setWriteConcern(2).build());
+                    System.out.println("Transaction sent: " + parallelTransaction.getId());
+                } catch (Exception e) {
+                    System.err.println("Error sending transaction: " + e.getMessage());
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        try {
+            latch.await(); // Wait for all threads to complete
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+        executorService.shutdown();
         channel.shutdown();
         System.out.println("All transactions sent.");
     }

@@ -35,6 +35,14 @@ public class Servers{
     }
 }
 
+//nextIndex = [4,4,4]
+//        matchIndex = [f3, 4, f2, ]
+//f1 - [1,2, 3, 4]
+//f2 - [1,2,3,4]
+//f3 - [1,2, 3 , 4]
+////l1  - [1,2,3,4]
+//commitindex  = 2
+
 
 
 

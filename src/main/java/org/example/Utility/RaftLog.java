@@ -24,6 +24,15 @@ public class RaftLog {
         }
     }
 
+    public void updateWriteConcern(int index) {
+        lock.writeLock().lock();
+
+        try {
+           log.get(index).writeConcern = log.get(index).writeConcern - 1;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
     public LogEntry get(int index) {
         if (index < 0) {
             return new LogEntry(-1, -1, null, -1);
