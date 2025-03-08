@@ -17,7 +17,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Servers{
 
     public static void main(String[] args) throws IOException, InterruptedException {
-
         List<Server> servers = new ArrayList<>();
         for (int i = 1; i <= 5; i++) {
             int port = 8000 + i; // Ports 8000 to 8004

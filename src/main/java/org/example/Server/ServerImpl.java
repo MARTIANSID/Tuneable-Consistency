@@ -5,12 +5,10 @@ import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -63,8 +61,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<String, Integer> tIdToLogIndex; // id : logIndex
 
+    ConcurrentHashMap<String, Long> timeAtWhichTransactionWasReceived;
+    AtomicLong totalLatency;
+
     ConcurrentHashMap<String, Boolean> ackSent;
     RaftStub clientStub;
+    AtomicLong ackTransactionCount;
 
     ReadWriteLock lock;
 
@@ -92,6 +94,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.tIdToLogIndex = new ConcurrentHashMap<>();
         this.lock = new ReentrantReadWriteLock();
         this.ackSent = new ConcurrentHashMap<>();
+        this.timeAtWhichTransactionWasReceived = new ConcurrentHashMap<>();
+        this.totalLatency = new AtomicLong(0);
+        this.ackTransactionCount = new AtomicLong(0);
 //        this.ackSent = new ConcurrentHashMap<>();
         // setting the peers list
         for (int i = 0; i < 5; i++) {
@@ -149,7 +154,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
             // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
-            for(LogEntryProto logEntry : leadersEntries.getLogList()) {
+            for (LogEntryProto logEntry : leadersEntries.getLogList()) {
                 tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
             }
 
@@ -239,18 +244,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         String id = t.getId();
 
-        if (tIdToLogIndex.containsKey(id)) {
-            int logIndex = tIdToLogIndex.get(id);
-            if (commitIndex.get() >= logIndex) {
-                // already committed so just send the ack
-            } else if (isWriteConcernStatisfied()) {
-
-            }
-            // now here if the writeConcernStatisfied does not have the data basically it is a replica then the replica will update the writeConcern done on its end using appendEntries
-            responseObserver.onNext(Empty.newBuilder().build());
-            responseObserver.onCompleted();
-            return;
-        }
+//        if (tIdToLogIndex.containsKey(id)) {
+//            int logIndex = tIdToLogIndex.get(id);
+//            if (commitIndex.get() >= logIndex) {
+//                // already committed so just send the ack
+//            } else if (isWriteConcernStatisfied()) {
+//            }
+//            // now here if the writeConcernStatisfied does not have the data basically it is a replica then the replica will update the writeConcern done on its end using appendEntries
+//            responseObserver.onNext(Empty.newBuilder().build());
+//            responseObserver.onCompleted();
+//            return;
+//        }
         int writeConcern = clientMessage.getWriteConcern();
 
         int index = -1;
@@ -263,7 +267,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern));
             log.updateWriteConcern(index);
             ackSent.put(id, false);
-            if(log.get(index).writeConcern == 0) {
+            timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
+            if (log.get(index).writeConcern == 0) {
                 List<LogEntry> entry = new ArrayList<>();
                 entry.add(log.get(index));
                 sendAckForEntries(entry);
@@ -399,17 +404,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
 
-
     private void sendAckForEntries(List<LogEntry> entriesToBeAck) {
 
         List<Transaction> entries = new ArrayList<>();
 
-        for(LogEntry entry : entriesToBeAck) {
-            if(ackSent.containsKey(entry.t.getId()) && !ackSent.get(entry.t.getId())) {
+        for (LogEntry entry : entriesToBeAck) {
+            String id = entry.t.getId();
+            if (ackSent.containsKey(id) && !ackSent.get(id)) {
                 // send ack for this entry
                 System.out.println("sending ack");
+                long latency = (System.nanoTime() - timeAtWhichTransactionWasReceived.get(id)) / 1_000_000;
+                System.out.println("The latency is ---" + latency);
+                totalLatency.addAndGet(latency);
+                System.out.println("The total latency variable is -- " + totalLatency.get());
+                ackTransactionCount.incrementAndGet();
                 entries.add(entry.t);
-                ackSent.put(entry.t.getId(), true);
+                ackSent.put(id, true);
             }
         }
         clientStub.sendAckToClient(Ack.newBuilder().addAllT(entries).build(), new StreamObserver<Empty>() {
@@ -428,8 +438,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             }
         });
-
-
     }
 
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower, int prevNextIndex) {
@@ -473,7 +481,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         }
                     }
                 }
-                checkIfWriteConcernsAreSatisfied(matchIndex.get(idOfFollower),idOfFollower);
+                checkIfWriteConcernsAreSatisfied(matchIndex.get(idOfFollower), idOfFollower);
             }
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
@@ -481,14 +489,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return true;
     }
 
-    private  void checkIfWriteConcernsAreSatisfied(int newMatchIndexOfFollower, int idOfFollower) {
+    // inside lock
+    private void checkIfWriteConcernsAreSatisfied(int newMatchIndexOfFollower, int idOfFollower) {
         List<LogEntry> entries = new ArrayList<>();
-        for(int i = commitIndex.get() + 1; i<=newMatchIndexOfFollower; i++) {
+
+        // optional check, need to confirm if we this is necessary
+        if(log.get(newMatchIndexOfFollower).term != currentTerm.get()) return;
+
+        for (int i = commitIndex.get() + 1; i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
-            if(ackSent.containsKey(id) && !ackSent.get(id)) {
-                System.out.println("This follower --"+idOfFollower + "is updating the writeConcern of" + log.get(i).t);
+            if (ackSent.containsKey(id) && !ackSent.get(id)) {
+                System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
                 log.updateWriteConcern(i);
-                if(log.get(i).writeConcern == 0) {
+                if (log.get(i).writeConcern == 0) {
                     entries.add(log.get(i));
                 }
             }
@@ -588,7 +601,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             if (votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
                 doesLeaderHasHighestTerm = true;
-
                 System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
                 // Stop the election timer
                 electionTimer.stop();
@@ -613,7 +625,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
         System.out.println("The commit index of this node is -- " + commitIndex.get());
         System.out.println("The size of log is ---" + log.size());
-        log.printLog();
+        System.out.println(totalLatency.get());
+        System.out.println("The latency of the system is in ms----" + (totalLatency.get() / (ackTransactionCount.get())));
+//        log.printLog();
     }
 
     private void startTheElectionTimer() {
