@@ -18,8 +18,6 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class ClientServerImpl extends RaftGrpc.RaftImplBase {
-
-
     ConcurrentHashMap<String, Boolean> ackReceived;
     ReadWriteLock lock;
 
@@ -27,7 +25,6 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
        this.ackReceived = new ConcurrentHashMap<>();
        this.lock = new ReentrantReadWriteLock();
     }
-
 
     // no need to acquire lock as it is already thread safe
     @Override
