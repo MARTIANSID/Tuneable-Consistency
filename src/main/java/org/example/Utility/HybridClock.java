@@ -1,21 +1,28 @@
 package org.example.Utility;
 
+import org.ds.paxos.TimeStampProto;
+
 public class HybridClock {
 
-    static class TimeStamp {
-        long physical;
-        long logical;
+    public static class TimeStamp {
+        public long physical;
+        public long logical;
 
         public TimeStamp(long p, long l) {
             this.physical = p;
             this.logical = l;
         }
+
+        public static TimeStampProto convertToProto(TimeStamp timeStamp) {
+            return TimeStampProto.newBuilder().setP(timeStamp.physical).setL(timeStamp.logical).build();
+        }
+
+        public static TimeStamp convertToTimeStamp(TimeStampProto timeStamp) {
+            return new TimeStamp(timeStamp.getP(), timeStamp.getL());
+        }
     }
 
     static class PhysicalClock {
-        /*
-        This class is an abstraction of local physical clock in the node.
-        */
         long physical;
         public PhysicalClock() {}
 

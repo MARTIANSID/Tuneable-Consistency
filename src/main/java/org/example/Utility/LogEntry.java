@@ -8,13 +8,15 @@ public class LogEntry {
     public Transaction t;
     public int writeConcern = 2;
     boolean ackSent;
+   public HybridClock.TimeStamp timeStamp;
 
-    public LogEntry(int index, int term, Transaction t, int writeConcern) {
+    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp) {
         this.index = index;
         this.term = term;
         this.t = t;
         this.writeConcern = writeConcern;
         this.ackSent = false;
+        this.timeStamp = timeStamp;
     }
 
     public LogEntry(int index, int term, Transaction t) {

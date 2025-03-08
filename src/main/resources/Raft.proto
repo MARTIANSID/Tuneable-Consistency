@@ -36,6 +36,12 @@ message LogEntryProto {
   int32 term = 2;
   int32 writeConcern = 3;
   Transaction t = 4;
+  TimeStampProto timeStamp = 5;
+}
+
+message TimeStampProto {
+  int64 p = 1;
+  int64 l = 2;
 }
 
 message Log {
@@ -50,6 +56,8 @@ message AppendEntriesArgument {
   Log entriesToAppend = 5;
   int32 leadersCommit = 6;
   int32 ackIndex = 7;
+  TimeStampProto timeStamp = 8;
+
 }
 
 message RequestVoteArguments {
@@ -63,6 +71,7 @@ message AppendEntriesResult {
   int32 currentTerm = 1;
   bool isSuccessFull = 2;
   int32 followerId = 3;
+  TimeStampProto timeStamp = 4;
 }
 message RequestVoteResult {
   int32 currentTerm = 1;

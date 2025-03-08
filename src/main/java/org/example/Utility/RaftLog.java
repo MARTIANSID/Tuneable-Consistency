@@ -2,6 +2,7 @@ package org.example.Utility;
 
 import org.ds.paxos.Log;
 import org.ds.paxos.LogEntryProto;
+import org.ds.paxos.TimeStampProto;
 
 import java.util.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -35,7 +36,7 @@ public class RaftLog {
     }
     public LogEntry get(int index) {
         if (index < 0) {
-            return new LogEntry(-1, -1, null, -1);
+            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L));
         }
         lock.readLock().lock();
         try {
@@ -122,7 +123,7 @@ public class RaftLog {
             List<LogEntryProto> entries = leadersEntries.getLogList();
 
             for(LogEntryProto entry : entries) {
-                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern()));
+                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(), HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp())));
             }
         } finally {
             lock.writeLock().unlock();

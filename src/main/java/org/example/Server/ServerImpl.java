@@ -16,6 +16,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.ds.paxos.RaftGrpc.*;
 
+import org.example.Utility.HybridClock;
 import org.example.Utility.LogEntry;
 import org.example.Utility.RaftLog;
 import org.example.Utility.ServerStatus.*;
@@ -70,6 +71,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ReadWriteLock lock;
 
+    HybridClock hybridClock;
+
 
     public ServerImpl(int serverId) {
         this.currentTerm = new AtomicInteger(0);
@@ -97,7 +100,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.timeAtWhichTransactionWasReceived = new ConcurrentHashMap<>();
         this.totalLatency = new AtomicLong(0);
         this.ackTransactionCount = new AtomicLong(0);
-//        this.ackSent = new ConcurrentHashMap<>();
+        this.hybridClock = new HybridClock();
+
         // setting the peers list
         for (int i = 0; i < 5; i++) {
             //setting up the nextIndex and matchIndex
@@ -128,9 +132,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 leaderId = appendEntriesArgument.getLeadersId(),
                 leadersAckIndex = appendEntriesArgument.getAckIndex();
 
+        TimeStampProto leadersTimeStamp = appendEntriesArgument.getTimeStamp();
+
         lock.writeLock().lock();
 
         try {
+            // update clock of follower using leaders clock
+            hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
+
             // Check if the leader's term is valid
             if (leadersTerm >= currentTerm.get()) {
                 currentLeader = leaderId;
@@ -140,6 +149,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
                 status = ServerCurrentStatus.FOLLOWER;
             }
+
 
             // If the leader's term is outdated or log mismatch, respond with failure
             if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
@@ -166,7 +176,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Reset the election timer as the leader is active
             startTheElectionTimer();
             // Send success response
-            responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).build());
+
+            // current time of follower
+            HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
+
+            responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
+
             responseObserver.onCompleted();
 
 //            System.out.println("Got Append Entries for server -- " + serverId + " Time --- " +(System.currentTimeMillis()));
@@ -264,7 +279,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             System.out.println("Got the transaction!");
             index = log.size();
-            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern));
+            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, hybridClock.now()));
             log.updateWriteConcern(index);
             ackSent.put(id, false);
             timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
@@ -444,9 +459,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
 
+        TimeStampProto followersTimeStamp = appendEntriesResult.getTimeStamp();
+
         // Lock for reading and writing shared state
         lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
         try {
+
+            // updating the clock of leader
+            hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(followersTimeStamp));
 
             if (termOfFollower > currentTerm.get()) {
                 currentTerm.updateAndGet(term -> Math.max(term, termOfFollower));
@@ -494,7 +514,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<LogEntry> entries = new ArrayList<>();
 
         // optional check, need to confirm if we this is necessary
-        if(log.get(newMatchIndexOfFollower).term != currentTerm.get()) return;
+        if (log.get(newMatchIndexOfFollower).term != currentTerm.get()) return;
 
         for (int i = commitIndex.get() + 1; i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
@@ -527,7 +547,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     LogEntry prevEntry = log.get(indexToSendFrom - 1);
                     List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
                     Log l = Log.newBuilder().addAllLog(entries).build();
-                    appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).build();
+                    appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now())).build();
                     matchIndexForFollower = entries.size() + indexToSendFrom - 1;
                 } finally {
                     lock.readLock().unlock();
