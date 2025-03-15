@@ -20,8 +20,12 @@ public class HybridClock {
         public static TimeStamp convertToTimeStamp(TimeStampProto timeStamp) {
             return new TimeStamp(timeStamp.getP(), timeStamp.getL());
         }
-    }
 
+        @Override
+        public String toString() {
+            return physical + " " + logical;
+        }
+    }
     static class PhysicalClock {
         long physical;
         public PhysicalClock() {}
@@ -39,7 +43,6 @@ public class HybridClock {
     public HybridClock() {
         this.physicalClock = new PhysicalClock();
     }
-
     public TimeStamp now() {
         TimeStamp now;
         long currentPhysical = this.physicalClock.now();

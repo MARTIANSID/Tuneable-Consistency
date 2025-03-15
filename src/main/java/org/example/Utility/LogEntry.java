@@ -28,6 +28,6 @@ public class LogEntry {
     }
     @Override
     public String toString() {
-        return "The Transaction is: " + t;
+        return "The Transaction is: " + t + " The time stamp is" + timeStamp + " The time stamp is" + timeStamp + " The time stamp is" + timeStamp;
     }
 }

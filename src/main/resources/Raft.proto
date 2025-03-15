@@ -14,10 +14,15 @@ message Empty{
   int32 data = 1;
 }
 
+
+message AckMessage {
+  Transaction t = 1;
+  TimeStampProto timStamp = 2;
+}
+
 message Ack {
   // later on we can add more fields like timestamp for causal consistency
-  repeated Transaction t = 1;
-
+  repeated AckMessage ackMessage = 1;
 }
 
 message ClientMessage {

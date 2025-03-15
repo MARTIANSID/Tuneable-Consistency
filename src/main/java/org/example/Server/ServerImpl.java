@@ -421,7 +421,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private void sendAckForEntries(List<LogEntry> entriesToBeAck) {
 
-        List<Transaction> entries = new ArrayList<>();
+        List<AckMessage> ackMessages = new ArrayList<>();
 
         for (LogEntry entry : entriesToBeAck) {
             String id = entry.t.getId();
@@ -433,11 +433,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 totalLatency.addAndGet(latency);
                 System.out.println("The total latency variable is -- " + totalLatency.get());
                 ackTransactionCount.incrementAndGet();
-                entries.add(entry.t);
+                ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).build());
                 ackSent.put(id, true);
             }
         }
-        clientStub.sendAckToClient(Ack.newBuilder().addAllT(entries).build(), new StreamObserver<Empty>() {
+        clientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
             @Override
             public void onNext(Empty empty) {
 
@@ -526,7 +526,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             }
         }
-        sendAckForEntries(entries);
+
+        // entries array size should be greater than zero
+        if(entries.size() > 0) {
+            sendAckForEntries(entries);
+        }
     }
 
     private void sendAppendEntries() {
@@ -647,7 +651,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         System.out.println("The size of log is ---" + log.size());
         System.out.println(totalLatency.get());
         System.out.println("The latency of the system is in ms----" + (totalLatency.get() / (ackTransactionCount.get())));
-//        log.printLog();
+        System.out.println("The current clock time of this node is----" + hybridClock.now());
+        log.printLog();
     }
 
     private void startTheElectionTimer() {
