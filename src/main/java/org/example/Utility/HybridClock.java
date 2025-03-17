@@ -68,6 +68,6 @@ public class HybridClock {
         }
 
         this.lastPhysical = in.physical;
-        this.nextLogical = in.logical + 1;
+        this.nextLogical = Math.max(in.logical, now.logical) + 1;
     }
 }
