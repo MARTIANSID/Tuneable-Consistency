@@ -63,6 +63,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<String, Integer> tIdToLogIndex; // id : logIndex
 
     ConcurrentHashMap<String, Long> timeAtWhichTransactionWasReceived;
+
+    ConcurrentHashMap<String, Double> clientBalancesMajorityCommitted;
+
+    ConcurrentHashMap<String, Double> clientBalancesLatest;
     AtomicLong totalLatency;
 
     ConcurrentHashMap<String, Boolean> ackSent;
@@ -101,6 +105,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.totalLatency = new AtomicLong(0);
         this.ackTransactionCount = new AtomicLong(0);
         this.hybridClock = new HybridClock();
+        this.clientBalancesMajorityCommitted = new ConcurrentHashMap<>();
+        this.clientBalancesLatest = new ConcurrentHashMap<>();
 
         // setting the peers list
         for (int i = 0; i < 5; i++) {
@@ -159,18 +165,30 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             // Proceed with appending the entries
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
+
+            // reverting the latest balances
+            rollbackTillIndex(prevLogIndex + 1);
             log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
             log.appendEntries(leadersEntries);  // Append new entries
 
 
             // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
+            // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
                 tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
+                updateBalances(logEntry.getT(), clientBalancesLatest);
             }
+
 
             // Update commit index
             if (leadersCommitIndex > commitIndex.get()) {
+                int prevCommitIndex = commitIndex.get();
+
                 commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
+                // update majority committed ap
+                for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
+                    updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
+                }
             }
 
             // Reset the election timer as the leader is active
@@ -189,6 +207,39 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+
+    // inside write lock
+    private void updateBalances(Transaction t, ConcurrentHashMap<String, Double> balances) {
+        String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
+
+        double amount = t.getAmount();
+
+        balances.put(sender, balances.getOrDefault(sender, 100.0) - amount);
+        balances.put(receiver, balances.getOrDefault(receiver, 100.0) + amount);
+    }
+
+    // inside write lock
+    private void rollbackTillIndex(int logIndex) {
+        // remove the entries from the logIndex till the end
+
+        for (int i = logIndex; i < log.size(); i++) {
+            Transaction t = log.get(logIndex).t;
+
+            String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
+
+            double amount = t.getAmount();
+
+            // revert the transaction, and the rollback will be performed in the clientBalancesLatest
+            clientBalancesLatest.put(sender, clientBalancesLatest.get(sender) + amount);
+            clientBalancesLatest.put(receiver, clientBalancesLatest.get(receiver) - amount);
+
+            // remove the entries from tIdToLogIndex
+            tIdToLogIndex.remove(id);
+
+        }
+
     }
 
 
@@ -279,7 +330,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             System.out.println("Got the transaction!");
             index = log.size();
+
+            if (clientMessage.hasTimeStamp()) {
+                // updating the clock of leader using the time stamp sent by the client
+                hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(clientMessage.getTimeStamp()));
+            }
+
             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, hybridClock.now()));
+            updateBalances(t, clientBalancesLatest);
             log.updateWriteConcern(index);
             ackSent.put(id, false);
             timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
@@ -292,7 +350,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             lock.writeLock().unlock();
         }
-
 
         totalAcks.put(index, 1);
         tIdToLogIndex.put(id, index);
@@ -320,7 +377,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private RequestVoteArguments getRequestVoteArgumentsObject() {
         return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
     }
-
 
     // do not think that I need a lock here as all are atomic variables
     private boolean handleRequestVoteResult(RequestVoteResult requestVoteResult) {
@@ -384,7 +440,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         }
         try {
-            // Wait for up to 30ms for responses
+            // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
             isElectionOver.set(true);
@@ -403,6 +459,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return result;
     }
 
+
     // it is inside write lock
     public boolean checkIfIndexIsAValidCommitIndex(int index) {
 
@@ -415,6 +472,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 cnt++;
             }
         }
+        // here I have used >= 2 because we don't actually update the match index of the leader
         return (cnt >= 2 && log.get(index).term == currentTerm.get());
     }
 
@@ -493,8 +551,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     if (checkIfIndexIsAValidCommitIndex(candidateCommitIndex)) {
                         if (prevCommitIndex != candidateCommitIndex) {
                             commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
+
+                            // update the majority committed map
+                            for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
+                                updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
+                            }
+
                             System.out.println("The commit index of leader updated to -- " + commitIndex.get());
                             System.out.println("Log size of leader is---" + log.size());
+
                             // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
                             List<LogEntry> entriesToBeAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
                             sendAckForEntries(entriesToBeAck);
@@ -528,7 +593,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
 
         // entries array size should be greater than zero
-        if(entries.size() > 0) {
+        if (entries.size() > 0) {
             sendAckForEntries(entries);
         }
     }
@@ -649,10 +714,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
         System.out.println("The commit index of this node is -- " + commitIndex.get());
         System.out.println("The size of log is ---" + log.size());
-        System.out.println(totalLatency.get());
-        System.out.println("The latency of the system is in ms----" + (totalLatency.get() / (ackTransactionCount.get())));
-        System.out.println("The current clock time of this node is----" + hybridClock.now());
-        log.printLog();
+        System.out.println("The majority committed map -- " + clientBalancesMajorityCommitted);
+        System.out.println("The latest map -- " + clientBalancesLatest);
+
+//        System.out.println(totalLatency.get());
+//        System.out.println("The latency of the system is in ms----" + (totalLatency.get() / (ackTransactionCount.get())));
+//        System.out.println("The current clock time of this node is----" + hybridClock.now());
+//        log.printLog();
     }
 
     private void startTheElectionTimer() {
