@@ -55,12 +55,9 @@ public class HybridClock {
             return Objects.hash(physical, logical); // Create hash code based on physical and logical
         }
     }
-
     static class PhysicalClock {
         long physical;
-
-        public PhysicalClock() {
-        }
+        public PhysicalClock() {}
 
         public long now() {
             this.physical = System.currentTimeMillis();
@@ -75,7 +72,6 @@ public class HybridClock {
     public HybridClock() {
         this.physicalClock = new PhysicalClock();
     }
-
     public TimeStamp now() {
         TimeStamp now;
         long currentPhysical = this.physicalClock.now();
@@ -102,5 +98,36 @@ public class HybridClock {
 
         this.lastPhysical = in.physical;
         this.nextLogical = Math.max(in.logical, now.logical) + 1;
+    }
+
+    // some test cases
+    public static void main(String[] args) {
+        HybridClock clock = new HybridClock();
+        // Test 1: Basic Functionality
+        TimeStamp ts1 = clock.now();
+        TimeStamp ts2 = clock.now();
+        System.out.println("Test 1: Basic Functionality");
+        System.out.println("Timestamp 1: " + ts1);
+        System.out.println("Timestamp 2: " + ts2);
+        System.out.println("Timestamps should be ordered correctly: " + (ts1.compareTo(ts2) < 0));
+        System.out.println();
+        // Test 2: Logical Counter Increment
+        TimeStamp ts3 = clock.now();
+        TimeStamp ts4 = clock.now();
+        System.out.println("Test 2: Logical Counter Increment");
+        System.out.println("Timestamp 3: " + ts3);
+        System.out.println("Timestamp 4: " + ts4);
+        System.out.println("Logical counter should increment: " + (ts4.logical == ts3.logical + 1));
+        System.out.println();
+        // Test 3: Update Method
+        TimeStamp ts5 = clock.now();
+        TimeStamp ts6 = new TimeStamp(ts5.physical, ts5.logical + 5);
+        clock.update(ts6);
+        TimeStamp ts7 = clock.now();
+        System.out.println("Test 3: Update Method");
+        System.out.println("Timestamp 5: " + ts5);
+        System.out.println("Timestamp 6: " + ts6);
+        System.out.println("Timestamp 7: " + ts7);
+        System.out.println("Logical counter should update correctly: " + (ts7.logical == ts6.logical + 1));
     }
 }
