@@ -67,6 +67,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<String, Double> clientBalancesMajorityCommitted;
 
     ConcurrentHashMap<String, Double> clientBalancesLatest;
+
+    ConcurrentHashMap<HybridClock.TimeStamp, Integer> timeStampsInLog;
+
     AtomicLong totalLatency;
 
     ConcurrentHashMap<String, Boolean> ackSent;
@@ -107,6 +110,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.hybridClock = new HybridClock();
         this.clientBalancesMajorityCommitted = new ConcurrentHashMap<>();
         this.clientBalancesLatest = new ConcurrentHashMap<>();
+        this.timeStampsInLog = new ConcurrentHashMap<>();
+
 
         // setting the peers list
         for (int i = 0; i < 5; i++) {
@@ -176,6 +181,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
                 tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
+                timeStampsInLog.put(HybridClock.TimeStamp.convertToTimeStamp(logEntry.getTimeStamp()), logEntry.getLogIndex());
                 updateBalances(logEntry.getT(), clientBalancesLatest);
             }
 
@@ -237,6 +243,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // remove the entries from tIdToLogIndex
             tIdToLogIndex.remove(id);
+
+
+            // remove the timestamps
+            timeStampsInLog.remove(log.get(i).timeStamp);
 
         }
 
@@ -336,8 +346,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(clientMessage.getTimeStamp()));
             }
 
-            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, hybridClock.now()));
+            HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
+
+            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp));
             updateBalances(t, clientBalancesLatest);
+            timeStampsInLog.put(currentTimeStamp, index);
             log.updateWriteConcern(index);
             ackSent.put(id, false);
             timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
@@ -491,7 +504,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 totalLatency.addAndGet(latency);
                 System.out.println("The total latency variable is -- " + totalLatency.get());
                 ackTransactionCount.incrementAndGet();
-                ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).build());
+                ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
                 ackSent.put(id, true);
             }
         }
@@ -710,6 +723,106 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+
+    // need to review the logic
+    @Override
+    public void sendReadRequest(ReadRequest readRequest, StreamObserver<Balance> responseObserver) {
+        ReadConcern readConcern = readRequest.getReadConcern();
+
+        String accName = readRequest.getAccName();
+
+        if (readRequest.hasTimeStamp()) {
+            // causal consistency
+            HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp.convertToTimeStamp(readRequest.getTimeStamp());
+
+            if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
+                try {
+                    Thread.sleep(30);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            // I am checking here again because we might wait 30 ms and still not get the timestamp
+
+            if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
+                // send failure, we wait approximately for 2 appendEntries
+                responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
+                responseObserver.onCompleted();
+            } else {
+                // The node was able to catch up till the timestamp and the data will be returned based on the read concern now
+                responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+                responseObserver.onCompleted();
+            }
+
+        } else if (readConcern == ReadConcern.LINEARIZABLE) {
+            // this readRequest should go to leader
+            // here we check if election is happening or not
+            // if election is happening send failure, client can try again
+
+            lock.readLock().lock();
+            try {
+                if (isElectionTakingPlace()) {
+                    // election is taking place so linearizability cannot be guaranteed
+                    responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
+                    responseObserver.onCompleted();
+                } else {
+                    if (currentLeader != serverId) {
+
+                        // send request to leader
+                        stubs[currentLeader].sendReadRequest(readRequest, new StreamObserver<Balance>() {
+                            @Override
+                            public void onNext(Balance balance) {
+                                responseObserver.onNext(balance);
+                            }
+
+                            @Override
+                            public void onError(Throwable throwable) {
+
+                            }
+
+                            @Override
+                            public void onCompleted() {
+                                responseObserver.onCompleted();
+                            }
+                        });
+                    } else {
+                        // this is the leader so return the Majority committed data
+                        responseObserver.onNext(Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.get(accName)).setFailure(false).setAccName(accName).build());
+                        responseObserver.onCompleted();
+                    }
+                }
+
+            } finally {
+                lock.readLock().unlock();
+            }
+        } else {
+            responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+            responseObserver.onCompleted();
+        }
+    }
+
+    // inside read lock
+    private boolean isElectionTakingPlace() {
+        if (status == ServerCurrentStatus.CANDIDATE) return true;
+        if (serverId == currentLeader && status == ServerCurrentStatus.FOLLOWER) return true;
+
+        return false;
+    }
+    private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
+
+        lock.readLock().lock();
+        try {
+            if(readConcern == ReadConcern.LOCAL) {
+                return Balance.newBuilder().setBalance(clientBalancesLatest.get(accName)).build();
+            } else {
+                // here readConcern will be majority
+                return Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.get(accName)).build();
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
     @Override
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
         System.out.println("The commit index of this node is -- " + commitIndex.get());
@@ -722,7 +835,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        System.out.println("The current clock time of this node is----" + hybridClock.now());
 //        log.printLog();
     }
-
     private void startTheElectionTimer() {
         this.electionTimer.reset();
     }
