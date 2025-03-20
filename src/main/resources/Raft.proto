@@ -8,16 +8,37 @@ service Raft {
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
   rpc printLog(Empty) returns (Empty);
   rpc sendAckToClient(Ack) returns (Empty);
+  rpc sendReadRequest(ReadRequest) returns (Balance);
 }
+
+
 
 message Empty{
   int32 data = 1;
+}
+
+message Balance {
+  double balance = 1;
+  string accName = 2;
+  bool failure = 3;
+}
+
+enum ReadConcern {
+  LINEARIZABLE = 0;
+  LOCAL = 1;
+  MAJORITY = 2;
+}
+message ReadRequest {
+  ReadConcern readConcern = 1;
+  TimeStampProto timeStamp = 2; // for causal consistency
+  string accName = 3;
 }
 
 
 message AckMessage {
   Transaction t = 1;
   TimeStampProto timStamp = 2;
+  int32 currentLeader = 3;
 }
 
 message Ack {
@@ -28,6 +49,7 @@ message Ack {
 message ClientMessage {
   Transaction t = 1;
   int32 writeConcern = 2;
+  TimeStampProto timeStamp = 3;
 }
 
 message Transaction {
