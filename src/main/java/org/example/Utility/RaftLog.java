@@ -25,11 +25,14 @@ public class RaftLog {
         }
     }
 
-    public void updateWriteConcern(int index) {
+    public void updateWriteConcern(int index, int serverId) {
         lock.writeLock().lock();
 
         try {
-           log.get(index).writeConcern = log.get(index).writeConcern - 1;
+            if(log.get(index).writeConcern <= 2 && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
+                log.get(index).writeConcern = log.get(index).writeConcern - 1;
+                log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -108,7 +111,6 @@ public class RaftLog {
             if (prevLogIndex == -1 || (prevLogIndex < log.size() && log.get(prevLogIndex).term == prevLogTerm)) {
                 check = true;
             }
-
         } finally {
             lock.readLock().unlock();
             return check;
@@ -123,7 +125,7 @@ public class RaftLog {
             List<LogEntryProto> entries = leadersEntries.getLogList();
 
             for(LogEntryProto entry : entries) {
-                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(), HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp())));
+                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(), HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()), entry.getServersThatReplicatedThisEntryList()));
             }
         } finally {
             lock.writeLock().unlock();

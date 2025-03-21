@@ -112,7 +112,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.clientBalancesLatest = new ConcurrentHashMap<>();
         this.timeStampsInLog = new ConcurrentHashMap<>();
 
-
         // setting the peers list
         for (int i = 0; i < 5; i++) {
             //setting up the nextIndex and matchIndex
@@ -351,7 +350,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp));
             updateBalances(t, clientBalancesLatest);
             timeStampsInLog.put(currentTimeStamp, index);
-            log.updateWriteConcern(index);
+            log.updateWriteConcern(index, serverId);
             ackSent.put(id, false);
             timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
             if (log.get(index).writeConcern == 0) {
@@ -467,14 +466,43 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<LogEntryProto> result = new ArrayList<>();
 
         for (LogEntry entry : entries) {
-            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).build());
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).build());
         }
         return result;
     }
 
 
+    private int getCommitIndexIfPossible() {
+        // we can sort the array 5*log5 roughly equal to 11.6 so it is fine
+        int[] sortedMatchIndex = new int[5];
+        for (int i = 0; i < 5; i++) {
+            sortedMatchIndex[i] = matchIndex.get(i);
+        }
+        Arrays.sort(sortedMatchIndex);
+
+        int index = 4;
+
+
+        while (index >= 0) {
+            // traverse through all the indexes which are equal to this current index
+            int currentIndex = sortedMatchIndex[index], cnt = 0, val = index;
+
+            if (currentIndex == -1) return -1;
+
+            while (index > 0 && sortedMatchIndex[index] == currentIndex) {
+                cnt++;
+                index--;
+            }
+            if ((cnt + (4 - val)) >= 2 && log.get(currentIndex).term == currentTerm.get()) {
+                return currentIndex;
+            }
+        }
+        // if no commitIndex is possible
+        return -1;
+    }
+
     // it is inside write lock
-    public boolean checkIfIndexIsAValidCommitIndex(int index) {
+    private boolean checkIfIndexIsAValidCommitIndex(int index) {
 
         if (index <= commitIndex.get()) return false;
 
@@ -554,32 +582,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } else {
                 // Update matchIndex and nextIndex
                 if (matchIndex.get(idOfFollower) < matchIndexOfFollower) {
+
+                    // prevMatchIndex fails when a leader comes up and does not have data of matchIndex, as the same replicas will try to decrement the writeConcern of the same entries, so instead of using the concept of c
                     int prevMatchIndex = matchIndex.get(idOfFollower);
                     matchIndex.set(idOfFollower, matchIndexOfFollower);
                     nextIndex.set(idOfFollower, matchIndexOfFollower + 1);
 
                     int prevCommitIndex = commitIndex.get();
-                    int candidateCommitIndex = matchIndex.get(idOfFollower);
                     // Check if we need to update the commitIndex of the leader
-                    if (checkIfIndexIsAValidCommitIndex(candidateCommitIndex)) {
-                        if (prevCommitIndex != candidateCommitIndex) {
-                            commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
+                    int candidateCommitIndex = getCommitIndexIfPossible();
 
-                            // update the majority committed map
-                            for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
-                                updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
-                            }
+                    if (candidateCommitIndex > commitIndex.get()) {
+                        commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
 
-                            System.out.println("The commit index of leader updated to -- " + commitIndex.get());
-                            System.out.println("Log size of leader is---" + log.size());
-
-                            // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
-                            List<LogEntry> entriesToBeAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
-                            sendAckForEntries(entriesToBeAck);
+                        // update the majority committed map
+                        for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
+                            updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                         }
+
+                        System.out.println("The commit index of leader updated to -- " + commitIndex.get());
+                        System.out.println("Log size of leader is---" + log.size());
+
+                        // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
+                        List<LogEntry> entriesToBeAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
+                        sendAckForEntries(entriesToBeAck);
+
                     }
+                    // the leader see what all entries have been replicated by the replica, and decrements the appendEntries for those
+                    checkIfWriteConcernsAreSatisfied(prevMatchIndex, matchIndex.get(idOfFollower), idOfFollower);
                 }
-                checkIfWriteConcernsAreSatisfied(matchIndex.get(idOfFollower), idOfFollower);
             }
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
@@ -588,17 +619,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // inside lock
-    private void checkIfWriteConcernsAreSatisfied(int newMatchIndexOfFollower, int idOfFollower) {
+    private void checkIfWriteConcernsAreSatisfied(int prevMatchIndexOfFollower, int newMatchIndexOfFollower, int idOfFollower) {
         List<LogEntry> entries = new ArrayList<>();
 
         // optional check, need to confirm if we this is necessary
-        if (log.get(newMatchIndexOfFollower).term != currentTerm.get()) return;
+//        if (log.get(newMatchIndexOfFollower).term != currentTerm.get()) return;
 
-        for (int i = commitIndex.get() + 1; i <= newMatchIndexOfFollower; i++) {
+        for (int i = Math.max(commitIndex.get() + 1, prevMatchIndexOfFollower + 1); i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
             if (ackSent.containsKey(id) && !ackSent.get(id)) {
                 System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
-                log.updateWriteConcern(i);
+                log.updateWriteConcern(i, idOfFollower);
                 if (log.get(i).writeConcern == 0) {
                     entries.add(log.get(i));
                 }
@@ -669,8 +700,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-
+    // already in writeLock
     public void reinitialiseIndexes() {
+
+        // we traverse from commitIndex to log end to see if the writeConcern of the entries have been updated by this leader or not
+        for (int i = (commitIndex.get() + 1); i < log.size(); i++) {
+            LogEntry logEntry = log.get(i);
+            if (!logEntry.serversThatReplicatedThisEntry.get(serverId)) {
+                log.updateWriteConcern(i, serverId);
+            }
+        }
+
         for (int i = 0; i < 5; i++) {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
@@ -788,7 +828,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         });
                     } else {
                         // this is the leader so return the Majority committed data
-                        responseObserver.onNext(Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.get(accName)).setFailure(false).setAccName(accName).build());
+                        responseObserver.onNext(Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setFailure(false).setAccName(accName).build());
                         responseObserver.onCompleted();
                     }
                 }
@@ -809,20 +849,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         return false;
     }
+
     private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
 
         lock.readLock().lock();
         try {
-            if(readConcern == ReadConcern.LOCAL) {
-                return Balance.newBuilder().setBalance(clientBalancesLatest.get(accName)).build();
+            if (readConcern == ReadConcern.LOCAL) {
+                return Balance.newBuilder().setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).build();
             } else {
                 // here readConcern will be majority
-                return Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.get(accName)).build();
+                return Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).build();
             }
         } finally {
             lock.readLock().unlock();
         }
     }
+
     @Override
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
         System.out.println("The commit index of this node is -- " + commitIndex.get());
@@ -835,6 +877,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        System.out.println("The current clock time of this node is----" + hybridClock.now());
 //        log.printLog();
     }
+
     private void startTheElectionTimer() {
         this.electionTimer.reset();
     }

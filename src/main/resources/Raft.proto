@@ -64,6 +64,7 @@ message LogEntryProto {
   int32 writeConcern = 3;
   Transaction t = 4;
   TimeStampProto timeStamp = 5;
+  repeated bool serversThatReplicatedThisEntry = 6;
 }
 
 message TimeStampProto {
