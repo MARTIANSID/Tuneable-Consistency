@@ -147,7 +147,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
-            // update clock of follower using leaders clock
+            // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
             // Check if the leader's term is valid
@@ -176,10 +176,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             log.appendEntries(leadersEntries);  // Append new entries
 
 
-            // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
             // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
+                // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
                 tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
+
+                // we need the time stamps in log to provide causal consistency
                 timeStampsInLog.put(HybridClock.TimeStamp.convertToTimeStamp(logEntry.getTimeStamp()), logEntry.getLogIndex());
                 updateBalances(logEntry.getT(), clientBalancesLatest);
             }
@@ -189,6 +191,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (leadersCommitIndex > commitIndex.get()) {
                 int prevCommitIndex = commitIndex.get();
 
+                // updating the commitIndex of this follower
                 commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
                 // update majority committed ap
                 for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
@@ -274,11 +277,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             if (currentTermOfTheCandidate > currentTerm.get()) {
+                // the term of this follower is updated because it will now vote in this updated term
                 currentTerm.updateAndGet(term -> Math.max(term, currentTermOfTheCandidate));
                 // the node must become a follower
                 if (status == ServerCurrentStatus.LEADER) {
+                    // if this node was leader we need to start the timer
                     startTheElectionTimer();
                 }
+                // changing the state to follower because higher term node is found, that is trying to become leader
                 status = ServerCurrentStatus.FOLLOWER;
             }
             // all the necessary conditions to check for denying vote
@@ -287,7 +293,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 isVoteGranted = false;
             }
             if (isVoteGranted) {
+                // vote for this term, this ideally can be optimised no need to map
                 votedFor.put(currentTerm.get(), candidateId);
+                // resetting the election timer
                 startTheElectionTimer();
             }
 
@@ -399,7 +407,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } else if (requestVoteResult.getIsVoteGranted()) {
             // vote granted
             votes.incrementAndGet();
-            // vote granted
             return true;
         }
         return true;
@@ -432,7 +439,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         votes.set(Integer.MIN_VALUE);
                         endLatchHold(latch);
                     } else if (votes.get() >= 2) {
-                        // majority is reached here
+                        // majority is reached here, no need to continue the election
                         endLatchHold(latch);
                     } else {
                         latch.countDown();
@@ -478,8 +485,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < 5; i++) {
             sortedMatchIndex[i] = matchIndex.get(i);
         }
+
+        // n*log(n)
         Arrays.sort(sortedMatchIndex);
 
+        // 5 servers
         int index = 4;
 
 
@@ -487,13 +497,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // traverse through all the indexes which are equal to this current index
             int currentIndex = sortedMatchIndex[index], cnt = 0, val = index;
 
+            // currentIndex can be < 0, that means we don't have matchIndex for this follower
             if (currentIndex == -1) return -1;
+
 
             while (index > 0 && sortedMatchIndex[index] == currentIndex) {
                 cnt++;
                 index--;
             }
+
+            // (4 - val) is there because the indexes on the right hand side of the current index support this index if not equal to -1
             if ((cnt + (4 - val)) >= 2 && log.get(currentIndex).term == currentTerm.get()) {
+                // we return because we want the best index (array is sorted), that is the biggest index
                 return currentIndex;
             }
         }
@@ -564,7 +579,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
         try {
 
-            // updating the clock of leader
+            // updating the clock of leader, if its behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(followersTimeStamp));
 
             if (termOfFollower > currentTerm.get()) {
@@ -576,6 +591,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             if (!result) {
+                // need to verify as to why I have added this if
                 if (nextIndex.get(idOfFollower) >= prevNextIndex) {
                     nextIndex.decrementAndGet(idOfFollower);
                 }
@@ -583,13 +599,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // Update matchIndex and nextIndex
                 if (matchIndex.get(idOfFollower) < matchIndexOfFollower) {
 
-                    // prevMatchIndex fails when a leader comes up and does not have data of matchIndex, as the same replicas will try to decrement the writeConcern of the same entries, so instead of using the concept of c
                     int prevMatchIndex = matchIndex.get(idOfFollower);
+
+                    // updating the nextIndex and matchIndex of the follower
                     matchIndex.set(idOfFollower, matchIndexOfFollower);
                     nextIndex.set(idOfFollower, matchIndexOfFollower + 1);
 
                     int prevCommitIndex = commitIndex.get();
-                    // Check if we need to update the commitIndex of the leader
+                    // Check if we need to update the commitIndex of the leader, we get the new commitIndex
                     int candidateCommitIndex = getCommitIndexIfPossible();
 
                     if (candidateCommitIndex > commitIndex.get()) {
@@ -629,6 +646,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             String id = log.get(i).t.getId();
             if (ackSent.containsKey(id) && !ackSent.get(id)) {
                 System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
+
+                // updateWriteConcern handles all the necessary conditions so that the same node does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower);
                 if (log.get(i).writeConcern == 0) {
                     entries.add(log.get(i));
@@ -656,11 +675,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 AppendEntriesArgument appendEntriesArgument = null;
                 lock.readLock().lock();
                 try {
+                    // nextIndex tells us the nextIndex from which we need the entries
                     indexToSendFrom = nextIndex.get(i);
+                    // prevEntry needed for comparison at the follower end
                     LogEntry prevEntry = log.get(indexToSendFrom - 1);
+                    // all entries after this index
                     List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
+                    // making the proto log object
                     Log l = Log.newBuilder().addAllLog(entries).build();
+                    // making appendEntries proto object
                     appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now())).build();
+                    // if update of the followers log is successful what will be the new matchIndex of follower
                     matchIndexForFollower = entries.size() + indexToSendFrom - 1;
                 } finally {
                     lock.readLock().unlock();
@@ -673,10 +698,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
+                        // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
                         doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp);
 
                     }
-
                     @Override
                     public void onError(Throwable throwable) {
 
@@ -703,7 +728,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // already in writeLock
     public void reinitialiseIndexes() {
 
-        // we traverse from commitIndex to log end to see if the writeConcern of the entries have been updated by this leader or not
+        // we traverse from commitIndex to log end to see if the writeConcern of the entries have been updated by this leader or not, because the log data is sent from the old leader so most likely it will not be updated
         for (int i = (commitIndex.get() + 1); i < log.size(); i++) {
             LogEntry logEntry = log.get(i);
             if (!logEntry.serversThatReplicatedThisEntry.get(serverId)) {
@@ -711,6 +736,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
 
+        // reinitialise the nextIndex and matchIndex
         for (int i = 0; i < 5; i++) {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
