@@ -591,7 +591,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             if (!result) {
-                // need to verify as to why I have added this if
+                // added just to ensure that nextIndex does not decrement twice (maybe it can happen, need to think of this situation again)
                 if (nextIndex.get(idOfFollower) >= prevNextIndex) {
                     nextIndex.decrementAndGet(idOfFollower);
                 }
