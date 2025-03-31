@@ -57,6 +57,6 @@ public class LogEntry {
 
     @Override
     public String toString() {
-        return "The Transaction is: " + t + " The time stamp is" + timeStamp + " The time stamp is" + timeStamp + " The time stamp is" + timeStamp;
+        return "The Transaction is: " + t + " The time stamp is" + timeStamp + "The servers that replicated the entry are --" +serversThatReplicatedThisEntry.toString();
     }
 }
