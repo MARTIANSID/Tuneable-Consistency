@@ -553,9 +553,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
         // this is just about minimising repeated acks, not compulsory to add it
-        ackLock.writeLock().lock();
-
-        try {
             for (LogEntry entry : entriesToBeAck) {
                 String id = entry.t.getId();
                 if (ackSent.containsKey(id) && !ackSent.get(id)) {
@@ -570,10 +567,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(id, true);
                 }
             }
-        } finally {
-            ackLock.writeLock().unlock();
-        }
-
+            
         if(ackMessages.isEmpty()) {
             latch.countDown();
             return;
