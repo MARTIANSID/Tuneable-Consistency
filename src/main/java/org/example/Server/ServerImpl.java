@@ -171,7 +171,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             // Proceed with appending the entries
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
-
+            
             // reverting the latest balances
             rollbackTillIndex(prevLogIndex + 1);
             log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
@@ -356,14 +356,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(clientMessage.getTimeStamp()));
             }
 
+            // we do update the clock of leader using followers
             HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
-
+            // appending the entry in log
             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp));
             updateBalances(t, clientBalancesLatest);
+            // we need this to implement causal consistency
             timeStampsInLog.put(currentTimeStamp, index);
+            // since this is in right lock only updated entry will be sent to the followers
             log.updateWriteConcern(index, serverId);
+
             ackSent.put(id, false);
             timeAtWhichTransactionWasReceived.put(id, System.nanoTime());
+            // if write concern becomes 0 we will send ack to client
             if (log.get(index).writeConcern == 0) {
                 entry.add(log.get(index));
             }
@@ -390,7 +395,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
     }
-
 
     private int getLastLogIndex() {
         if (log.size() == 0) {
@@ -486,13 +490,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
+
         for (LogEntry entry : entries) {
-            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).build());
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).build());
         }
         return result;
     }
 
 
+    // inside write lock
     private int getCommitIndexIfPossible() {
         // we can sort the array 5*log5 roughly equal to 11.6 so it is fine
         int[] sortedMatchIndex = new int[5];
@@ -567,7 +573,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(id, true);
                 }
             }
-            
+
         if(ackMessages.isEmpty()) {
             latch.countDown();
             return;
@@ -680,7 +686,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         return true;
     }
-
     // inside write lock
     private List<LogEntry> checkIfWriteConcernsAreSatisfied(int prevMatchIndexOfFollower, int newMatchIndexOfFollower, int idOfFollower) {
         List<LogEntry> entries = new ArrayList<>();
@@ -832,7 +837,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-
     // need to review the logic
     @Override
     public void sendReadRequest(ReadRequest readRequest, StreamObserver<Balance> responseObserver) {
@@ -920,7 +924,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             responseObserver.onCompleted();
         }
     }
-
     // inside read lock
     private boolean isElectionTakingPlace() {
         if (status == ServerCurrentStatus.CANDIDATE) return true;
