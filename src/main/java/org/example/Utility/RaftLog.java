@@ -126,7 +126,6 @@ public class RaftLog {
 
             for(LogEntryProto entry : entries) {
 
-
                 // I use new ArrayList here because for some reason the list returned from protobuf is immutable
                 log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(),
                         HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),

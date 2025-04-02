@@ -198,10 +198,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             }
 
-            // checking the log entries
-            if(leadersEntries.getLogList().size() > 0) {
-                log.printLog();
-            }
 
             // Reset the election timer as the leader is active
             startTheElectionTimer();
