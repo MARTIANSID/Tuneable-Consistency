@@ -162,7 +162,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 status = ServerCurrentStatus.FOLLOWER;
             }
 
-
             // If the leader's term is outdated or log mismatch, respond with failure
             if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
                 responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
@@ -171,23 +170,21 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             // Proceed with appending the entries
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
-            
+
             // reverting the latest balances
             rollbackTillIndex(prevLogIndex + 1);
             log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
-            log.appendEntries(leadersEntries);  // Append new entries
+            log.appendEntries(leadersEntries, serverId);  // Append new entries I also update the writeConcern here because this particular needs to update the writeConcern data on its end
 
 
             // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
                 // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
                 tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
-
                 // we need the time stamps in log to provide causal consistency
                 timeStampsInLog.put(HybridClock.TimeStamp.convertToTimeStamp(logEntry.getTimeStamp()), logEntry.getLogIndex());
                 updateBalances(logEntry.getT(), clientBalancesLatest);
             }
-
 
             // Update commit index
             if (leadersCommitIndex > commitIndex.get()) {
@@ -199,6 +196,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
                     updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                 }
+            }
+
+            // checking the log entries
+            if(leadersEntries.getLogList().size() > 0) {
+                log.printLog();
             }
 
             // Reset the election timer as the leader is active
@@ -247,8 +249,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // remove the entries from tIdToLogIndex
             tIdToLogIndex.remove(id);
-
-
             // remove the timestamps
             timeStampsInLog.remove(log.get(i).timeStamp);
 
@@ -777,12 +777,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void reinitialiseIndexes() {
 
         // we traverse from commitIndex to log end to see if the writeConcern of the entries have been updated by this leader or not, because the log data is sent from the old leader so most likely it will not be updated
-        for (int i = (commitIndex.get() + 1); i < log.size(); i++) {
-            LogEntry logEntry = log.get(i);
-            if (!logEntry.serversThatReplicatedThisEntry.get(serverId)) {
-                log.updateWriteConcern(i, serverId);
-            }
-        }
+        // I have removed this code because we can add it when the follower receives these entries
+//        for (int i = (commitIndex.get() + 1); i < log.size(); i++) {
+//            LogEntry logEntry = log.get(i);
+//            if (!logEntry.serversThatReplicatedThisEntry.get(serverId)) {
+//                log.updateWriteConcern(i, serverId);
+//            }
+//        }
 
         // reinitialise the nextIndex and matchIndex
         for (int i = 0; i < 5; i++) {
@@ -855,9 +856,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     throw new RuntimeException(e);
                 }
             }
-
             // I am checking here again because we might wait 30 ms and still not get the timestamp
-
             if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
                 // send failure, we wait approximately for 2 appendEntries
                 responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
@@ -867,15 +866,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // but here also there are two things that, if the readConcern is majority then we need to wait till the commit point passes or equals to the expected log entry
                 if (readConcern == ReadConcern.MAJORITY) {
                     int logIndexOfRequestedEntry = timeStampsInLog.get(timeStampRequestedByClient);
-                    if (commitIndex.get() > logIndexOfRequestedEntry) {
+                    // the requested logIndex should be safely committed
+                    if (commitIndex.get() >= logIndexOfRequestedEntry) {
                         // return error, or we can wait for some more time, this is dependent on our design choice
                         responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
                         responseObserver.onCompleted();
-                        return;
                     }
+                } else {
+                    // here the readConcern will be LOCAL
+                    responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+                    responseObserver.onCompleted();
                 }
-                responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
-                responseObserver.onCompleted();
             }
 
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
@@ -931,7 +932,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         return false;
     }
-
     private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
 
         lock.readLock().lock();

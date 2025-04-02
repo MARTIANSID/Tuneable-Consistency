@@ -27,7 +27,6 @@ public class RaftLog {
 
     public void updateWriteConcern(int index, int serverId) {
         lock.writeLock().lock();
-
         try {
             if(log.get(index).writeConcern <= 2 && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
@@ -117,7 +116,8 @@ public class RaftLog {
         }
     }
 
-    public void appendEntries(Log leadersEntries) {
+    // we expect a serverId because we want which server has replicated these entries
+    public void appendEntries(Log leadersEntries, int serverId) {
 
         lock.writeLock().lock();
 
@@ -125,10 +125,25 @@ public class RaftLog {
             List<LogEntryProto> entries = leadersEntries.getLogList();
 
             for(LogEntryProto entry : entries) {
-                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(), HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()), entry.getServersThatReplicatedThisEntryList()));
+
+
+                // I use new ArrayList here because for some reason the list returned from protobuf is immutable
+                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(),
+                        HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),
+                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()))); // Ensure it's mutable
+
+                // here I update the writeConcern as well, but this method does not acquire lock and is private
+                updateWriteConcernInternal(log.size() - 1, serverId);
             }
         } finally {
             lock.writeLock().unlock();
+        }
+    }
+    private void updateWriteConcernInternal(int index, int serverId) {
+        if (log.get(index).writeConcern <= 2 && log.get(index).writeConcern > 0 &&
+                !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
+            log.get(index).writeConcern = log.get(index).writeConcern - 1;
+            log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
         }
     }
 
