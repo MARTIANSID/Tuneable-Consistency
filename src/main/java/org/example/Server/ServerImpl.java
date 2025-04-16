@@ -22,6 +22,7 @@ import org.example.Utility.RaftLog;
 import org.example.Utility.ServerStatus.*;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
+    static int NUM_OF_SERVERS = 5;
     AtomicInteger currentTerm;
 
     // can optimize the votedFor logic
@@ -82,23 +83,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ReadWriteLock ackLock;
 
 
-    public ServerImpl(int serverId) {
+    public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = new ConcurrentHashMap<>();
-        this.log = new RaftLog();
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
-        this.nextIndex = new AtomicIntegerArray(5);
-        this.matchIndex = new AtomicIntegerArray(5);
         this.serverId = serverId;
         this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(200) + 300), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
-        this.stubs = new RaftStub[5];
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
         this.isElectionOver = new AtomicBoolean(false);
         this.doesLeaderHasHighestTerm = false;
-        this.blockingStubs = new RaftBlockingStub[5];
         this.ackIndex = new AtomicInteger(-1);
         this.totalAcks = new ConcurrentHashMap<>();
         this.matchIndexCount = new ConcurrentHashMap<>();
@@ -113,9 +109,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.clientBalancesLatest = new ConcurrentHashMap<>();
         this.timeStampsInLog = new ConcurrentHashMap<>();
         this.ackLock = new ReentrantReadWriteLock();
+        this.NUM_OF_SERVERS = NUM_OF_SERVERS;
+        this.stubs = new RaftStub[NUM_OF_SERVERS];
+        this.nextIndex = new AtomicIntegerArray(NUM_OF_SERVERS);
+        this.matchIndex = new AtomicIntegerArray(NUM_OF_SERVERS);
+        this.blockingStubs = new RaftBlockingStub[NUM_OF_SERVERS];
+        this.log = new RaftLog(NUM_OF_SERVERS);
 
         // setting the peers list
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
 
             nextIndex.set(i, log.size());
@@ -176,7 +178,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             log.truncateAfter(prevLogIndex + 1);  // Clear entries after prevLogIndex
             log.appendEntries(leadersEntries, serverId);  // Append new entries I also update the writeConcern here because this particular needs to update the writeConcern data on its end
 
-
             // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
                 // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
@@ -197,7 +198,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                 }
             }
-
 
             // Reset the election timer as the leader is active
             startTheElectionTimer();
@@ -355,7 +355,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // we do update the clock of leader using followers
             HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
             // appending the entry in log
-            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp));
+            log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS));
             updateBalances(t, clientBalancesLatest);
             // we need this to implement causal consistency
             timeStampsInLog.put(currentTimeStamp, index);
@@ -437,7 +437,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         CountDownLatch latch = new CountDownLatch(4);
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
             if (i == serverId) continue;
 
@@ -452,7 +452,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     if (!isSuccessful) {
                         votes.set(Integer.MIN_VALUE);
                         endLatchHold(latch);
-                    } else if (votes.get() >= 2) {
+                    } else if (votes.get() >= (NUM_OF_SERVERS / 2)) {
                         // majority is reached here, no need to continue the election
                         endLatchHold(latch);
                     } else {
@@ -497,8 +497,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // inside write lock
     private int getCommitIndexIfPossible() {
         // we can sort the array 5*log5 roughly equal to 11.6 so it is fine
-        int[] sortedMatchIndex = new int[5];
-        for (int i = 0; i < 5; i++) {
+        int[] sortedMatchIndex = new int[NUM_OF_SERVERS];
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
             sortedMatchIndex[i] = matchIndex.get(i);
         }
 
@@ -506,7 +506,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         Arrays.sort(sortedMatchIndex);
 
         // 5 servers
-        int index = 4;
+        int index = NUM_OF_SERVERS - 1;
 
 
         while (index >= 0) {
@@ -539,7 +539,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // check if majority of the servers are at-least at this index
         int cnt = 0;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
             if (matchIndex.get(i) >= index) {
                 cnt++;
             }
@@ -562,6 +562,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     System.out.println("sending ack");
                     long latency = (System.nanoTime() - timeAtWhichTransactionWasReceived.get(id)) / 1_000_000;
                     System.out.println("The latency is ---" + latency);
+                    System.out.println("Replicated to ----" + entry.serversThatReplicatedThisEntry);
                     totalLatency.addAndGet(latency);
                     System.out.println("The total latency variable is -- " + totalLatency.get());
                     ackTransactionCount.incrementAndGet();
@@ -693,7 +694,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             String id = log.get(i).t.getId();
             if (ackSent.containsKey(id) && !ackSent.get(id)) {
                 System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
-
                 // updateWriteConcern handles all the necessary conditions so that the same node does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower);
                 if (log.get(i).writeConcern == 0) {
@@ -709,7 +709,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         while (status == ServerCurrentStatus.LEADER) {
 
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
                 if (i == serverId) continue;
 
@@ -780,9 +780,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //                log.updateWriteConcern(i, serverId);
 //            }
 //        }
-
         // reinitialise the nextIndex and matchIndex
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
         }
@@ -812,7 +811,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // Now that we have finished the election setup, we can check for the election result
         lock.writeLock().lock();  // Acquire the lock to ensure that no other thread modifies the shared state while we transition
         try {
-            if (votes.get() >= 2 && status != ServerCurrentStatus.FOLLOWER) {
+            if (votes.get() >= (NUM_OF_SERVERS / 2) && status != ServerCurrentStatus.FOLLOWER) {
                 doesLeaderHasHighestTerm = true;
                 System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
                 // Stop the election timer

@@ -11,9 +11,12 @@ public class RaftLog {
     private final ArrayList<LogEntry> log;
     private final ReentrantReadWriteLock lock;
 
-    public RaftLog() {
+    private int NUM_OF_SERVERS;
+
+    public RaftLog(int NUM_OF_SERVERS) {
         this.log = new ArrayList<>();
         this.lock = new ReentrantReadWriteLock();
+        this.NUM_OF_SERVERS = NUM_OF_SERVERS;
     }
 
     public void append(LogEntry entry) {
@@ -28,7 +31,7 @@ public class RaftLog {
     public void updateWriteConcern(int index, int serverId) {
         lock.writeLock().lock();
         try {
-            if(log.get(index).writeConcern <= 2 && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
+            if(log.get(index).writeConcern <= (NUM_OF_SERVERS) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
             }
@@ -38,7 +41,7 @@ public class RaftLog {
     }
     public LogEntry get(int index) {
         if (index < 0) {
-            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L));
+            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L), NUM_OF_SERVERS);
         }
         lock.readLock().lock();
         try {
@@ -139,7 +142,7 @@ public class RaftLog {
         }
     }
     private void updateWriteConcernInternal(int index, int serverId) {
-        if (log.get(index).writeConcern <= 2 && log.get(index).writeConcern > 0 &&
+        if (log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 &&
                 !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
             log.get(index).writeConcern = log.get(index).writeConcern - 1;
             log.get(index).serversThatReplicatedThisEntry.set(serverId, true);

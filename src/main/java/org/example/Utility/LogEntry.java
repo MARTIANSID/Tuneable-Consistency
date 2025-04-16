@@ -16,7 +16,7 @@ public class LogEntry {
     public List<Boolean> serversThatReplicatedThisEntry;
 
 
-    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp) {
+    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, int NUM_OF_SERVERS) {
         this.index = index;
         this.term = term;
         this.t = t;
@@ -25,7 +25,7 @@ public class LogEntry {
         this.timeStamp = timeStamp;
         this.serversThatReplicatedThisEntry = new ArrayList<>();
 
-        for(int i = 0 ; i < 5; i ++) {
+        for(int i = 0 ; i < NUM_OF_SERVERS; i ++) {
             // false means that this entry was not replicated on this server
             serversThatReplicatedThisEntry.add(false);
         }

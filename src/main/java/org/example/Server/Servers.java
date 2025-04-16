@@ -16,12 +16,15 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class Servers{
 
+    // set the number of servers from here
+    public static final int NUM_OF_SERVERS = 50;
+
     public static void main(String[] args) throws IOException, InterruptedException {
         List<Server> servers = new ArrayList<>();
-        for (int i = 1; i <= 5; i++) {
+        for (int i = 1; i <= NUM_OF_SERVERS; i++) {
             int port = 8000 + i; // Ports 8000 to 8004
             Server server = ServerBuilder.forPort(port)
-                    .addService(new ServerImpl(i - 1))
+                    .addService(new ServerImpl(i - 1, NUM_OF_SERVERS))
                     .build()
                     .start();
             System.out.println("Server" + (i + 1) + " started on port " + port);

@@ -1,5 +1,7 @@
 package org.example.Client;
 
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
@@ -9,6 +11,7 @@ import org.example.Utility.HybridClock;
 import org.example.Utility.RaftLog;
 
 import java.io.IOException;
+import java.sql.Time;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -20,10 +23,14 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
     int currentLeader;
     // used for causal consistency
     HybridClock.TimeStamp lastWriteTimeStamp;
+
+    // clock of client
+    HybridClock hybridClock;
     public ClientServerImpl() {
        this.ackReceived = new ConcurrentHashMap<>();
        this.lock = new ReentrantReadWriteLock();
        this.currentLeader = 0;
+       this.hybridClock = new HybridClock();
     }
 
     // no need to acquire lock as it is already thread safe
@@ -35,7 +42,7 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
             ackReceived.put(ackMessage.getT().getId(), true);
         }
 
-        System.out.println(ackMessages + "Messages received on the client end");
+        System.out.println(ackMessages.size() + "Messages received on the client end");
     }
     public static void main(String[] args) throws IOException, InterruptedException {
         // starting client server at 9000 port
@@ -43,6 +50,7 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
                 .addService(new ClientServerImpl())
                 .build()
                 .start();
+
 
         server.awaitTermination();
     }
