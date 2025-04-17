@@ -31,7 +31,7 @@ public class RaftLog {
     public void updateWriteConcern(int index, int serverId) {
         lock.writeLock().lock();
         try {
-            if(log.get(index).writeConcern <= (NUM_OF_SERVERS) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
+            if(log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
             }
