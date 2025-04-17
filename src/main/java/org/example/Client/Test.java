@@ -1,20 +1,19 @@
 package org.example.Client;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
-import org.ds.paxos.ClientMessage;
-import org.ds.paxos.Empty;
-import org.ds.paxos.RaftGrpc;
-import org.ds.paxos.Transaction;
-
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import org.ds.paxos.ClientMessage;
+import org.ds.paxos.RaftGrpc;
+import org.ds.paxos.Transaction;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+
 public class Test {
-    private static final int THREAD_COUNT = 20; // Number of parallel transactions
+    private static final int THREAD_COUNT = 50; // Number of parallel transactions
 
     public static void main(String[] args) {
         ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8005)
@@ -55,7 +54,9 @@ public class Test {
                             .setReceiver("Test1")
                             .setSender("Test2")
                             .build();
-                    stub.sendTransaction(ClientMessage.newBuilder().setT(parallelTransaction).setWriteConcern(2).build());
+                    int writeConcern = new Random().nextBoolean() ? 1 : 26;
+
+                    stub.sendTransaction(ClientMessage.newBuilder().setT(parallelTransaction).setWriteConcern(writeConcern).build());
                     System.out.println("Transaction sent: " + parallelTransaction.getId());
                 } catch (Exception e) {
                     System.err.println("Error sending transaction: " + e.getMessage());

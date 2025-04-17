@@ -1,6 +1,7 @@
 syntax = "proto3";
 option java_multiple_files =  true;
 package org.ds.paxos;
+option java_package = "org.ds.paxos";
 
 service Raft {
   rpc SendTransaction(ClientMessage) returns (Empty);
@@ -108,5 +109,38 @@ message RequestVoteResult {
 
 
 
+
+
+//TOKEN BUCKET PROTO FILES
+
+service TokenBucket {
+  rpc GetTokenStatus(TokenStatusRequest) returns (TokenStatusResponse);
+  rpc UpdateTokenState(TokenUpdateRequest) returns (Empty);
+  rpc ConsumeTokens(TokenConsumeRequest) returns (TokenConsumeResponse);
+}
+
+message TokenStatusRequest {
+  // Empty for now
+}
+
+message TokenStatusResponse {
+  double tokensAvailable = 1;
+  int64 lastUpdatedTime = 2;
+}
+
+message TokenUpdateRequest {
+  double tokensRemaining = 1;
+  int64 lastUpdatedTime = 2;
+}
+
+message TokenConsumeRequest {
+  double requiredTokens = 1;
+}
+
+message TokenConsumeResponse {
+  bool granted = 1;
+  double tokensRemaining = 2;
+  int64 lastUpdatedTime = 3;
+}
 
 

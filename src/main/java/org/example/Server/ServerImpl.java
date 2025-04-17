@@ -15,7 +15,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.ds.paxos.RaftGrpc.*;
-
 import org.example.Utility.HybridClock;
 import org.example.Utility.LogEntry;
 import org.example.Utility.RaftLog;
@@ -81,6 +80,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     HybridClock hybridClock;
 
     ReadWriteLock ackLock;
+    private TokenBucketGrpc.TokenBucketBlockingStub tokenBucketStub;
+    private final double TOKEN_REFILL_RATE_PER_MS = 1; // 1 token/sec
 
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
@@ -132,6 +133,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // setting up the client stub
         ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
         clientStub = RaftGrpc.newStub(channel);
+
+         // Initialize token bucket stub (assuming token server is on port 8500)
+         ManagedChannel tokenChannel = ManagedChannelBuilder.forAddress("localhost", 8500).usePlaintext().build();
+         tokenBucketStub = TokenBucketGrpc.newBlockingStub(tokenChannel);
 
         // starting the election timer
         this.electionTimer.start();
@@ -337,6 +342,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //            return;
 //        }
         int writeConcern = clientMessage.getWriteConcern();
+
+
+
+        //TOKEN BUCKET ALGORITHM:
+        double requiredTokens = (writeConcern == 1) ? 30 : 80;
+        TokenConsumeResponse tokenResp = tokenBucketStub.consumeTokens(
+        TokenConsumeRequest.newBuilder()
+            .setRequiredTokens(requiredTokens)
+            .build()
+         );
+
+        if (!tokenResp.getGranted()) {
+            System.out.println("Not enough tokens. Dropping or queuing txn: " + id);
+            responseObserver.onNext(Empty.newBuilder().build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+
 
         int index = -1;
         // we want it to be synchronized in order to get the correct index, and not allow multiple threads to get same index
