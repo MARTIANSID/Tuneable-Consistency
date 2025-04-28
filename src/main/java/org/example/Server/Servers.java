@@ -10,7 +10,7 @@ import io.grpc.ServerBuilder;
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS = 50;
+    public static final int NUM_OF_SERVERS = 3;
 
     public static void main(String[] args) throws IOException, InterruptedException {
         List<Server> servers = new ArrayList<>();

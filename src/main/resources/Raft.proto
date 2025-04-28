@@ -51,6 +51,7 @@ message ClientMessage {
   Transaction t = 1;
   int32 writeConcern = 2;
   TimeStampProto timeStamp = 3;
+
 }
 
 message Transaction {
@@ -58,6 +59,7 @@ message Transaction {
   string receiver = 2;
   double amount = 3;
   string id = 4;
+  int64 transactionSendTimeInMs = 5;
 }
 message LogEntryProto {
   int32 logIndex = 1;
