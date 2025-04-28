@@ -134,7 +134,7 @@ public class RaftLog {
                         HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),
                         new ArrayList<>(entry.getServersThatReplicatedThisEntryList()))); // Ensure it's mutable
 
-                // here I update the writeConcern as well, but this method does not acquire lock and is private
+                // here I update the writeConcern as well, but this method does not acquire lock and is private, this when followers add the entries sent from the leader
                 updateWriteConcernInternal(log.size() - 1, serverId);
             }
         } finally {
