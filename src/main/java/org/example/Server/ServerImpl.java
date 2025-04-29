@@ -361,33 +361,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // we want it to be synchronized in order to get the correct index, and not allow multiple threads to get same index
         // log.size() takes in only read lock hence we need synchronized
         List<LogEntry> entry = new ArrayList<>();
+
+        // do the token processing before
+        redisLock.writeLock().lock();
+        try {
+            // get the token data
+            TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
+
+            double currentTokens = tokenBucketData.getTokenCount();
+            long lastUpdateTime = tokenBucketData.getLastUpdateTime();
+
+            System.out.println("The current tokens are--" + currentTokens);
+
+            // Atleast 1 token is required otherwise just throttle, maybe we can add back in the queue for later processing
+            if ((currentTokens - 1) < 0.0) {
+                System.out.println("Throttling the request");
+                responseObserver.onNext(Empty.newBuilder().build());
+                responseObserver.onCompleted();
+                return;
+            }
+
+            // update the token count in redis along with lastUpdateTime
+            tokenBucket.updateTokens(currentTokens - 1, lastUpdateTime);
+        } finally {
+            redisLock.writeLock().unlock();
+        }
         lock.writeLock().lock();
         try {
             System.out.println("Got the transaction!");
             // adding the logic of Token Bucket
-            redisLock.writeLock().lock();
-            try {
-                // get the token data
-                TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
-
-                double currentTokens = tokenBucketData.getTokenCount();
-                long lastUpdateTime = tokenBucketData.getLastUpdateTime();
-
-                System.out.println("The current tokens are--" + currentTokens);
-
-                // Atleast 1 token is required otherwise just throttle, maybe we can add back in the queue for later processing
-                if ((currentTokens - 1) < 0.0) {
-                    System.out.println("Throttling the request");
-                    responseObserver.onNext(Empty.newBuilder().build());
-                    responseObserver.onCompleted();
-                    return;
-                }
-
-                // update the token count in redis along with lastUpdateTime
-                tokenBucket.updateTokens(currentTokens - 1, lastUpdateTime);
-            } finally {
-                redisLock.writeLock().unlock();
-            }
 
             index = log.size();
 
