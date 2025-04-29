@@ -18,8 +18,8 @@ public class TokenBucketImpl {
     private static final String LAST_UPDATE_KEY = "last_update_time";
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 20.0;
-    private static final double REFILL_RATE = 20.0; // tokens per second
+    private static final double MAX_TOKENS = 200.0;
+    private static final double REFILL_RATE = 200.0; // tokens per second
 
     public TokenBucketImpl(String redisHost, int redisPort) {
         // here first I connect to redis master
@@ -33,7 +33,7 @@ public class TokenBucketImpl {
         String tokenCountStr = masterJedis.get(TOKEN_BUCKET_KEY);
         String lastUpdateTimeStr = masterJedis.get(LAST_UPDATE_KEY);
         // if tokenCount is null then we will treat the bucket as full
-        double tokenCount = (tokenCountStr == null) ? 60.0 : Double.parseDouble(tokenCountStr);
+        double tokenCount = (tokenCountStr == null) ? MAX_TOKENS : Double.parseDouble(tokenCountStr);
         // if lastUpdateTime is null I set it to -1
         long lastUpdateTime = (lastUpdateTimeStr == null) ? -1 : Long.parseLong(lastUpdateTimeStr);
         return new TokenBucketData(tokenCount, lastUpdateTime);
@@ -48,8 +48,8 @@ public class TokenBucketImpl {
         // Calculate the elapsed time in nanoseconds
         long currentTime = System.nanoTime();
 
-        // initally when lastUpdateTime = -1 then the newTokenCount should be = 60.0
-        double newTokens = 0.0, newTokenCount = 60.0;
+        // initally when lastUpdateTime = -1 then the newTokenCount should be = MAX_TOKENS
+        double newTokens = 0.0, newTokenCount = MAX_TOKENS;
 
         // if lastUpdateTime = -1 then no need to update anything
         if (lastUpdateTime != -1) {

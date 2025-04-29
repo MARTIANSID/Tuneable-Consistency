@@ -31,7 +31,7 @@ import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
-    int NUM_OF_SERVERS = 5;
+    int NUM_OF_SERVERS;
     AtomicInteger currentTerm;
 
     // can optimize the votedFor logic
@@ -364,7 +364,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
         try {
             System.out.println("Got the transaction!");
-
             // adding the logic of Token Bucket
             redisLock.writeLock().lock();
             try {
@@ -374,16 +373,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 double currentTokens = tokenBucketData.getTokenCount();
                 long lastUpdateTime = tokenBucketData.getLastUpdateTime();
 
+                System.out.println("The current tokens are--" + currentTokens);
 
-                System.out.println("The current tokens are--" + currentTokens + " The last update time is--" + lastUpdateTime);
-
-
-                if (currentTokens <= 0) {
+                // Atleast 1 token is required otherwise just throttle, maybe we can add back in the queue for later processing
+                if ((currentTokens - 1) < 0.0) {
                     System.out.println("Throttling the request");
                     responseObserver.onNext(Empty.newBuilder().build());
                     responseObserver.onCompleted();
                     return;
                 }
+
                 // update the token count in redis along with lastUpdateTime
                 tokenBucket.updateTokens(currentTokens - 1, lastUpdateTime);
             } finally {
