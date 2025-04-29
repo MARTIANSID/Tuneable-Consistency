@@ -551,7 +551,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // n*log(n)
         Arrays.sort(sortedMatchIndex);
 
-        // 5 servers
         int index = NUM_OF_SERVERS - 1;
 
 
@@ -563,13 +562,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (currentIndex == -1) return -1;
 
 
-            while (index > 0 && sortedMatchIndex[index] == currentIndex) {
+            while (index >= 0 && sortedMatchIndex[index] == currentIndex) {
                 cnt++;
                 index--;
             }
 
             // (4 - val) is there because the indexes on the right hand side of the current index support this index if not equal to -1
-            if ((cnt + (4 - val)) >= 2 && log.get(currentIndex).term == currentTerm.get()) {
+            if ((cnt + ((NUM_OF_SERVERS - 1) - val)) >= (NUM_OF_SERVERS / 2) && log.get(currentIndex).term == currentTerm.get()) {
                 // we return because we want the best index (array is sorted), that is the biggest index
                 return currentIndex;
             }
@@ -578,21 +577,32 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return -1;
     }
 
-    // it is inside write lock
-    private boolean checkIfIndexIsAValidCommitIndex(int index) {
-
-        if (index <= commitIndex.get()) return false;
-
-        // check if majority of the servers are at-least at this index
-        int cnt = 0;
+    // should be inside a lock, this method is kind of better because we do not need to sort the matchIndex array and we can get the commit index in roughly O(n) time because usually the log of follower and leader is off by 2-3 entries
+    private int getCommitIndexIfPossibleEarlyExitMethod() {
+        // Find the max matchIndex
+        int maxMatchIndex = -1;
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            if (matchIndex.get(i) >= index) {
-                cnt++;
+            maxMatchIndex = Math.max(maxMatchIndex, matchIndex.get(i));
+        }
+
+        // Try from maxMatchIndex down to 0
+        for (int idx = maxMatchIndex; idx > commitIndex.get(); idx--) {
+            int count = 0;
+
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (matchIndex.get(i) >= idx) {
+                    count++;
+                }
+            }
+
+            // check majority and term
+            if (count >= (NUM_OF_SERVERS / 2) && log.get(idx).term == currentTerm.get()) {
+                return idx;
             }
         }
-        // here I have used >= 2 because we don't actually update the match index of the leader
-        return (cnt >= 2 && log.get(index).term == currentTerm.get());
+        return -1;
     }
+
 
     // it is not in log
     private void sendAckForEntries(List<LogEntry> entriesToBeAck, CountDownLatch latch) {
@@ -611,7 +621,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(id, true);
                     // send ack for this entry
                     System.out.println("sending ack");
-//                    System.out.println("Replicated to ----" + entry.serversThatReplicatedThisEntry);
+                    System.out.println("The transaction id --" + id + " Replicated to ----" + entry.serversThatReplicatedThisEntry);
                     Long timeStampOfTransaction = System.currentTimeMillis();
                     // here I have implemented the logic of rolling throughput
                     // remove the old transactions from the queue, we maintain a window of 1 seconds
@@ -710,7 +720,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     int prevCommitIndex = commitIndex.get();
                     // Check if we need to update the commitIndex of the leader, we get the new commitIndex
-                    int candidateCommitIndex = getCommitIndexIfPossible();
+//                    int candidateCommitIndex = getCommitIndexIfPossible();
+                      int candidateCommitIndex = getCommitIndexIfPossibleEarlyExitMethod();
 
                     if (candidateCommitIndex > commitIndex.get()) {
                         commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
