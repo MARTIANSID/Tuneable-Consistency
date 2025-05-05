@@ -3,9 +3,6 @@ package org.example.TokenBucket;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Pipeline;
 
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-
 public class TokenBucketImpl {
 
     // jedis for connecting to the master replica of redis
@@ -18,8 +15,8 @@ public class TokenBucketImpl {
     private static final String LAST_UPDATE_KEY = "last_update_time";
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 20.0;
-    private static final double REFILL_RATE = 20.0; // tokens per second
+    private static final double MAX_TOKENS = 40.0;
+    private static final double REFILL_RATE = 40.0; // tokens per second
 
     public TokenBucketImpl(String redisHost, int redisPort) {
         // here first I connect to redis master

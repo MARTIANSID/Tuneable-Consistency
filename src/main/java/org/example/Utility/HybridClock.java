@@ -1,8 +1,8 @@
 package org.example.Utility;
 
-import org.ds.paxos.TimeStampProto;
-
 import java.util.Objects;
+
+import org.ds.paxos.TimeStampProto;
 
 public class HybridClock {
 
