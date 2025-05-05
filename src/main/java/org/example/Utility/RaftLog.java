@@ -104,7 +104,6 @@ public class RaftLog {
             lock.readLock().unlock();
         }
     }
-
     public boolean checkIfPrevLogIndexHasPrevLogTerm(int prevLogIndex, int prevLogTerm) {
         lock.readLock().lock();
 

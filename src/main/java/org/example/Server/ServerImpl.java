@@ -239,8 +239,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             lock.writeLock().unlock();
         }
     }
-
-
     // inside write lock
     private void updateBalances(Transaction t, ConcurrentHashMap<String, Double> balances) {
         String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
@@ -287,7 +285,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         return true;
     }
-
     @Override
     public void requestVote(RequestVoteArguments requestVoteArguments, StreamObserver<RequestVoteResult> responseObserver) {
         int currentTermOfTheCandidate = requestVoteArguments.getCandidatesTerm(), lastLogIndexOfCandidate = requestVoteArguments.getLastLogIndex(), lastLogTermOfCandidate = requestVoteArguments.getLastLogTerm(), candidateId = requestVoteArguments.getCandidateId();
@@ -721,7 +718,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     int prevCommitIndex = commitIndex.get();
                     // Check if we need to update the commitIndex of the leader, we get the new commitIndex
 //                    int candidateCommitIndex = getCommitIndexIfPossible();
-                      int candidateCommitIndex = getCommitIndexIfPossibleEarlyExitMethod();
+                    int candidateCommitIndex = getCommitIndexIfPossibleEarlyExitMethod();
 
                     if (candidateCommitIndex > commitIndex.get()) {
                         commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
@@ -1008,6 +1005,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // inside read lock
     private boolean isElectionTakingPlace() {
         if (status == ServerCurrentStatus.CANDIDATE) return true;
+        // this condition simply means that the current leader has stepped down because a it saw a server with higher term, and currently it does not know the exact leader, other design shown can be setting the current leader = -1 (which means leader is unknown)
         if (serverId == currentLeader && status == ServerCurrentStatus.FOLLOWER) return true;
 
         return false;
