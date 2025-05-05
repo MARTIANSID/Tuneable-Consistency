@@ -591,7 +591,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     count++;
                 }
             }
-
+            
             // check majority and term
             if (count >= (NUM_OF_SERVERS / 2) && log.get(idx).term == currentTerm.get()) {
                 return idx;
