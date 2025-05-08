@@ -1216,7 +1216,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 if (readConcern == ReadConcern.MAJORITY) {
                     int logIndexOfRequestedEntry = timeStampsInLog.get(timeStampRequestedByClient);
                     // the requested logIndex should be safely committed
-                    if (commitIndex.get() >= logIndexOfRequestedEntry) {
+                    // if the commitIndex is less than the logIndexOfRequestEntry then it is not safely committed till now
+                    if (commitIndex.get() < logIndexOfRequestedEntry) {
                         // return error, or we can wait for some more time, this is dependent on our design choice
                         responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
                         responseObserver.onCompleted();
