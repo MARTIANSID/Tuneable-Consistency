@@ -59,6 +59,10 @@ message Transaction {
   double amount = 3;
   string id = 4;
   int64 transactionSendTimeInMs = 5;
+  int32 minRequiredConsistency = 6;
+  double baseProfit = 7;
+  double extraProfitMajority = 8;
+  int32 writeConcern = 9;
 }
 message LogEntryProto {
   int32 logIndex = 1;

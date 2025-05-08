@@ -13,21 +13,20 @@ import java.util.concurrent.Executors;
 import org.example.Client.ClientServerImpl.*;
 
 public class Test {
-    private static final int THREAD_COUNT = 80; // Number of parallel transactions
+    private static final int THREAD_COUNT = 230; // Number of parallel transactions
 
     public static void main(String[] args) {
 
-
-//        stub.printLog(Empty.newBuilder().build());
-
 //        System.out.println(stub.sendReadRequest(ReadRequest.newBuilder().setReadConcern(ReadConcern.LINEARIZABLE).setAccName("Test1").build()));
 
-
         while (true) {
-
-            ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8001).usePlaintext()
+            ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8003).usePlaintext()
                     .build();
             RaftGrpc.RaftBlockingStub stub = RaftGrpc.newBlockingStub(channel);
+
+            stub.printLog(Empty.newBuilder().build());
+            if(true)
+            break;
 
 //         Parallel execution using threads
             ExecutorService executorService = Executors.newFixedThreadPool(THREAD_COUNT);
@@ -36,15 +35,19 @@ public class Test {
             for (int i = 0; i < THREAD_COUNT; i++) {
                 executorService.execute(() -> {
                     try {
+                        Random random = new Random();
+                        int minConsistency = (random.nextInt(2) + 1);
                         Transaction parallelTransaction = Transaction.newBuilder()
                                 .setId(String.valueOf(new Random().nextInt(10000)))
                                 .setAmount(1)
                                 .setReceiver("Test1")
                                 .setSender("Test2")
+                                .setMinRequiredConsistency(minConsistency)
+                                .setBaseProfit(random.nextInt(30))
+                                .setExtraProfitMajority( minConsistency == 2 ? 0 : random.nextInt(70))
                                 .setTransactionSendTimeInMs(System.currentTimeMillis())
                                 .build();
-                        Random random = new Random();
-                        int result = (random.nextInt(2) == 0) ? 1 : 1;
+                        int result = (random.nextInt(2) == 0) ? 1 : 2;
 //                    ClientServerImpl.timeTakenForTransactionToBeExecuted.put(parallelTransaction.getId(), System.currentTimeMillis());
                         stub.sendTransaction(ClientMessage.newBuilder().setT(parallelTransaction).setWriteConcern(result).build());
 //                    synchronized (System.out) {
@@ -74,6 +77,7 @@ public class Test {
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
+
 
             executorService.shutdown();
             channel.shutdown();

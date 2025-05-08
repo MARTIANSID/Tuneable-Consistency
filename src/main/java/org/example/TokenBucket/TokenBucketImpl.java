@@ -18,8 +18,8 @@ public class TokenBucketImpl {
     private static final String LAST_UPDATE_KEY = "last_update_time";
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 200.0;
-    private static final double REFILL_RATE = 200.0; // tokens per second
+    private static final double MAX_TOKENS = 400;
+    private static final double REFILL_RATE = 400; // tokens per second
 
     public TokenBucketImpl(String redisHost, int redisPort) {
         // here first I connect to redis master
@@ -75,7 +75,7 @@ public class TokenBucketImpl {
 
         // Execute the commands asynchronously
         pipeline.sync();
-        System.out.println("Updated token count: " + newTokenCount + " tokens");
+//        System.out.println("Updated token count: " + newTokenCount + " tokens");
     }
 
     public static class TokenBucketData {
