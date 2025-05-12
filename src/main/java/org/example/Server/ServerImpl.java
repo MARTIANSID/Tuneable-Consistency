@@ -849,6 +849,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private void becomeLeader() {
         lock.writeLock().lock();
         try {
+            // if it is not candidate that is might have become follower in between in requestVote RPC we do not want to make the node leader in this case
+            if(status != ServerCurrentStatus.CANDIDATE) return;
             doesLeaderHasHighestTerm.set(true);
             System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
             // Stop the election timer
