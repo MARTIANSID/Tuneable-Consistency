@@ -383,7 +383,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private RequestVoteArguments getRequestVoteArgumentsObject() {
-        return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+        lock.readLock().lock();
+        try {
+            return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     // do not think that I need a lock here as all are atomic variables
@@ -442,7 +447,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             }
                             endLatchHold(latch);
                         }
-                    } else if (votes.get() >= (NUM_OF_SERVERS / 2)) {
+                    } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
                         // instead of writing outside
                         if(isElectionOver.compareAndSet(false, true)) {
                             // majority is reached here, no need to continue the election
@@ -831,8 +836,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             currentTerm.incrementAndGet();
             // Reset the timer
             startTheElectionTimer();
-            // Resetting the votes
-            votes.set(0);
+            // the current server votes it self
+            votes.set(1);
             // Vote for self
             votedFor.put(currentTerm.get(), serverId);
             isElectionOver.set(false);
