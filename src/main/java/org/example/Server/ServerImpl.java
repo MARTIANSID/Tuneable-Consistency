@@ -416,23 +416,37 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             if (i == serverId) continue;
 
+
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                 @Override
                 public void onNext(RequestVoteResult requestVoteResult) {
-                    // if isElectionOver was already false then do not change shared data
+
+                    // latch.countDown() is atomic operation
+                    // additional not compulsory
                     if(isElectionOver.get()) {
+                        latch.countDown();
                         return;
                     }
                     boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
                     // it is not successful when the currentTerm of the leader is not up-to date
+                    // I am handling everything in call backs to make raft election thread safe
+                    // if isElectionOver was already false then do not change shared data
+                    // since compareAndSet is atomic we protect the double transitions due to race conditions
                     if (!isSuccessful) {
                         if(isElectionOver.compareAndSet(false, true)) {
-                            votes.set(Integer.MIN_VALUE);
+                            lock.writeLock().lock();
+                            try {
+                               becomeFollower();
+                            } finally {
+                                lock.writeLock().unlock();
+                            }
                             endLatchHold(latch);
                         }
                     } else if (votes.get() >= (NUM_OF_SERVERS / 2)) {
+                        // instead of writing outside
                         if(isElectionOver.compareAndSet(false, true)) {
                             // majority is reached here, no need to continue the election
+                            becomeLeader();
                             endLatchHold(latch);
                         }
                     } else {
@@ -442,7 +456,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 @Override
                 public void onError(Throwable throwable) {
-
+                    // in case of error as well we kind of want to terminate early
+                    latch.countDown();
                 }
 
                 @Override
@@ -625,7 +640,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // Lock for reading and writing shared state
         lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
         try {
-
+            // this makes the function idempotent
+            if(status != ServerCurrentStatus.LEADER) {
+                return false;
+            }
             // updating the clock of leader, if its behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(followersTimeStamp));
 
@@ -759,8 +777,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
                         // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-                        // this makes it thread safe basically only one thread will be able to update it to false no race conditions here, and once it is false it remains false and then we break the loo
-                        doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
+
+                            doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
                     }
 
                     @Override
@@ -821,36 +839,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             lock.writeLock().unlock();  // Release the lock after the initial election setup
         }
-
         requestForVotes();
-
-        // Now that we have finished the election setup, we can check for the election result
-        lock.writeLock().lock();  // Acquire the lock to ensure that no other thread modifies the shared state while we transition
+    }
+    private void becomeLeader() {
+        lock.writeLock().lock();
         try {
-            if (votes.get() >= (NUM_OF_SERVERS / 2) && status != ServerCurrentStatus.FOLLOWER) {
-                doesLeaderHasHighestTerm.set(true);
-                System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
-                // Stop the election timer
-                electionTimer.stop();
-                // Reinitialize state
-                reinitialiseIndexes();
-                // This node becomes the leader
-                this.status = ServerCurrentStatus.LEADER;
-                this.currentLeader = this.serverId;
-            } else {
-                // we might want to cancel the batch job just in case, but it will start the election timer again which should not be an issue
-                becomeFollower();
-            }
+            doesLeaderHasHighestTerm.set(true);
+            System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
+            // Stop the election timer
+            electionTimer.stop();
+            // Reinitialize state
+            reinitialiseIndexes();
+            // This node becomes the leader
+            this.status = ServerCurrentStatus.LEADER;
+            this.currentLeader = this.serverId;
         } finally {
-            lock.writeLock().unlock();  // Release the lock after modifying shared state
-            // Start sending AppendEntries outside the critical section
-            if (votes.get() >= (NUM_OF_SERVERS / 2) && status == ServerCurrentStatus.LEADER) {
-                // once this node becomes the leader it will start processing the batch of transactions
-                // I store the batchProcessingTask here so that I can cancel this task when this node steps down and becomes follower
-                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
-                sendAppendEntries();
-            }
+           lock.writeLock().unlock();
         }
+        batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        sendAppendEntries();
     }
 
     // should be inside write lock
