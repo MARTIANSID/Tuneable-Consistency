@@ -99,6 +99,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ReadWriteLock redisLock;
 
     ReentrantLock batchLock;
+    ReentrantLock electionLock;
 
     TokenBucketImpl tokenBucket;
 
@@ -159,6 +160,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.batchProcessingTask = null;
         // since in the batch we are only writing data, we need only the writeLock
         this.batchLock = new ReentrantLock();
+        this.electionLock = new ReentrantLock();
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
@@ -417,17 +419,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                 @Override
                 public void onNext(RequestVoteResult requestVoteResult) {
-                    if (isElectionOver.get()) {
+                    // if isElectionOver was already false then do not change shared data
+                    if(isElectionOver.get()) {
                         return;
                     }
                     boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
                     // it is not successful when the currentTerm of the leader is not up-to date
                     if (!isSuccessful) {
-                        votes.set(Integer.MIN_VALUE);
-                        endLatchHold(latch);
+                        if(isElectionOver.compareAndSet(false, true)) {
+                            votes.set(Integer.MIN_VALUE);
+                            endLatchHold(latch);
+                        }
                     } else if (votes.get() >= (NUM_OF_SERVERS / 2)) {
-                        // majority is reached here, no need to continue the election
-                        endLatchHold(latch);
+                        if(isElectionOver.compareAndSet(false, true)) {
+                            // majority is reached here, no need to continue the election
+                            endLatchHold(latch);
+                        }
                     } else {
                         latch.countDown();
                     }
@@ -449,7 +456,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
-            isElectionOver.set(true);
+
+            isElectionOver.compareAndSet(false, true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

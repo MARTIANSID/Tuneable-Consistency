@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS = 61;
+    public static final int NUM_OF_SERVERS = 51;
 
     public static void main(String[] args) throws IOException, InterruptedException {
         List<Server> servers = new ArrayList<>();
