@@ -60,7 +60,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     AtomicBoolean isElectionOver;
 
-    boolean doesLeaderHasHighestTerm;
+    AtomicBoolean doesLeaderHasHighestTerm;
 
     int currentLeader;
 
@@ -127,7 +127,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
         this.isElectionOver = new AtomicBoolean(false);
-        this.doesLeaderHasHighestTerm = false;
+        this.doesLeaderHasHighestTerm = new AtomicBoolean(false);
         this.ackIndex = new AtomicInteger(-1);
         this.totalAcks = new ConcurrentHashMap<>();
         this.matchIndexCount = new ConcurrentHashMap<>();
@@ -398,7 +398,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return true;
     }
 
-    private void endLatchHold(CountDownLatch latch) {
+    private synchronized void endLatchHold(CountDownLatch latch) {
         while (latch.getCount() > 0) {
             latch.countDown();
         }
@@ -751,8 +751,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
                         // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-                        doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp);
-
+                        // this makes it thread safe basically only one thread will be able to update it to false no race conditions here, and once it is false it remains false and then we break the loo
+                        doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
                     }
 
                     @Override
@@ -765,9 +765,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     }
                 });
-                if (!doesLeaderHasHighestTerm) break;
+                if (!doesLeaderHasHighestTerm.get()) break;
             }
-            if (!doesLeaderHasHighestTerm) break;
+            if (!doesLeaderHasHighestTerm.get()) break;
 
             try {
                 // in every 15 milliseconds send appendEntries
@@ -820,7 +820,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();  // Acquire the lock to ensure that no other thread modifies the shared state while we transition
         try {
             if (votes.get() >= (NUM_OF_SERVERS / 2) && status != ServerCurrentStatus.FOLLOWER) {
-                doesLeaderHasHighestTerm = true;
+                doesLeaderHasHighestTerm.set(true);
                 System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
                 // Stop the election timer
                 electionTimer.stop();
@@ -830,7 +830,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 this.status = ServerCurrentStatus.LEADER;
                 this.currentLeader = this.serverId;
             } else {
-                this.status = ServerCurrentStatus.FOLLOWER;
+                // we might want to cancel the batch job just in case, but it will start the election timer again which should not be an issue
+                becomeFollower();
             }
         } finally {
             lock.writeLock().unlock();  // Release the lock after modifying shared state
