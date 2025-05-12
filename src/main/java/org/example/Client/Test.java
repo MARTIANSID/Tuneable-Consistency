@@ -78,7 +78,6 @@ public class Test {
                 throw new RuntimeException(e);
             }
 
-
             executorService.shutdown();
             channel.shutdown();
             System.out.println("All transactions sent.");
