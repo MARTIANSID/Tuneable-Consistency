@@ -62,7 +62,10 @@ message Transaction {
   int32 minRequiredConsistency = 6;
   double baseProfit = 7;
   double extraProfitMajority = 8;
-  int32 writeConcern = 9;
+  double extraIntermediateProfit = 9;
+  int32 writeConcern = 10;
+  // this is there to check in which batch this transaction was actually processed
+  int32 batchNo = 11;
 }
 message LogEntryProto {
   int32 logIndex = 1;
@@ -71,6 +74,7 @@ message LogEntryProto {
   Transaction t = 4;
   TimeStampProto timeStamp = 5;
   repeated bool serversThatReplicatedThisEntry = 6;
+  int32 copyOfWriteConcern = 7;
 }
 
 message TimeStampProto {

@@ -28,6 +28,7 @@ import com.sun.management.OperatingSystemMXBean;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.util.prefs.PreferenceChangeEvent;
+import java.util.stream.Collectors;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
     int NUM_OF_SERVERS;
@@ -92,9 +93,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     AtomicInteger totalTransactions;
 
+    // this is used to calculate the throughput of the system
     ConcurrentLinkedQueue<Long> ackTransactionsTimeStamps;
 
-    private final Object metricCalculations;
+    private final Object systemWideThroughput;
+
+    private final Object writeConcernThroughput;
+
+    private final Object writeConcernLatency;
 
     ReadWriteLock redisLock;
 
@@ -110,11 +116,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ScheduledExecutorService batchProcessor;
     private ScheduledFuture<?> batchProcessingTask;
 
-    // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 200;
+    ConcurrentHashMap<Integer, Double> writeConcernCosts;
 
-    private static final double COST_W1 = 1;
-    private static final double COST_MAJORITY = 2.0;
+    ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns;
+
+    ConcurrentHashMap<Integer, Long> writeConcernLatencies;
+
+    // all the parameters for knapsack
+    private static final int BATCH_INTERVAL_MS = 20;
+
+//    private static final double COST_W1 = 1;
+//    private static final double COST_MAJORITY = 2.0;
     private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in seconds
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
@@ -150,17 +162,24 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.blockingStubs = new RaftBlockingStub[NUM_OF_SERVERS];
         this.log = new RaftLog(NUM_OF_SERVERS);
         this.totalTransactions = new AtomicInteger(0);
+        // this is used to calculate the throughput of the system
         this.ackTransactionsTimeStamps = new ConcurrentLinkedQueue<>();
-        this.metricCalculations = new Object();
+        this.systemWideThroughput = new Object();
+        this.writeConcernThroughput = new Object();
+        this.writeConcernLatency = new Object();
         this.redisLock = new ReentrantReadWriteLock();
         this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
         this.batchOfTransactions = new LinkedList<>();
+        this.writeConcernCosts = new ConcurrentHashMap<>();
         // only one thread is required because I run a periodic batch job every 20ms
         this.batchProcessor = Executors.newScheduledThreadPool(1);
         this.batchProcessingTask = null;
         // since in the batch we are only writing data, we need only the writeLock
         this.batchLock = new ReentrantLock();
         this.electionLock = new ReentrantLock();
+        this.ackTransactionTimeStampsForAllWriteConcerns = new ConcurrentHashMap<>();
+        this.writeConcernLatencies = new ConcurrentHashMap<>();
+
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
@@ -172,6 +191,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
+            }
+
+            int majorityLevel = ((NUM_OF_SERVERS / 2) + 1);
+
+            //setting up of the queues for calculating the throughput of each writeConcern
+            if(i > 0 && i <= majorityLevel) {
+                ackTransactionTimeStampsForAllWriteConcerns.put(i, new ConcurrentLinkedQueue<>());
+                // initially we might want to set the write concerns costs as 1.0 but as the throughput is calculated they are adjusted
+                writeConcernCosts.put(i,1.0);
+                writeConcernLatencies.put(i, (long)0);
             }
         }
         // setting up the client stub
@@ -196,6 +225,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
+            // this is added to replicate network call behaviour
+            Thread.sleep(new Random().nextInt(20) + 5);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
@@ -258,6 +289,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 //            System.out.println("Got Append Entries for server -- " + serverId + " Time --- " +(System.currentTimeMillis()));
 
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
         } finally {
             lock.writeLock().unlock();
         }
@@ -412,9 +445,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void requestForVotes() {
+        // this function uses readLock so it is thread safe
         RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
 
         // here I have deducted one because obviously the server requesting for votes, will not be responding to requestVote rpc
+        // also we expect response from total servers - 1
         CountDownLatch latch = new CountDownLatch(NUM_OF_SERVERS - 1);
 
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
@@ -436,8 +471,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     // it is not successful when the currentTerm of the leader is not up-to date
                     // I am handling everything in call backs to make raft election thread safe
                     // if isElectionOver was already false then do not change shared data
-                    // since compareAndSet is atomic we protect the double transitions due to race conditions
+                    // since compareAndSet is atomic we protect against the double transitions due to race conditions
                     if (!isSuccessful) {
+                        // if the current term is less then this node has to become a follower
                         if(isElectionOver.compareAndSet(false, true)) {
                             lock.writeLock().lock();
                             try {
@@ -448,10 +484,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             endLatchHold(latch);
                         }
                     } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
-                        // instead of writing outside
+
                         if(isElectionOver.compareAndSet(false, true)) {
                             // majority is reached here, no need to continue the election
+                            // I call the becomeLeader() here to make thread safe!
                             becomeLeader();
+                            //no need to wait further
                             endLatchHold(latch);
                         }
                     } else {
@@ -476,7 +514,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
-
             isElectionOver.compareAndSet(false, true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -487,9 +524,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
-
         for (LogEntry entry : entries) {
-            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).build());
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCopyOfWriteConcern(entry.copyOfWriteConcern).build());
         }
         return result;
     }
@@ -565,29 +601,30 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
         // this is just about minimising repeated acks, not compulsory to add it, now for the calculation of the metrics this is strictly required
+
+        Long timeStampOfTransaction = System.currentTimeMillis();
+
         for (LogEntry entry : entriesToBeAck) {
             String id = entry.t.getId();
 
+            // this field is seperate for each thread, so there will be no race conditions for this
+            boolean firstAck = false;
+
+
             // need to add lock because lot of shared variables are being accessed here
-            synchronized (metricCalculations) {
+            synchronized (systemWideThroughput) {
                 if (ackSent.containsKey(id) && !ackSent.get(id)) {
+
+                    firstAck = true;
                     // marking it as sent, if it fails the client can retry from its end
                     ackSent.put(id, true);
                     // send ack for this entry
 //                    System.out.println("sending ack");
 //                    System.out.println("The transaction id --" + id + " Replicated to ----" + entry.serversThatReplicatedThisEntry);
-                    Long timeStampOfTransaction = System.currentTimeMillis();
                     // here I have implemented the logic of rolling throughput
                     // remove the old transactions from the queue, we maintain a window of 1 seconds
-                    while (!ackTransactionsTimeStamps.isEmpty() &&
-                            (timeStampOfTransaction - ackTransactionsTimeStamps.peek()) >= 1000L) {
-                        ackTransactionsTimeStamps.poll();
-                    }
-                    // add the current transactions timestamp in the queue
-                    ackTransactionsTimeStamps.add(timeStampOfTransaction);
-                    // size of this queue should be the TPS / Rolling throughput
-                    //System.outprintln("Rolling throughput is--" + ackTransactionsTimeStamps.size());
-
+                    // *** this is system wide throughput calculation ***
+                    recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
                     // this latency is in ms
                     long latency = (timeStampOfTransaction - timeAtWhichTransactionWasReceived.get(id));
                     int currentTotalTransactions = totalTransactions.incrementAndGet();
@@ -598,6 +635,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 }
             }
+            // if we are sending the ack of this transaction again we do not want to process the writeConcernThroughput
+            if(!firstAck) continue;
+            // *** this is the calculation of writeConcernThroughput ***
+            synchronized (writeConcernThroughput) {
+                int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
+                ConcurrentLinkedQueue<Long> writeConcernSpecificAckTransactionsTimeStamps = ackTransactionTimeStampsForAllWriteConcerns.get(writeConcernOfThisTransaction);
+                if(writeConcernSpecificAckTransactionsTimeStamps != null && timeStampOfTransaction != null) {
+                    recordThroughput(writeConcernSpecificAckTransactionsTimeStamps, timeStampOfTransaction, true);
+                }
+            }
+            // *** this is the calculation of writeConcernLatency ***
+            synchronized (writeConcernLatency) {
+                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
+                int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
+               Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
+               // this timeStampOfTransaction is the current time taken at the time of sending ack
+               Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
+               Long prevLatency = writeConcernLatencies.get(writeConcernOfThisTransaction);
+               // taking average of latencies, later on maybe we can use Exponential Moving Average (which more weightage to the recent latencies)
+               writeConcernLatencies.put(writeConcernOfThisTransaction, prevLatency == 0 ? currentLatency : ((prevLatency + currentLatency) / 2));
+
+            }
+
         }
 
         // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on committing
@@ -626,13 +686,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             public void onCompleted() {
                 // this where we receive the message done
 //                System.out.println("Ack Sent successfully");
-                latch.countDown();
+                 // not sure if this is required or not
+//                latch.countDown();
             }
         });
 
     }
+    private void recordThroughput(ConcurrentLinkedQueue<Long> queue, long timeStampOfTransaction, boolean addTimeStamp) {
+        while (!queue.isEmpty() && timeStampOfTransaction - queue.peek() >= 1000L) {
+            queue.poll();
+        }
+        // during processing the batch we do not want to add the timestamp
+        if(addTimeStamp)
+        queue.add(timeStampOfTransaction);
+    }
 
-    // we can optimize the write lock herek
+    // we can optimize the write lock here
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower, int prevNextIndex) {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
@@ -699,6 +768,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
 
+            // sending ack logic is kept outside the lock to reduce the contention
             CountDownLatch latch = new CountDownLatch(2);
             // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
             if (!committedEntriesAck.isEmpty()) {
@@ -782,7 +852,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
                         // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-
                             doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
                     }
 
@@ -887,6 +956,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here the logic to process the current batch of transaction will come
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
+
+
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
@@ -903,11 +974,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
-        HashSet<String> idsOfTransactionsWhichCanBeExecuted = new HashSet<>();
-
-        for(ClientMessage cm : transactionsToExecute) {
-            idsOfTransactionsWhichCanBeExecuted.add(cm.getT().getId());
-        }
+        // we can add parallelize this stream if needed
+        Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+                .map(cm -> cm.getT().getId())
+                .collect(Collectors.toSet());
 
         int backLog = 0;
 
@@ -947,11 +1017,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // we do update the clock of leader using followers
                 HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
                 // appending the entry in log
-                log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS));
+                log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS, System.currentTimeMillis()));
                 updateBalances(t, clientBalancesLatest);
                 // we need this to implement causal consistency
                 timeStampsInLog.put(currentTimeStamp, index);
-                // since this is in right lock only updated entry will be sent to the followers
+                // since this is in write lock only updated entry will be sent to the followers, as this entire thing is atomic
                 log.updateWriteConcern(index, serverId);
                 ackSent.put(id, false);
                 timeAtWhichTransactionWasReceived.put(id, System.currentTimeMillis());
@@ -978,12 +1048,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    private void printAllWriteConernsThroughputAndLatencies() {
+        System.out.println("Printing Throughputs");
+        for(int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+            System.out.println(getWriteConcernThroughput(i));
+        }
+        synchronized (writeConcernLatency) {
+            System.out.println("Printing Latencies");
+            for(int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+                System.out.println(writeConcernLatencies.get(i));
+            }
+        }
+    }
+
+
+
     private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch) {
 
         redisLock.writeLock().lock();
         try {
+
+            // for testing
+            printAllWriteConernsThroughputAndLatencies();
+
             // current metrics
-            double currentTps = getCurrentRollingThroughput();
+            double currentTps = getSystemWideThroughput();
             TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
             double  currentTokens = tb.getTokenCount();
             long lastUpdate = tb.getLastUpdateTime();
@@ -995,8 +1084,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
             int transactionsToBeProcessedToMaintainThreshold = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
-
-            System.out.println("Min transactions to be processed --" + transactionsToBeProcessedToMaintainThreshold);
 
             // the optimal number of transactions we can process
             int minNumberOfTransactionsToBeProcessed = Math.min(transactionsToBeProcessedToMaintainThreshold, n);
@@ -1055,15 +1142,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 usedTokens += tokenCostOfTransaction;
                 ClientMessage.Builder cmBuilder = t.clientMessage.toBuilder();
                 // I update the writeConcern of the transaction
-                if(minConsistencyOfTransaction == 1) {
-                    cmBuilder.setWriteConcern(1);
-                } else {
-                    cmBuilder.setWriteConcern(((NUM_OF_SERVERS) / 2 + 1));
-                }
+                cmBuilder.setWriteConcern(minConsistencyOfTransaction);
+
                 profit += profitForMinConsistency;
                 selected.add(cmBuilder.build());
                 // added this because we do not want the current batch to consume all the tokens, we want to get the required throughput
-                // we might want to process more transactions if lets say more w:1 are left?? because w:1 is pretty cheap we can use some tokens for it??
+                // we might want to process more transactions if lets say more w:1 are left?? because w:1 is pretty cheap we can use some tokens for it
                 if(selected.size() >= minTransactions && (index + 1) < transactions.size() && transactions.get(index + 1).minRequiredConsistency != 1) return new ProcessResult(selected, (usedTokens / scale), profit, 0);
             } else {
                 // we break here because now the token cost will increase because consistency levels are only going to increase
@@ -1075,19 +1159,23 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return new ProcessResult(selected, usedTokens / scale, profit, 0);
     }
 
+
+    // all the token costs are stored in a map, we use scale to convert them into integer, as we can't store double in DP
+    private double tokenCost(int consistency, double scale) {
+        return Math.ceil(writeConcernCosts.getOrDefault(consistency, 0.0) * scale);
+    }
+
     // use this when throughput is higher or equal to of the expected value
     private ProcessResult processForProfit(List<TransactionOption> transactions, double currentTokens, int minTransactions, double scale) {
         int n = transactions.size();
-        int maxTokens = (int)(currentTokens * scale);
+        int maxTokens = (int) Math.ceil(currentTokens * scale);
+        int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
 
-        int CONSISTENCY_W1 = 1, CONSISTENCY_MAJORITY = 2;
-
-        // DP[i][t] = object holding profit and count of selected transactions
         class State {
             double profit;
             int count;
             int prevT;
-            int consistency; // 0 if skipped, else consistency level
+            int consistency;
             boolean taken;
 
             State(double profit, int count, int prevT, int consistency, boolean taken) {
@@ -1099,61 +1187,61 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
 
+        // **** we can reduce the complexity of this DP by tuning the batch timing ****
+        // complexity of this is (no of transaction in the batch) * (max tokens allowed)
+
         State[][] dp = new State[n + 1][maxTokens + 1];
         dp[0][0] = new State(0, 0, -1, 0, false);
 
-        int maxNumberOfTransactionsThatCanBeExecuted = 0;
+        int maxExecutedTransactions = 0;
 
         for (int i = 0; i < n; i++) {
             TransactionOption tx = transactions.get(i);
 
-            double profitW1 = tx.baseProfit;
-            double profitMaj = tx.baseProfit + tx.extraMajorityProfit;
-
-            int costW1 = (int)(COST_W1 * scale);
-            int costMaj = (int)(COST_MAJORITY * scale);
-
             for (int t = 0; t <= maxTokens; t++) {
                 if (dp[i][t] == null) continue;
 
-                // Case 1: skip
+                // this the case where we skip the transaction
                 if (dp[i + 1][t] == null || dp[i + 1][t].profit < dp[i][t].profit) {
                     dp[i + 1][t] = new State(dp[i][t].profit, dp[i][t].count, t, 0, false);
                 }
 
-                // Case 2: W1
-                if (tx.minRequiredConsistency <= CONSISTENCY_W1 && t + costW1 <= maxTokens) {
-                    int nt = t + costW1;
-                    double newProfit = dp[i][t].profit + profitW1;
-                    int newCount = dp[i][t].count + 1;
+                // we try all possible writeConcern
+                for (int wc : writeConcernCosts.keySet()) {
+                    int cost = (int) tokenCost(wc, scale);
 
-                    if (dp[i + 1][nt] == null || dp[i + 1][nt].profit < newProfit) {
-                        dp[i + 1][nt] = new State(newProfit, newCount, t, CONSISTENCY_W1, true);
-                        maxNumberOfTransactionsThatCanBeExecuted = Math.max(maxNumberOfTransactionsThatCanBeExecuted, dp[i+1][nt].count);
+                    if (wc < tx.minRequiredConsistency) continue;
+
+                    double profit = tx.baseProfit;
+
+                    if (wc >= majorityLevel) {
+                        profit += tx.extraMajorityProfit;
+                    } else if (wc > tx.minRequiredConsistency) {
+                        profit += tx.extraIntermediateProfit * (wc - tx.minRequiredConsistency);
+                    }
+
+                    // obviously it should not exceed the maxTokens limit
+                    if (t + cost <= maxTokens) {
+                        int nt = t + cost;
+                        double newProfit = dp[i][t].profit + profit;
+                        int newCount = dp[i][t].count + 1;
+
+                        if (dp[i + 1][nt] == null || dp[i + 1][nt].profit < newProfit) {
+                            dp[i + 1][nt] = new State(newProfit, newCount, t, wc, true);
+                            // we calculate the max number of transactions we can execute
+                            maxExecutedTransactions = Math.max(maxExecutedTransactions, newCount);
+                        }
                     }
                 }
-
-                // Case 3: Majority
-                if (tx.minRequiredConsistency <= CONSISTENCY_MAJORITY && t + costMaj <= maxTokens) {
-                    int nt = t + costMaj;
-                    double newProfit = dp[i][t].profit + profitMaj;
-                    int newCount = dp[i][t].count + 1;
-
-                    if (dp[i + 1][nt] == null || dp[i + 1][nt].profit < newProfit) {
-                        dp[i + 1][nt] = new State(newProfit, newCount, t, CONSISTENCY_MAJORITY, true);
-                        maxNumberOfTransactionsThatCanBeExecuted = Math.max(maxNumberOfTransactionsThatCanBeExecuted, dp[i+1][nt].count);
-                    }
-                }
-
             }
         }
-        // Find best valid state with at least minTransactions
+
         double bestProfit = -1;
         int bestT = -1, transactionsUpgraded = 0;
 
-        // we do optimise here on the number of transactions that we can execute, we want to execute maxNumberOfTransactions but in all the cases we cannot
         for (int t = 0; t <= maxTokens; t++) {
-            if (dp[n][t] != null && dp[n][t].count >= Math.min(maxNumberOfTransactionsThatCanBeExecuted,minTransactions)) {
+            // we use Math.min because the minTransactions could be higher than the number of transactions that we can execute
+            if (dp[n][t] != null && dp[n][t].count >= Math.min(maxExecutedTransactions, minTransactions)) {
                 if (dp[n][t].profit > bestProfit) {
                     bestProfit = dp[n][t].profit;
                     bestT = t;
@@ -1161,12 +1249,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
 
-        if (bestT == -1) return new ProcessResult( new ArrayList<>(), 0.0, bestProfit, 0); // not possible
+        if (bestT == -1) return new ProcessResult(new ArrayList<>(), 0.0, bestProfit, 0);
 
-        // Backtrack
         List<ClientMessage> result = new ArrayList<>();
         int t = bestT;
-        double profit = 0;
+
         for (int i = n; i >= 1; i--) {
             State s = dp[i][t];
             if (s == null) break;
@@ -1174,41 +1261,45 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (s.taken) {
                 TransactionOption tx = transactions.get(i - 1);
                 ClientMessage.Builder builder = tx.clientMessage.toBuilder();
-                if (s.consistency == CONSISTENCY_W1) {
-                    builder.setWriteConcern(1);
-                } else {
-                    // majority writeConcern
-                    builder.setWriteConcern((NUM_OF_SERVERS / 2) + 1);
+                // set the writeConcern for this particular transaction
+                builder.setWriteConcern(s.consistency);
 
-                    if (tx.minRequiredConsistency == CONSISTENCY_W1) {
-                        // this means that the consistency of this particular transaction was upgraded
-                        transactionsUpgraded++;
-                    }
+                // check if we have upgraded the consistency of this particular transaction
+                if (s.consistency > tx.minRequiredConsistency) {
+                    transactionsUpgraded++;
                 }
                 result.add(builder.build());
             }
             t = s.prevT;
         }
+
         Collections.reverse(result);
         double tokensUsed = bestT / scale;
+
         return new ProcessResult(result, tokensUsed, bestProfit, transactionsUpgraded);
     }
 
-    private double tokenCost(int consistency, double scale) {
-        return consistency == 1 ? (COST_W1*scale) : (COST_MAJORITY*scale);
-    }
+
     // this gives me the current rolling throughput, at the time of ack I add the transactions timestamp
-    private double getCurrentRollingThroughput() {
+    private double getSystemWideThroughput() {
         // this can be accessed while sending ack also so we want to ensure that only thread enters
-        synchronized (metricCalculations) {
-            long currentTime = System.currentTimeMillis();
-            while (!ackTransactionsTimeStamps.isEmpty() && (currentTime - ackTransactionsTimeStamps.peek()) > 1000) {
-                ackTransactionsTimeStamps.poll();
-            }
+        synchronized (systemWideThroughput) {
+            Long currentTimeStamp = System.currentTimeMillis();
+            recordThroughput(ackTransactionsTimeStamps, currentTimeStamp, false);
             return ackTransactionsTimeStamps.size();
         }
     }
 
+    private double getWriteConcernThroughput(int writeConcern) {
+        synchronized (writeConcernThroughput) {
+            Long currentTimeStamp = System.currentTimeMillis();
+            ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns.get(writeConcern);
+            if(writeConcernSpecificTimeStamps != null) {
+                recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
+            }
+            return writeConcernSpecificTimeStamps.size();
+        }
+    }
     // need to review the logic
     @Override
     public void sendReadRequest(ReadRequest readRequest, StreamObserver<Balance> responseObserver) {

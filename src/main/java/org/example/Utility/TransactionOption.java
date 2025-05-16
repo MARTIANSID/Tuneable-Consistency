@@ -15,13 +15,16 @@ public class TransactionOption {
 
     public double extraMajorityProfit;
 
+    public double extraIntermediateProfit;
+
    public String id;
 
-    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit) {
+    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit) {
         this.minRequiredConsistency = minRequiredConsistency;
         this.baseProfit = baseProfit;
         this.extraMajorityProfit = extraMajorityProfit;
         this.clientMessage = clientMessage;
+        this.extraIntermediateProfit = extraIntermediateProfit;
     }
 
     public static List<TransactionOption> convertToTransactionOption(List<ClientMessage> clientMessageList) {
@@ -30,7 +33,7 @@ public class TransactionOption {
 
         for(ClientMessage cm : clientMessageList) {
             Transaction t = cm.getT();
-            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority()));
+            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit()));
         }
         return transactionOptionList;
     }
