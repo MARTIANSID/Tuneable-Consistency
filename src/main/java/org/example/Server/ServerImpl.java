@@ -5,7 +5,6 @@ import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 
-import java.util.stream.Collectors;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -14,14 +13,11 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.stream.Collectors;
 
 import org.ds.paxos.RaftGrpc.*;
 
 import org.example.TokenBucket.TokenBucketImpl;
-import org.example.Utility.HybridClock;
-import org.example.Utility.LogEntry;
-import org.example.Utility.RaftLog;
+import org.example.Utility.*;
 import org.example.Utility.ServerStatus.*;
 import org.example.TokenBucket.TokenBucketImpl.TokenBucketData;
 
@@ -31,9 +27,11 @@ import com.sun.management.OperatingSystemMXBean;
 
 import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
+import java.util.prefs.PreferenceChangeEvent;
+import java.util.stream.Collectors;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
-    int NUM_OF_SERVERS = 5;
+    int NUM_OF_SERVERS;
     AtomicInteger currentTerm;
 
     // can optimize the votedFor logic
@@ -63,7 +61,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     AtomicBoolean isElectionOver;
 
-    boolean doesLeaderHasHighestTerm;
+    AtomicBoolean doesLeaderHasHighestTerm;
 
     int currentLeader;
 
@@ -92,47 +90,47 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     HybridClock hybridClock;
 
     ReadWriteLock ackLock;
-    // private TokenBucketGrpc.TokenBucketBlockingStub tokenBucketStub;
-    // private final double TOKEN_REFILL_RATE_PER_MS = 1; // 1 token/sec
 
     AtomicInteger totalTransactions;
 
+    // this is used to calculate the throughput of the system
     ConcurrentLinkedQueue<Long> ackTransactionsTimeStamps;
 
-    private final Object metricCalculations;
+    private final Object systemWideThroughput;
+
+    private final Object writeConcernThroughput;
+
+    private final Object writeConcernLatency;
 
     ReadWriteLock redisLock;
 
+    ReentrantLock batchLock;
+    ReentrantLock electionLock;
+
     TokenBucketImpl tokenBucket;
 
-    private long serverStartTimeMs;
-    private AtomicLong totalAckedTransactions = new AtomicLong(0);
+    // this helps in avoiding race conditions, this will batch transactions for 20ms
+    Queue<ClientMessage> batchOfTransactions;
+
+    // this will execute the batch in every 20 ms
+    ScheduledExecutorService batchProcessor;
+    private ScheduledFuture<?> batchProcessingTask;
+
+    ConcurrentHashMap<Integer, Double> writeConcernCosts;
+
+    ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns;
+
+    ConcurrentHashMap<Integer, Long> writeConcernLatencies;
+
+    ConcurrentHashMap<Integer, Double> smoothedLatencies;
 
 
+    // all the parameters for knapsack
+    private static final int BATCH_INTERVAL_MS = 20;
 
-
-    //Knapsack
-    private static class QueuedTransaction {
-        Transaction txn;
-        int minRequiredConsistency;
-        double baseProfit;
-        double extraProfitOnMajority;
-    
-        public QueuedTransaction(Transaction txn, int minRequiredConsistency, double baseProfit, double extraProfitOnMajority) {
-            this.txn = txn;
-            this.minRequiredConsistency = minRequiredConsistency;
-            this.baseProfit = baseProfit;
-            this.extraProfitOnMajority = extraProfitOnMajority;
-        }
-    }
-    
-    private LinkedBlockingQueue<QueuedTransaction> incomingTransactions = new LinkedBlockingQueue<>();
-    private final ScheduledExecutorService batchProcessor = Executors.newScheduledThreadPool(1);
-    private static final int BATCH_INTERVAL_MS = 200; // batch interval
-    private static final double COST_W1 = 0.5;
-    private static final double COST_MAJORITY = 1.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 55; // Target TPS7
-
+//    private static final double COST_W1 = 1;
+//    private static final double COST_MAJORITY = 2.0;
+    private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in seconds
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -140,12 +138,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(200) + 300), TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 200), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
         this.isElectionOver = new AtomicBoolean(false);
-        this.doesLeaderHasHighestTerm = false;
+        this.doesLeaderHasHighestTerm = new AtomicBoolean(false);
         this.ackIndex = new AtomicInteger(-1);
         this.totalAcks = new ConcurrentHashMap<>();
         this.matchIndexCount = new ConcurrentHashMap<>();
@@ -167,11 +165,24 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.blockingStubs = new RaftBlockingStub[NUM_OF_SERVERS];
         this.log = new RaftLog(NUM_OF_SERVERS);
         this.totalTransactions = new AtomicInteger(0);
+        // this is used to calculate the throughput of the system
         this.ackTransactionsTimeStamps = new ConcurrentLinkedQueue<>();
-        this.metricCalculations = new Object();
+        this.systemWideThroughput = new Object();
+        this.writeConcernThroughput = new Object();
+        this.writeConcernLatency = new Object();
         this.redisLock = new ReentrantReadWriteLock();
         this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
-        this.serverStartTimeMs = System.currentTimeMillis();
+        this.batchOfTransactions = new LinkedList<>();
+        this.writeConcernCosts = new ConcurrentHashMap<>();
+        // only one thread is required because I run a periodic batch job every 20ms
+        this.batchProcessor = Executors.newScheduledThreadPool(1);
+        this.batchProcessingTask = null;
+        // since in the batch we are only writing data, we need only the writeLock
+        this.batchLock = new ReentrantLock();
+        this.electionLock = new ReentrantLock();
+        this.ackTransactionTimeStampsForAllWriteConcerns = new ConcurrentHashMap<>();
+        this.writeConcernLatencies = new ConcurrentHashMap<>();
+        this.smoothedLatencies = new ConcurrentHashMap<>();
 
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
@@ -185,16 +196,20 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
             }
+
+            int majorityLevel = ((NUM_OF_SERVERS / 2) + 1);
+
+            //setting up of the queues for calculating the throughput of each writeConcern
+            if(i > 0 && i <= majorityLevel) {
+                ackTransactionTimeStampsForAllWriteConcerns.put(i, new ConcurrentLinkedQueue<>());
+                // initially we might want to set the write concerns costs as 1.0 but as the throughput is calculated they are adjusted
+                writeConcernCosts.put(i,1.0);
+                writeConcernLatencies.put(i, (long)0);
+            }
         }
         // setting up the client stub
         ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
         clientStub = RaftGrpc.newStub(channel);
-
-         // Initialize token bucket stub (assuming token server is on port 8500)
-        //  ManagedChannel tokenChannel = ManagedChannelBuilder.forAddress("localhost", 8500).usePlaintext().build();
-        //  tokenBucketStub = TokenBucketGrpc.newBlockingStub(tokenChannel);
-
-        batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
         // starting the election timer
         this.electionTimer.start();
@@ -214,17 +229,20 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
+            // this is added to replicate network call behaviour
+            Thread.sleep(new Random().nextInt(20) + 5);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
             // Check if the leader's term is valid
-            if (leadersTerm >= currentTerm.get()) {
+            if (leadersTerm > currentTerm.get()) {
                 currentLeader = leaderId;
                 currentTerm.updateAndGet(term -> Math.max(term, leadersTerm));
-                if (status == ServerCurrentStatus.LEADER) {
-                    startTheElectionTimer();
-                }
-                status = ServerCurrentStatus.FOLLOWER;
+                becomeFollower();
+            }
+
+            if(leadersTerm == currentTerm.get()) {
+                currentLeader = leaderId;
             }
 
             // If the leader's term is outdated or log mismatch, respond with failure
@@ -275,11 +293,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 //            System.out.println("Got Append Entries for server -- " + serverId + " Time --- " +(System.currentTimeMillis()));
 
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
         } finally {
             lock.writeLock().unlock();
         }
     }
-
 
     // inside write lock
     private void updateBalances(Transaction t, ConcurrentHashMap<String, Double> balances) {
@@ -314,8 +333,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
 
     }
-
-
     // in lock
     private boolean isUpToDateCandidateLog(int lastLogTermOfCandidate, int lastLogIndexOfCandidate) {
         int lastLogTermOfCurrentNode = getLastLogTerm(), lastLogIndexOfCurrentNode = getLastLogTerm();
@@ -341,12 +358,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // the term of this follower is updated because it will now vote in this updated term
                 currentTerm.updateAndGet(term -> Math.max(term, currentTermOfTheCandidate));
                 // the node must become a follower
-                if (status == ServerCurrentStatus.LEADER) {
-                    // if this node was leader we need to start the timer
-                    startTheElectionTimer();
-                }
-                // changing the state to follower because higher term node is found, that is trying to become leader
-                status = ServerCurrentStatus.FOLLOWER;
+                becomeFollower();
             }
             // all the necessary conditions to check for denying vote
             if (votedFor.containsKey(this.currentTerm.get()) || (this.currentTerm.get() > currentTermOfTheCandidate) || !isUpToDateCandidateLog(lastLogTermOfCandidate, lastLogIndexOfCandidate)) {
@@ -373,351 +385,23 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
         // check if the current node is leader or not, if not forward request to leader, this might fail if election is going on
         if (serverId != currentLeader) {
-            // can use a blocking stub here
-            blockingStubs[currentLeader].sendTransaction(clientMessage);
+            // here I have kept the call blocking for now (with a timeout of 1 second), later we can move it to async,
+            blockingStubs[currentLeader].withDeadlineAfter(1, TimeUnit.SECONDS).sendTransaction(clientMessage);
             responseObserver.onNext(Empty.newBuilder().build());
             responseObserver.onCompleted();
             return;
         }
-
-        Transaction t = clientMessage.getT();
-        int writeConcern = clientMessage.getWriteConcern();
-        String appType = t.getAppType();
-    
-        double baseProfit = 0, extraProfit = 0;
-        int minConsistency = writeConcern;
-    
-        if (appType.equals("like")) {
-            baseProfit = 1;
-            extraProfit = 1; // if upgraded to majority
-        } else if (appType.equals("comment")) {
-            baseProfit = 1;
-            extraProfit = 2;
-        } else if (appType.equals("post")) {
-            baseProfit = 2;
-            extraProfit = 0; // post already needs majority
-        }
-    
-        incomingTransactions.add(new QueuedTransaction(t, minConsistency, baseProfit, extraProfit));
+        // I send the ack back, to resolve the above blocking call immediately once the message is received
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
-    }
-
-//         String id = t.getId();
-
-// //        if (tIdToLogIndex.containsKey(id)) {
-// //            int logIndex = tIdToLogIndex.get(id);
-// //            if (commitIndex.get() >= logIndex) {
-// //                // already committed so just send the ack
-// //            } else if (isWriteConcernStatisfied()) {
-// //            }
-// //            // now here if the writeConcernStatisfied does not have the data basically it is a replica then the replica will update the writeConcern done on its end using appendEntries
-// //            responseObserver.onNext(Empty.newBuilder().build());
-// //            responseObserver.onCompleted();
-// //            return;
-// //        }
-//         int writeConcern = clientMessage.getWriteConcern();
-
-
-
-//         //TOKEN BUCKET ALGORITHM:
-//         // double requiredTokens = (writeConcern == 1) ? 30 : 80;
-//         // TokenConsumeResponse tokenResp = tokenBucketStub.consumeTokens(
-//         // TokenConsumeRequest.newBuilder()
-//         //     .setRequiredTokens(requiredTokens)
-//         //     .build()
-//         //  );
-
-//         // if (!tokenResp.getGranted()) {
-//         //     System.out.println("Not enough tokens. Dropping or queuing txn: " + id);
-//         //     responseObserver.onNext(Empty.newBuilder().build());
-//         //     responseObserver.onCompleted();
-//         //     return;
-//         // }
-
-
-
-//         int index = -1;
-//         // we want it to be synchronized in order to get the correct index, and not allow multiple threads to get same index
-//         // log.size() takes in only read lock hence we need synchronized
-//         List<LogEntry> entry = new ArrayList<>();
-//         lock.writeLock().lock();
-//         try {
-//             System.out.println("Got the transaction!");
-
-//             // adding the logic of Token Bucket
-//             redisLock.writeLock().lock();
-//             try {
-//                 // get the token data
-//                 TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
-
-//                 double currentTokens = tokenBucketData.getTokenCount();
-//                 long lastUpdateTime = tokenBucketData.getLastUpdateTime();
-
-
-//                 System.out.println("The current tokens are--" + currentTokens + " The last update time is--" + lastUpdateTime);
-
-
-//                 if (currentTokens <= 0) {
-//                     System.out.println("Throttling the request");
-//                     responseObserver.onNext(Empty.newBuilder().build());
-//                     responseObserver.onCompleted();
-//                     return;
-//                 }
-//                 // update the token count in redis along with lastUpdateTime
-//                 tokenBucket.updateTokens(currentTokens - 1, lastUpdateTime);
-//             } finally {
-//                 redisLock.writeLock().unlock();
-//             }
-
-//             index = log.size();
-
-//             if (clientMessage.hasTimeStamp()) {
-//                 // updating the clock of leader using the time stamp sent by the client
-//                 hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(clientMessage.getTimeStamp()));
-//             }
-
-//             // we do update the clock of leader using followers
-//             HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
-//             // appending the entry in log
-//             log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS));
-//             updateBalances(t, clientBalancesLatest);
-//             // we need this to implement causal consistency
-//             timeStampsInLog.put(currentTimeStamp, index);
-//             // since this is in right lock only updated entry will be sent to the followers
-//             log.updateWriteConcern(index, serverId);
-
-//             ackSent.put(id, false);
-//             timeAtWhichTransactionWasReceived.put(id, System.currentTimeMillis());
-//             // if write concern becomes 0 we will send ack to client
-//             if (log.get(index).writeConcern == 0) {
-//                 entry.add(log.get(index));
-//             }
-//             System.out.println(index);
-//         } finally {
-//             totalAcks.put(index, 1);
-//             tIdToLogIndex.put(id, index);
-
-//             lock.writeLock().unlock();
-
-//             CountDownLatch latch = new CountDownLatch(1);
-//             if (!entry.isEmpty()) {
-//                 sendAckForEntries(entry, latch);
-//             } else {
-//                 latch.countDown();
-//             }
-
-//             try {
-//                 latch.await(200, TimeUnit.MILLISECONDS);
-//             } catch (InterruptedException e) {
-//                 throw new RuntimeException(e);
-//             }
-//         }
-//         responseObserver.onNext(Empty.newBuilder().build());
-//         responseObserver.onCompleted();
-//     }
-
-private void processBatch() {
-    List<QueuedTransaction> batch = new ArrayList<>();
-    incomingTransactions.drainTo(batch);
-
-    if (batch.isEmpty()) return;
-
-    redisLock.writeLock().lock();
-    try {
-
-        double currentTps = getCurrentRollingThroughput();
-        TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
-        double rawTokens = tb.getTokenCount();
-        long lastUpdate = tb.getLastUpdateTime();
-        int maxTokens = (int)Math.floor(rawTokens * 2);
-        long now = System.currentTimeMillis();
-        double avgThroughput = (double) totalAckedTransactions.get() * 1000 / (now - serverStartTimeMs);
-        boolean throughputLow = avgThroughput < MIN_REQUIRED_THROUGHPUT;
-
-    
-        int n = batch.size();
-        int R = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
-        R = Math.min(R, n); 
-        
-        
-        
-
-
-        // 3) Build cost & profit arrays
-         // build cost & profit arrays (same as you have)…
-        int[] costMin = new int[n], costMaj = new int[n];
-        double[] profMin = new double[n], profMaj = new double[n];
-        // for (int i = 0; i < n; i++) {
-        // QueuedTransaction qt = batch.get(i);
-        // costMin[i] = qt.minRequiredConsistency == 1 ? 1 : 2;
-        // costMaj[i] = 2;
-        // profMin[i] = qt.baseProfit;
-        // profMaj[i] = qt.baseProfit + qt.extraProfitOnMajority;
-        // }
-
-        for (int i = 0; i < n; i++) {
-            QueuedTransaction qt = batch.get(i);
-            costMin[i] = qt.minRequiredConsistency == 1 ? 1 : 2;
-            costMaj[i] = 2;
-            profMin[i] = qt.baseProfit;
-            profMaj[i] = qt.baseProfit + qt.extraProfitOnMajority;
-
-            if (throughputLow) {
-                // Force no upgrades if throughput is low
-                if (qt.minRequiredConsistency == 1) {
-                    costMaj[i] = Integer.MAX_VALUE;
-                    profMaj[i] = Double.NEGATIVE_INFINITY;
-                }
-            }
-        }
-
-        // 4) DP table: dp[i][j][w] = max profit using first i txns, picking exactly j txns, spending w units
-        double[][][] dp = new double[n+1][n+1][maxTokens+1];
-        int[][][] choice = new int[n+1][n+1][maxTokens+1]; 
-        //   choice = 0→skip, 1→takeMin, 2→takeMaj
-
-        // initialize to -∞, except dp[0][0][0] = 0
-        for (int i = 0; i <= n; i++)
-            for (int j = 0; j <= n; j++)
-                Arrays.fill(dp[i][j], Double.NEGATIVE_INFINITY);
-        dp[0][0][0] = 0;
-
-        // 5) Fill DP
-        for (int i = 1; i <= n; i++) {
-            for (int j = 0; j <= i; j++) {
-                for (int w = 0; w <= maxTokens; w++) {
-                    // SKIP
-                    dp[i][j][w] = dp[i-1][j][w];
-                    choice[i][j][w] = 0;
-
-                    // TAKE at min consistency
-                    if (j > 0 && w >= costMin[i-1] 
-                        && dp[i-1][j-1][w-costMin[i-1]] > Double.NEGATIVE_INFINITY) {
-                        double cand = dp[i-1][j-1][w-costMin[i-1]] + profMin[i-1];
-                        if (cand > dp[i][j][w]) {
-                            dp[i][j][w] = cand;
-                            choice[i][j][w] = 1;
-                        }
-                    }
-                    // TAKE upgraded to majority (only if original min was 1)
-                    if (batch.get(i-1).minRequiredConsistency == 1 
-                        && j > 0 && w >= costMaj[i-1]
-                        && dp[i-1][j-1][w-costMaj[i-1]] > Double.NEGATIVE_INFINITY) {
-                        double cand = dp[i-1][j-1][w-costMaj[i-1]] + profMaj[i-1];
-                        if (cand > dp[i][j][w]) {
-                            dp[i][j][w] = cand;
-                            choice[i][j][w] = 2;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 6) Pick the best over j ≥ R (you can pick beyond R to maximize profit)
-        double bestProfit = Double.NEGATIVE_INFINITY;
-        int bestJ = R, bestW = 0;
-        for (int j = R; j <= n; j++) {
-            for (int w = 0; w <= maxTokens; w++) {
-                if (dp[n][j][w] > bestProfit) {
-                    bestProfit = dp[n][j][w];
-                    bestJ = j;
-                    bestW = w;
-                }
-            }
-        }
-
-        // 7) Backtrack to find which items & at what consistency
-// new—use the JDK's Map.Entry as your tuple type
-        List<Map.Entry<QueuedTransaction,Integer>> chosen = new ArrayList<>();
-        int i = n, j = bestJ, w = bestW;
-        while (i > 0) {
-            int ch = choice[i][j][w];
-            if (ch == 1 || ch == 2) {
-                QueuedTransaction qt = batch.get(i-1);
-                int execConsistency = (ch == 1 ? qt.minRequiredConsistency : 2);
-                chosen.add(new AbstractMap.SimpleEntry<>(qt, execConsistency));
-                w -= (ch==1 ? costMin[i-1] : costMaj[i-1]);
-                j--;
-            }
-            i--;
-        }
-        Collections.reverse(chosen);
-
-        // 8) Any not chosen get requeued
-        Set<QueuedTransaction> selSet = chosen.stream()
-        .map(Map.Entry::getKey)
-        .collect(Collectors.toSet());
-
-    List<QueuedTransaction> leftovers = batch.stream()
-        .filter(qt -> !selSet.contains(qt))
-        .collect(Collectors.toList());
-
-
-        // 9) Actually execute everything we chose
-        long upgrades = chosen.stream()
-        .filter(e -> e.getValue() == 2)
-        .count();
-
-        // actually execute
-        double tokensUsed = bestW / 2.0;
-        for (var e : chosen) {
-        actuallyAppendTransaction(e.getKey().txn, e.getValue());
-        }
-
-        // requeue any you skipped
-        incomingTransactions.addAll(leftovers);
-
-        // write back bucket
-        double newTokenCount = rawTokens - tokensUsed;
-        tokenBucket.updateTokens(newTokenCount, lastUpdate);
-
-        // **NEW**: a single “batch summary” line with only the fields you care about
-        System.out.printf(
-            "📦 BatchSummary: picked %d/%d (upgrades=%d), profit=%.1f, tokensUsed=%.1f→left=%.1f, avg=%.1f tps, rolling=%.1f tps%n",
-            chosen.size(),      // # executed
-            n,                  // batch size
-            upgrades,           // how many got bumped to majority
-            bestProfit,         // total profit
-            tokensUsed,         // tokens consumed
-            newTokenCount,      // tokens left
-            avgThroughput,      // average tps
-            currentTps          // rolling tps
-        );
-
-
-    } finally {
-        redisLock.writeLock().unlock();
-    }
-} 
-
-
-
-
-
-    private void actuallyAppendTransaction(Transaction txn, int writeConcern) {
-        lock.writeLock().lock();
+        // here I add the transactions in batch
+        batchLock.lock();
         try {
-            int index = log.size();
-            HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
-            log.append(new LogEntry(index, currentTerm.get(), txn, writeConcern, currentTimeStamp, NUM_OF_SERVERS));
-            updateBalances(txn, clientBalancesLatest);
-            timeStampsInLog.put(currentTimeStamp, index);
-            log.updateWriteConcern(index, serverId);
-            tIdToLogIndex.put(txn.getId(), index);
-            ackSent.put(txn.getId(), false);
-            timeAtWhichTransactionWasReceived.put(txn.getId(), System.currentTimeMillis());
+            batchOfTransactions.add(clientMessage);
         } finally {
-            lock.writeLock().unlock();
+            batchLock.unlock();
         }
     }
-    
-
-    private double getCost(int consistency) {
-        return (consistency == 1) ? COST_W1 : COST_MAJORITY;
-    }
-    
-
 
     private int getLastLogIndex() {
         if (log.size() == 0) {
@@ -736,7 +420,12 @@ private void processBatch() {
     }
 
     private RequestVoteArguments getRequestVoteArgumentsObject() {
-        return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+        lock.readLock().lock();
+        try {
+            return RequestVoteArguments.newBuilder().setCandidateId(this.serverId).setCandidatesTerm(this.currentTerm.get()).setLastLogTerm(this.getLastLogTerm()).setLastLogIndex(this.getLastLogIndex()).build();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     // do not think that I need a lock here as all are atomic variables
@@ -753,35 +442,60 @@ private void processBatch() {
         return true;
     }
 
-    private void endLatchHold(CountDownLatch latch) {
+    private synchronized void endLatchHold(CountDownLatch latch) {
         while (latch.getCount() > 0) {
             latch.countDown();
         }
     }
 
     private void requestForVotes() {
+        // this function uses readLock so it is thread safe
         RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
 
-        CountDownLatch latch = new CountDownLatch(4);
+        // here I have deducted one because obviously the server requesting for votes, will not be responding to requestVote rpc
+        // also we expect response from total servers - 1
+        CountDownLatch latch = new CountDownLatch(NUM_OF_SERVERS - 1);
 
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
             if (i == serverId) continue;
 
+
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                 @Override
                 public void onNext(RequestVoteResult requestVoteResult) {
-                    if (isElectionOver.get()) {
+
+                    // latch.countDown() is atomic operation
+                    // additional not compulsory
+                    if(isElectionOver.get()) {
+                        latch.countDown();
                         return;
                     }
                     boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
                     // it is not successful when the currentTerm of the leader is not up-to date
+                    // I am handling everything in call backs to make raft election thread safe
+                    // if isElectionOver was already false then do not change shared data
+                    // since compareAndSet is atomic we protect against the double transitions due to race conditions
                     if (!isSuccessful) {
-                        votes.set(Integer.MIN_VALUE);
-                        endLatchHold(latch);
-                    } else if (votes.get() >= (NUM_OF_SERVERS / 2)) {
-                        // majority is reached here, no need to continue the election
-                        endLatchHold(latch);
+                        // if the current term is less then this node has to become a follower
+                        if(isElectionOver.compareAndSet(false, true)) {
+                            lock.writeLock().lock();
+                            try {
+                               becomeFollower();
+                            } finally {
+                                lock.writeLock().unlock();
+                            }
+                            endLatchHold(latch);
+                        }
+                    } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
+
+                        if(isElectionOver.compareAndSet(false, true)) {
+                            // majority is reached here, no need to continue the election
+                            // I call the becomeLeader() here to make thread safe!
+                            becomeLeader();
+                            //no need to wait further
+                            endLatchHold(latch);
+                        }
                     } else {
                         latch.countDown();
                     }
@@ -789,7 +503,8 @@ private void processBatch() {
 
                 @Override
                 public void onError(Throwable throwable) {
-
+                    // in case of error as well we kind of want to terminate early
+                    latch.countDown();
                 }
 
                 @Override
@@ -803,7 +518,7 @@ private void processBatch() {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
             // now election is over cannot receive more responses
-            isElectionOver.set(true);
+            isElectionOver.compareAndSet(false, true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -813,9 +528,8 @@ private void processBatch() {
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
-
         for (LogEntry entry : entries) {
-            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).build());
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCopyOfWriteConcern(entry.copyOfWriteConcern).build());
         }
         return result;
     }
@@ -832,7 +546,6 @@ private void processBatch() {
         // n*log(n)
         Arrays.sort(sortedMatchIndex);
 
-        // 5 servers
         int index = NUM_OF_SERVERS - 1;
 
 
@@ -844,13 +557,13 @@ private void processBatch() {
             if (currentIndex == -1) return -1;
 
 
-            while (index > 0 && sortedMatchIndex[index] == currentIndex) {
+            while (index >= 0 && sortedMatchIndex[index] == currentIndex) {
                 cnt++;
                 index--;
             }
 
             // (4 - val) is there because the indexes on the right hand side of the current index support this index if not equal to -1
-            if ((cnt + (4 - val)) >= 2 && log.get(currentIndex).term == currentTerm.get()) {
+            if ((cnt + ((NUM_OF_SERVERS - 1) - val)) >= (NUM_OF_SERVERS / 2) && log.get(currentIndex).term == currentTerm.get()) {
                 // we return because we want the best index (array is sorted), that is the biggest index
                 return currentIndex;
             }
@@ -859,20 +572,30 @@ private void processBatch() {
         return -1;
     }
 
-    // it is inside write lock
-    private boolean checkIfIndexIsAValidCommitIndex(int index) {
-
-        if (index <= commitIndex.get()) return false;
-
-        // check if majority of the servers are at-least at this index
-        int cnt = 0;
+    // should be inside a lock, this method is kind of better because we do not need to sort the matchIndex array and we can get the commit index in roughly O(n) time because usually the log of follower and leader is off by 2-3 entries
+    private int getCommitIndexIfPossibleEarlyExitMethod() {
+        // Find the max matchIndex
+        int maxMatchIndex = -1;
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            if (matchIndex.get(i) >= index) {
-                cnt++;
+            maxMatchIndex = Math.max(maxMatchIndex, matchIndex.get(i));
+        }
+
+        // Try from maxMatchIndex down to 0
+        for (int idx = maxMatchIndex; idx > commitIndex.get(); idx--) {
+            int count = 0;
+
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (matchIndex.get(i) >= idx) {
+                    count++;
+                }
+            }
+
+            // check majority and term
+            if (count >= (NUM_OF_SERVERS / 2) && log.get(idx).term == currentTerm.get()) {
+                return idx;
             }
         }
-        // here I have used >= 2 because we don't actually update the match index of the leader
-        return (cnt >= 2 && log.get(index).term == currentTerm.get());
+        return -1;
     }
 
     // it is not in log
@@ -882,50 +605,72 @@ private void processBatch() {
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
         // this is just about minimising repeated acks, not compulsory to add it, now for the calculation of the metrics this is strictly required
+
+        Long timeStampOfTransaction = System.currentTimeMillis();
+
         for (LogEntry entry : entriesToBeAck) {
             String id = entry.t.getId();
 
+            // this field is seperate for each thread, so there will be no race conditions for this
+            boolean firstAck = false;
+
+
             // need to add lock because lot of shared variables are being accessed here
-            synchronized (metricCalculations) {
+            synchronized (systemWideThroughput) {
                 if (ackSent.containsKey(id) && !ackSent.get(id)) {
+
+                    firstAck = true;
                     // marking it as sent, if it fails the client can retry from its end
                     ackSent.put(id, true);
-                    totalAckedTransactions.incrementAndGet();
-
                     // send ack for this entry
-                    // System.out.println("sending ack");
-//                    System.out.println("Replicated to ----" + entry.serversThatReplicatedThisEntry);
-                    Long timeStampOfTransaction = System.currentTimeMillis();
+//                    System.out.println("sending ack");
+//                    System.out.println("The transaction id --" + id + " Replicated to ----" + entry.serversThatReplicatedThisEntry);
                     // here I have implemented the logic of rolling throughput
                     // remove the old transactions from the queue, we maintain a window of 1 seconds
-                    while (!ackTransactionsTimeStamps.isEmpty() &&
-                            (timeStampOfTransaction - ackTransactionsTimeStamps.peek()) >= 1000L) {
-                        ackTransactionsTimeStamps.poll();
-                    }
-                    // add the current transactions timestamp in the queue
-                    ackTransactionsTimeStamps.add(timeStampOfTransaction);
-                    // size of this queue should be the TPS / Rolling throughput
-                    // System.out.println("Rolling throughput is--" + ackTransactionsTimeStamps.size());
-
+                    // *** this is system wide throughput calculation ***
+                    recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
                     // this latency is in ms
                     long latency = (timeStampOfTransaction - timeAtWhichTransactionWasReceived.get(id));
                     int currentTotalTransactions = totalTransactions.incrementAndGet();
                     long currentTotalLatency = totalLatency.addAndGet(latency);
-                    // System.out.println("Current throughput of the system--" + (double) ((currentTotalTransactions * 1000)) / currentTotalLatency);
+//                    System.out.println("Current throughput of the system--" + (double) ((currentTotalTransactions * 1000)) / currentTotalLatency);
                     ackTransactionCount.incrementAndGet();
                     ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
 
                 }
             }
+            // if we are sending the ack of this transaction again we do not want to process the writeConcernThroughput
+            if(!firstAck) continue;
+            // *** this is the calculation of writeConcernThroughput ***
+            synchronized (writeConcernThroughput) {
+                int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
+                ConcurrentLinkedQueue<Long> writeConcernSpecificAckTransactionsTimeStamps = ackTransactionTimeStampsForAllWriteConcerns.get(writeConcernOfThisTransaction);
+                if(writeConcernSpecificAckTransactionsTimeStamps != null && timeStampOfTransaction != null) {
+                    recordThroughput(writeConcernSpecificAckTransactionsTimeStamps, timeStampOfTransaction, true);
+                }
+            }
+            // *** this is the calculation of writeConcernLatency ***
+            synchronized (writeConcernLatency) {
+                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
+                int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
+               Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
+               // this timeStampOfTransaction is the current time taken at the time of sending ack
+               Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
+               Long prevLatency = writeConcernLatencies.get(writeConcernOfThisTransaction);
+               // taking average of latencies, later on maybe we can use Exponential Moving Average (which more weightage to the recent latencies)
+               writeConcernLatencies.put(writeConcernOfThisTransaction, prevLatency == 0 ? currentLatency : ((prevLatency + currentLatency) / 2));
+
+            }
+
         }
 
-        // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on comitting
+        // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on committing
         if (ackMessages.isEmpty()) {
             latch.countDown();
             return;
         }
 
-        // refresh the context
+        // refresh the context, not sure if this is required need to research a but
         RaftGrpc.RaftStub refreshContextClientStub = clientStub.withDeadlineAfter(2, TimeUnit.SECONDS);
         refreshContextClientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
             @Override
@@ -936,7 +681,7 @@ private void processBatch() {
             @Override
             public void onError(Throwable throwable) {
                 latch.countDown();
-                // System.out.println("Error in sending ack--" + throwable);
+//                System.out.println("Error in sending ack--" + throwable);
 
                 // implement retry logic
             }
@@ -944,25 +689,23 @@ private void processBatch() {
             @Override
             public void onCompleted() {
                 // this where we receive the message done
-                System.out.println("Ack Sent successfully");
-                latch.countDown();
+//                System.out.println("Ack Sent successfully");
+                 // not sure if this is required or not
+//                latch.countDown();
             }
         });
 
     }
-
-    private double getCurrentRollingThroughput() {
-        synchronized (metricCalculations) {
-            long currentTime = System.currentTimeMillis();
-            while (!ackTransactionsTimeStamps.isEmpty() && (currentTime - ackTransactionsTimeStamps.peek()) > 1000) {
-                ackTransactionsTimeStamps.poll();
-            }
-            return ackTransactionsTimeStamps.size();
+    private void recordThroughput(ConcurrentLinkedQueue<Long> queue, long timeStampOfTransaction, boolean addTimeStamp) {
+        while (!queue.isEmpty() && timeStampOfTransaction - queue.peek() >= 1000L) {
+            queue.poll();
         }
+        // during processing the batch we do not want to add the timestamp
+        if(addTimeStamp)
+        queue.add(timeStampOfTransaction);
     }
-    
 
-    // we can optimize the write lock herek
+    // we can optimize the write lock here
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower, int prevNextIndex) {
         boolean result = appendEntriesResult.getIsSuccessFull();
         int termOfFollower = appendEntriesResult.getCurrentTerm(), idOfFollower = appendEntriesResult.getFollowerId();
@@ -975,15 +718,17 @@ private void processBatch() {
         // Lock for reading and writing shared state
         lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
         try {
-
+            // this makes the function idempotent
+            if(status != ServerCurrentStatus.LEADER) {
+                return false;
+            }
             // updating the clock of leader, if its behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(followersTimeStamp));
 
             if (termOfFollower > currentTerm.get()) {
                 currentTerm.updateAndGet(term -> Math.max(term, termOfFollower));
                 // Become follower
-                status = ServerCurrentStatus.FOLLOWER;
-                startTheElectionTimer();
+                becomeFollower();
                 return false;
             }
 
@@ -1004,7 +749,8 @@ private void processBatch() {
 
                     int prevCommitIndex = commitIndex.get();
                     // Check if we need to update the commitIndex of the leader, we get the new commitIndex
-                    int candidateCommitIndex = getCommitIndexIfPossible();
+//                    int candidateCommitIndex = getCommitIndexIfPossible();
+                    int candidateCommitIndex = getCommitIndexIfPossibleEarlyExitMethod();
 
                     if (candidateCommitIndex > commitIndex.get()) {
                         commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
@@ -1013,8 +759,8 @@ private void processBatch() {
                         for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
                             updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                         }
-                        // System.out.println("The commit index of leader updated to -- " + commitIndex.get());
-                        // System.out.println("Log size of leader is---" + log.size());
+//                        System.out.println("The commit index of leader updated to -- " + commitIndex.get());
+//                        System.out.println("Log size of leader is---" + log.size());
 
                         // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
                         committedEntriesAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
@@ -1026,6 +772,7 @@ private void processBatch() {
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
 
+            // sending ack logic is kept outside the lock to reduce the contention
             CountDownLatch latch = new CountDownLatch(2);
             // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
             if (!committedEntriesAck.isEmpty()) {
@@ -1060,7 +807,7 @@ private void processBatch() {
         for (int i = Math.max(commitIndex.get() + 1, prevMatchIndexOfFollower + 1); i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
             if (ackSent.containsKey(id) && !ackSent.get(id)) {
-                System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
+//                System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
                 // updateWriteConcern handles all the necessary conditions so that the same node does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower);
                 if (log.get(i).writeConcern == 0) {
@@ -1109,8 +856,7 @@ private void processBatch() {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
                         // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-                        doesLeaderHasHighestTerm = handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp);
-
+                            doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
                     }
 
                     @Override
@@ -1123,9 +869,9 @@ private void processBatch() {
 
                     }
                 });
-                if (!doesLeaderHasHighestTerm) break;
+                if (!doesLeaderHasHighestTerm.get()) break;
             }
-            if (!doesLeaderHasHighestTerm) break;
+            if (!doesLeaderHasHighestTerm.get()) break;
 
             try {
                 // in every 15 milliseconds send appendEntries
@@ -1135,7 +881,6 @@ private void processBatch() {
             }
         }
     }
-
     // already in writeLock
     public void reinitialiseIndexes() {
 
@@ -1164,42 +909,442 @@ private void processBatch() {
             currentTerm.incrementAndGet();
             // Reset the timer
             startTheElectionTimer();
-            // Resetting the votes
-            votes.set(0);
+            // the current server votes it self
+            votes.set(1);
             // Vote for self
             votedFor.put(currentTerm.get(), serverId);
             isElectionOver.set(false);
         } finally {
             lock.writeLock().unlock();  // Release the lock after the initial election setup
         }
-
         requestForVotes();
-
-        // Now that we have finished the election setup, we can check for the election result
-        lock.writeLock().lock();  // Acquire the lock to ensure that no other thread modifies the shared state while we transition
+    }
+    private void becomeLeader() {
+        lock.writeLock().lock();
         try {
-            if (votes.get() >= (NUM_OF_SERVERS / 2) && status != ServerCurrentStatus.FOLLOWER) {
-                doesLeaderHasHighestTerm = true;
-                System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
-                // Stop the election timer
-                electionTimer.stop();
-                // Reinitialize state
-                reinitialiseIndexes();
-                // This node becomes the leader
-                this.status = ServerCurrentStatus.LEADER;
-                this.currentLeader = this.serverId;
-            } else {
-                this.status = ServerCurrentStatus.FOLLOWER;
+            // if it is not candidate that is might have become follower in between in requestVote RPC we do not want to make the node leader in this case
+            if(status != ServerCurrentStatus.CANDIDATE) return;
+            doesLeaderHasHighestTerm.set(true);
+            System.out.println(serverId + " " + "Became the leader" + " The term is " + currentTerm.get());
+            // Stop the election timer
+            electionTimer.stop();
+            // Reinitialize state
+            reinitialiseIndexes();
+            // This node becomes the leader
+            this.status = ServerCurrentStatus.LEADER;
+            this.currentLeader = this.serverId;
+        } finally {
+           lock.writeLock().unlock();
+        }
+        batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        sendAppendEntries();
+    }
+
+    // should be inside write lock
+    private void becomeFollower() {
+
+        // the status changes to follower
+        status = ServerCurrentStatus.FOLLOWER;
+        // we have to start the election timer because now it is a follower
+
+        startTheElectionTimer();
+
+        // cancelling the batch job
+        if (batchProcessingTask != null && !batchProcessingTask.isCancelled()) {
+            batchProcessingTask.cancel(false);  // false = don't interrupt if running
+            batchProcessingTask = null;
+        }
+
+    }
+    private void processBatch() {
+        // here the logic to process the current batch of transaction will come
+        List<ClientMessage> currentBatch = new ArrayList<>();
+        // remove and add the current batch of transactions to currentBatch List
+
+
+        batchLock.lock();
+        try {
+            currentBatch.addAll(batchOfTransactions);
+            batchOfTransactions.clear();
+        } finally {
+            batchLock.unlock();
+        }
+        // no need for processing if current batch is empty
+        if(currentBatch.isEmpty()) return;
+
+       List<ClientMessage> transactionsToExecute =  handleTokenBucket(currentBatch);
+
+       // we need add back the transactions which we were not able to execute
+
+        // first I create a hashset of all the transactions id which are going to be executed
+        // this part can be optimised a bit
+        // we can add parallelize this stream if needed
+        Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+                .map(cm -> cm.getT().getId())
+                .collect(Collectors.toSet());
+
+        int backLog = 0;
+
+        // adding back it in the queue
+        batchLock.lock();
+        try {
+            for(ClientMessage clientMessage : currentBatch) {
+                if(!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+                    backLog++;
+                    batchOfTransactions.add(clientMessage);
+                }
             }
         } finally {
-            lock.writeLock().unlock();  // Release the lock after modifying shared state
-            // Start sending AppendEntries outside the critical section
-            if (votes.get() >= 2 && status == ServerCurrentStatus.LEADER) {
-                sendAppendEntries();
+            batchLock.unlock();
+        }
+
+        System.out.println("The backlog is--" + backLog);
+
+        // this list is used to ack transactions with w:1
+        List<LogEntry> entry = new ArrayList<>();
+       // here append all these transactions in the raft log
+        lock.writeLock().lock();
+        try {
+
+            for(ClientMessage clientMessage : transactionsToExecute) {
+                int index = log.size();
+
+                if (clientMessage.hasTimeStamp()) {
+                    // updating the clock of leader using the time stamp sent by the client
+                    hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(clientMessage.getTimeStamp()));
+                }
+
+                Transaction t = clientMessage.getT();
+                int writeConcern = clientMessage.getWriteConcern();
+                String id = t.getId();
+
+                // we do update the clock of leader using followers
+                HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
+                // appending the entry in log
+                log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS, System.currentTimeMillis()));
+                updateBalances(t, clientBalancesLatest);
+                // we need this to implement causal consistency
+                timeStampsInLog.put(currentTimeStamp, index);
+                // since this is in write lock only updated entry will be sent to the followers, as this entire thing is atomic
+                log.updateWriteConcern(index, serverId);
+                ackSent.put(id, false);
+                timeAtWhichTransactionWasReceived.put(id, System.currentTimeMillis());
+                // if write concern becomes 0 we will send ack to client
+                if (log.get(index).writeConcern == 0) {
+                    entry.add(log.get(index));
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+            CountDownLatch latch = new CountDownLatch(1);
+            if (!entry.isEmpty()) {
+                // this sends Ack for all transactions together
+                sendAckForEntries(entry, latch);
+            } else {
+                latch.countDown();
+            }
+
+            try {
+                latch.await(200, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
             }
         }
     }
 
+    private void printAllWriteConernsThroughputAndLatencies() {
+        System.out.println("Printing Throughputs");
+        for(int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+            System.out.println(getWriteConcernThroughput(i));
+        }
+        synchronized (writeConcernLatency) {
+            System.out.println("Printing Latencies");
+            for(int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+                System.out.println(writeConcernLatencies.get(i));
+            }
+        }
+    }
+
+    private void adjustTokenCostsBasedOnLatency() {
+        final int MIN_COST = 1;
+        final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
+        int minTransactions = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+        final double maxTokenCostPerTxn = TOKEN_CAPACITY / minTransactions;
+        final int scale = 10;
+
+        synchronized (writeConcernLatency) {
+            // Filter out zero latencies and get max
+            long maxLatency = writeConcernLatencies.values().stream()
+                    .mapToLong(l -> l)
+                    .max()
+                    .orElse(1L); // avoid divide by 0
+
+            // Sort write concerns to enforce cost hierarchy
+            List<Integer> writeConcerns = new ArrayList<>(writeConcernLatencies.keySet());
+            Collections.sort(writeConcerns);
+
+
+            double prevCost = MIN_COST;
+            for (int wc : writeConcerns) {
+                long latency = writeConcernLatencies.get(wc);
+
+                // Apply EMA smoothing (optional)
+                double smoothedLatency = smoothedLatencies.compute(wc,
+                        (k, oldVal) -> oldVal == null ? latency : 0.2 * latency + 0.8 * oldVal);
+
+                // Scale cost proportionally to latency
+                double scaledCost = (smoothedLatency / maxLatency) * maxTokenCostPerTxn;
+                int tokenCost = (int) Math.ceil(scaledCost * scale);
+                tokenCost = Math.max((int) prevCost, tokenCost);  // Enforce hierarchy
+
+                writeConcernCosts.put(wc, (double) tokenCost);
+                prevCost = tokenCost;
+                System.out.printf("[Cost Adjust] WC=%d | Latency=%dms | Cost=%d%n",
+                        wc, latency, tokenCost);
+            }
+        }
+    }
+
+
+
+    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch) {
+
+        redisLock.writeLock().lock();
+        try {
+
+            // for testing
+//            printAllWriteConernsThroughputAndLatencies();
+            adjustTokenCostsBasedOnLatency();
+
+            // current metrics
+            double currentTps = getSystemWideThroughput();
+            TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
+            double  currentTokens = tb.getTokenCount();
+            long lastUpdate = tb.getLastUpdateTime();
+
+            // see if the current throughput is lesser than what is required, if it is then we do not want to upgrade any transaction
+            boolean throughputLow = currentTps < MIN_REQUIRED_THROUGHPUT;
+
+            int n = currentBatch.size();
+
+            // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
+            int transactionsToBeProcessedToMaintainThreshold = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+
+            // the optimal number of transactions we can process
+            int minNumberOfTransactionsToBeProcessed = Math.min(transactionsToBeProcessedToMaintainThreshold, n);
+
+            // I convert the clientMessage protobuf object into java object, so that we can use java functions directly on it
+            List<TransactionOption> currentBatchInTransactionOption = TransactionOption.convertToTransactionOption(currentBatch);
+
+            // this is scale converts the cost W:1 and W:Majority into int, because we will be using these costs in our dp (and array indexes cannot be float)
+            double scale = 10;
+
+            ProcessResult result;
+
+            if(throughputLow) {
+                 result =  processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, scale);
+            } else {
+                result = processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, scale);
+            }
+            // updating the token count here (updating in redis)
+            tokenBucket.updateTokens((currentTokens - (result.tokensUsed / scale)), lastUpdate);
+            System.out.printf(
+                    "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n",
+                    result.profit,
+                    currentTps,
+                    currentTokens,
+                    result.tokensUsed,
+                    result.transactionsUpgraded
+            );
+            return result.messages;
+        } finally {
+            redisLock.writeLock().unlock();
+        }
+    }
+
+    // use this when throughput is lower than expected
+    private ProcessResult processForThroughput(List<TransactionOption> transactions, double currentTokens, int minTransactions, double scale) {
+        // n*log(n)
+        Collections.sort(transactions, (a,b)->{
+            // if consistency is same select transaction with higher profit
+            if(a.minRequiredConsistency == b.minRequiredConsistency) return Double.compare(b.baseProfit, a.baseProfit);
+
+            // select the lower consistency transaction
+            return (a.minRequiredConsistency - b.minRequiredConsistency);
+        });
+
+        List<ClientMessage> selected = new ArrayList<>();
+
+        double usedTokens = 0.0, profit = 0;
+
+        int index = 0;
+
+        for(TransactionOption t : transactions) {
+            int minConsistencyOfTransaction = t.minRequiredConsistency;
+            double profitForMinConsistency = t.baseProfit, tokenCostOfTransaction = tokenCost(minConsistencyOfTransaction);
+
+            if(Double.compare(tokenCostOfTransaction + usedTokens, currentTokens * scale) <= 0) {
+                usedTokens += tokenCostOfTransaction;
+                ClientMessage.Builder cmBuilder = t.clientMessage.toBuilder();
+                // I update the writeConcern of the transaction
+                cmBuilder.setWriteConcern(minConsistencyOfTransaction);
+
+                profit += profitForMinConsistency;
+                selected.add(cmBuilder.build());
+                // added this because we do not want the current batch to consume all the tokens, we want to get the required throughput
+                // we might want to process more transactions if lets say more w:1 are left?? because w:1 is pretty cheap we can use some tokens for it
+                if(selected.size() >= minTransactions && (index + 1) < transactions.size() && transactions.get(index + 1).minRequiredConsistency != 1) return new ProcessResult(selected, (usedTokens / scale), profit, 0);
+            } else {
+                // we break here because now the token cost will increase because consistency levels are only going to increase
+                break;
+            }
+            index++;
+        }
+        // here no transactions are upgraded so I simply pass 0
+        return new ProcessResult(selected, usedTokens / scale, profit, 0);
+    }
+
+
+    // all the token costs are stored in a map, we use scale to convert them into integer, as we can't store double in DP
+    private double tokenCost(int consistency) {
+        return Math.ceil(writeConcernCosts.getOrDefault(consistency, 0.0));
+    }
+
+    // use this when throughput is higher or equal to of the expected value
+    private ProcessResult processForProfit(List<TransactionOption> transactions, double currentTokens, int minTransactions, double scale) {
+        int n = transactions.size();
+        int maxTokens = (int) Math.ceil(currentTokens * scale);
+        int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
+
+        class State {
+            double profit;
+            int count;
+            int prevT;
+            int consistency;
+            boolean taken;
+
+            State(double profit, int count, int prevT, int consistency, boolean taken) {
+                this.profit = profit;
+                this.count = count;
+                this.prevT = prevT;
+                this.consistency = consistency;
+                this.taken = taken;
+            }
+        }
+
+        // **** we can reduce the complexity of this DP by tuning the batch timing ****
+        // complexity of this is (no of transaction in the batch) * (max tokens allowed)
+
+        State[][] dp = new State[n + 1][maxTokens + 1];
+        dp[0][0] = new State(0, 0, -1, 0, false);
+
+        int maxExecutedTransactions = 0;
+
+        for (int i = 0; i < n; i++) {
+            TransactionOption tx = transactions.get(i);
+
+            for (int t = 0; t <= maxTokens; t++) {
+                if (dp[i][t] == null) continue;
+
+                // this the case where we skip the transaction
+                if (dp[i + 1][t] == null || dp[i + 1][t].profit < dp[i][t].profit) {
+                    dp[i + 1][t] = new State(dp[i][t].profit, dp[i][t].count, t, 0, false);
+                }
+
+                // we try all possible writeConcern
+                for (int wc : writeConcernCosts.keySet()) {
+                    int cost = (int) tokenCost(wc);
+
+                    if (wc < tx.minRequiredConsistency) continue;
+
+                    double profit = tx.baseProfit;
+
+                    if (wc >= majorityLevel) {
+                        profit += tx.extraMajorityProfit;
+                    } else if (wc > tx.minRequiredConsistency) {
+                        profit += tx.extraIntermediateProfit * (wc - tx.minRequiredConsistency);
+                    }
+
+                    // obviously it should not exceed the maxTokens limit
+                    if (t + cost <= maxTokens) {
+                        int nt = t + cost;
+                        double newProfit = dp[i][t].profit + profit;
+                        int newCount = dp[i][t].count + 1;
+
+                        if (dp[i + 1][nt] == null || dp[i + 1][nt].profit < newProfit) {
+                            dp[i + 1][nt] = new State(newProfit, newCount, t, wc, true);
+                            // we calculate the max number of transactions we can execute
+                            maxExecutedTransactions = Math.max(maxExecutedTransactions, newCount);
+                        }
+                    }
+                }
+            }
+        }
+
+        double bestProfit = -1;
+        int bestT = -1, transactionsUpgraded = 0;
+
+        for (int t = 0; t <= maxTokens; t++) {
+            // we use Math.min because the minTransactions could be higher than the number of transactions that we can execute
+            if (dp[n][t] != null && dp[n][t].count >= Math.min(maxExecutedTransactions, minTransactions)) {
+                if (dp[n][t].profit > bestProfit) {
+                    bestProfit = dp[n][t].profit;
+                    bestT = t;
+                }
+            }
+        }
+
+        if (bestT == -1) return new ProcessResult(new ArrayList<>(), 0.0, bestProfit, 0);
+
+        List<ClientMessage> result = new ArrayList<>();
+        int t = bestT;
+
+        for (int i = n; i >= 1; i--) {
+            State s = dp[i][t];
+            if (s == null) break;
+
+            if (s.taken) {
+                TransactionOption tx = transactions.get(i - 1);
+                ClientMessage.Builder builder = tx.clientMessage.toBuilder();
+                // set the writeConcern for this particular transaction
+                builder.setWriteConcern(s.consistency);
+
+                // check if we have upgraded the consistency of this particular transaction
+                if (s.consistency > tx.minRequiredConsistency) {
+                    transactionsUpgraded++;
+                }
+                result.add(builder.build());
+            }
+            t = s.prevT;
+        }
+
+        Collections.reverse(result);
+        double tokensUsed = bestT / scale;
+
+        return new ProcessResult(result, tokensUsed, bestProfit, transactionsUpgraded);
+    }
+
+
+    // this gives me the current rolling throughput, at the time of ack I add the transactions timestamp
+    private double getSystemWideThroughput() {
+        // this can be accessed while sending ack also so we want to ensure that only thread enters
+        synchronized (systemWideThroughput) {
+            Long currentTimeStamp = System.currentTimeMillis();
+            recordThroughput(ackTransactionsTimeStamps, currentTimeStamp, false);
+            return ackTransactionsTimeStamps.size();
+        }
+    }
+
+    private double getWriteConcernThroughput(int writeConcern) {
+        synchronized (writeConcernThroughput) {
+            Long currentTimeStamp = System.currentTimeMillis();
+            ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns.get(writeConcern);
+            if(writeConcernSpecificTimeStamps != null) {
+                recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
+            }
+            return writeConcernSpecificTimeStamps.size();
+        }
+    }
     // need to review the logic
     @Override
     public void sendReadRequest(ReadRequest readRequest, StreamObserver<Balance> responseObserver) {
@@ -1213,6 +1358,7 @@ private void processBatch() {
 
             if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
                 try {
+                    // I wait for 30 ms because I send appendEntries in 15 ms so we are kind of considering one missed appendEntry here (we may want to reduce the time here )
                     Thread.sleep(30);
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
@@ -1229,23 +1375,25 @@ private void processBatch() {
                 if (readConcern == ReadConcern.MAJORITY) {
                     int logIndexOfRequestedEntry = timeStampsInLog.get(timeStampRequestedByClient);
                     // the requested logIndex should be safely committed
-                    if (commitIndex.get() >= logIndexOfRequestedEntry) {
+                    // if the commitIndex is less than the logIndexOfRequestEntry then it is not safely committed till now
+                    if (commitIndex.get() < logIndexOfRequestedEntry) {
                         // return error, or we can wait for some more time, this is dependent on our design choice
                         responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
                         responseObserver.onCompleted();
+                        return;
                     }
-                } else {
-                    // here the readConcern will be LOCAL
-                    responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
-                    responseObserver.onCompleted();
                 }
+                // here the readConcern will be majority and local, in case of majority the requested timestamp would have been safely committed here
+                responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+                responseObserver.onCompleted();
+
             }
 
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
             // this readRequest should go to leader
             // here we check if election is happening or not
             // if election is happening send failure, client can try again
-
+            // this read lock is required because in isElection we are using shared variables and we do not wait for the rpc call to complete before releasing the lock it is async
             lock.readLock().lock();
             try {
                 if (isElectionTakingPlace()) {
@@ -1254,7 +1402,6 @@ private void processBatch() {
                     responseObserver.onCompleted();
                 } else {
                     if (currentLeader != serverId) {
-
                         // send request to leader
                         stubs[currentLeader].sendReadRequest(readRequest, new StreamObserver<Balance>() {
                             @Override
@@ -1283,6 +1430,7 @@ private void processBatch() {
                 lock.readLock().unlock();
             }
         } else {
+            // here the readConcern is just local
             responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
             responseObserver.onCompleted();
         }
@@ -1291,13 +1439,14 @@ private void processBatch() {
     // inside read lock
     private boolean isElectionTakingPlace() {
         if (status == ServerCurrentStatus.CANDIDATE) return true;
+        // this condition simply means that the current leader has stepped down because a it saw a server with higher term, and currently it does not know the exact leader, other design shown can be setting the current leader = -1 (which means leader is unknown)
         if (serverId == currentLeader && status == ServerCurrentStatus.FOLLOWER) return true;
 
         return false;
     }
-
     private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
 
+        // we need the readLock here because the raft log might be updated with new entries however the clientBalance might not have been, so this lock keeps the raft log and maps in sync
         lock.readLock().lock();
         try {
             if (readConcern == ReadConcern.LOCAL) {
@@ -1310,13 +1459,12 @@ private void processBatch() {
             lock.readLock().unlock();
         }
     }
-
     @Override
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
-        // System.out.println("The commit index of this node is -- " + commitIndex.get());
-        // System.out.println("The size of log is ---" + log.size());
-        // System.out.println("The majority committed map -- " + clientBalancesMajorityCommitted);
-        // System.out.println("The latest map -- " + clientBalancesLatest);
+        System.out.println("The commit index of this node is -- " + commitIndex.get());
+        System.out.println("The size of log is ---" + log.size());
+        System.out.println("The majority committed map -- " + clientBalancesMajorityCommitted);
+        System.out.println("The latest map -- " + clientBalancesLatest);
 
 //        System.out.println(totalLatency.get());
 //        System.out.println("The latency of the system is in ms----" + (totalLatency.get() / (ackTransactionCount.get())));
@@ -1324,6 +1472,7 @@ private void processBatch() {
 //        log.printLog();
     }
 
+    // this resets and starts the timer again
     private void startTheElectionTimer() {
         this.electionTimer.reset();
     }
