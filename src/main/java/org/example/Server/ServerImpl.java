@@ -525,7 +525,6 @@ private void processBatch() {
 
     redisLock.writeLock().lock();
     try {
-        System.out.println(System.currentTimeMillis());
 
         double currentTps = getCurrentRollingThroughput();
         TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
