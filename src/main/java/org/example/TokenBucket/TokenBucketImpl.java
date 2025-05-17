@@ -78,6 +78,14 @@ public class TokenBucketImpl {
 //        System.out.println("Updated token count: " + newTokenCount + " tokens");
     }
 
+    public double getMaxTokens() {
+        return MAX_TOKENS;
+    }
+
+    public double getRefillRate() {
+        return REFILL_RATE;
+    }
+
     public static class TokenBucketData {
         private double tokenCount;
         private long lastUpdateTime;
