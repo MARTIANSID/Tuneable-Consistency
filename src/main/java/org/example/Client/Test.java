@@ -10,7 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Test {
-    private static final int THREAD_COUNT = 100; // Number of parallel transactions
+    private static final int THREAD_COUNT = 25; // Number of parallel transactions
     private static final int NUM_OF_SERVERS = 9;
 
     public static void main(String[] args) {
@@ -65,7 +65,7 @@ public class Test {
             channel.shutdown();
             System.out.println("All transactions sent.");
             try {
-                Thread.sleep(1002);
+                Thread.sleep(50);
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }

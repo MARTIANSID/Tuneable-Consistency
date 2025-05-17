@@ -126,11 +126,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 20;
+    private static final int BATCH_INTERVAL_MS = 100;
 
 //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 450; // this is in seconds
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -651,7 +651,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             // *** this is the calculation of writeConcernLatency ***
             synchronized (writeConcernLatency) {
-                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
+                // System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
                 int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
                Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
                // this timeStampOfTransaction is the current time taken at the time of sending ack
