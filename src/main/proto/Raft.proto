@@ -1,0 +1,122 @@
+syntax = "proto3";
+option java_multiple_files =  true;
+package org.ds.paxos;
+
+service Raft {
+  rpc SendTransaction(ClientMessage) returns (Empty);
+  rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
+  rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
+  rpc printLog(Empty) returns (Empty);
+  rpc sendAckToClient(Ack) returns (Empty);
+  rpc sendReadRequest(ReadRequest) returns (Balance);
+}
+
+
+
+message Empty{
+  int32 data = 1;
+}
+
+message Balance {
+  double balance = 1;
+  string accName = 2;
+  bool failure = 3;
+}
+
+enum ReadConcern {
+  LINEARIZABLE = 0;
+  LOCAL = 1;
+  MAJORITY = 2;
+}
+message ReadRequest {
+  ReadConcern readConcern = 1;
+  TimeStampProto timeStamp = 2; // for causal consistency
+  string accName = 3;
+}
+
+
+message AckMessage {
+  Transaction t = 1;
+  TimeStampProto timStamp = 2;
+  int32 currentLeader = 3;
+}
+
+message Ack {
+  // later on we can add more fields like timestamp for causal consistency
+  repeated AckMessage ackMessage = 1;
+}
+
+message ClientMessage {
+  Transaction t = 1;
+  int32 writeConcern = 2;
+  TimeStampProto timeStamp = 3;
+
+}
+
+message Transaction {
+  string sender = 1;
+  string receiver = 2;
+  double amount = 3;
+  string id = 4;
+  int64 transactionSendTimeInMs = 5;
+  int32 minRequiredConsistency = 6;
+  double baseProfit = 7;
+  double extraProfitMajority = 8;
+  double extraIntermediateProfit = 9;
+  int32 writeConcern = 10;
+  // this is there to check in which batch this transaction was actually processed
+  int32 batchNo = 11;
+}
+message LogEntryProto {
+  int32 logIndex = 1;
+  int32 term = 2;
+  int32 writeConcern = 3;
+  Transaction t = 4;
+  TimeStampProto timeStamp = 5;
+  repeated bool serversThatReplicatedThisEntry = 6;
+  int32 copyOfWriteConcern = 7;
+}
+
+message TimeStampProto {
+  int64 p = 1;
+  int64 l = 2;
+}
+
+message Log {
+  repeated LogEntryProto log = 1;
+}
+
+message AppendEntriesArgument {
+  int32 leadersTerm = 1;
+  int32 prevLogIndex = 2;
+  int32 leadersId = 3;
+  int32 prevLogTerm = 4;
+  Log entriesToAppend = 5;
+  int32 leadersCommit = 6;
+  int32 ackIndex = 7;
+  TimeStampProto timeStamp = 8;
+
+}
+
+message RequestVoteArguments {
+  int32 candidatesTerm = 1;
+  int32 candidateId = 2;
+  int32 lastLogIndex = 3;
+  int32 lastLogTerm = 4;
+}
+
+message AppendEntriesResult {
+  int32 currentTerm = 1;
+  bool isSuccessFull = 2;
+  int32 followerId = 3;
+  TimeStampProto timeStamp = 4;
+}
+message RequestVoteResult {
+  int32 currentTerm = 1;
+  bool isVoteGranted = 2;
+}
+
+
+
+
+
