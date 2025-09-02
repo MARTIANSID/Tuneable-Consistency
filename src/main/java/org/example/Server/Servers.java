@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS = 51;
+    public static final int NUM_OF_SERVERS =  9;
 
     public static void main(String[] args) throws IOException, InterruptedException {
         List<Server> servers = new ArrayList<>();
@@ -30,7 +30,6 @@ public class Servers{
             System.out.println("Server" + (i + 1) + " started on port " + port);
             servers.add(server);
         }
-
         for (Server server : servers) {
             server.awaitTermination();
         }

@@ -124,6 +124,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
 
+    public int backLog;
+
 
     // all the parameters for knapsack
     private static final int BATCH_INTERVAL_MS = 20;
@@ -131,6 +133,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
     private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in seconds
+
+    // this based on the adjustedTokenCosts
+    public static final double scale = 1;
+
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -183,6 +189,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.ackTransactionTimeStampsForAllWriteConcerns = new ConcurrentHashMap<>();
         this.writeConcernLatencies = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
+        this.backLog = 0;
 
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
@@ -397,6 +404,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here I add the transactions in batch
         batchLock.lock();
         try {
+            // this is assuming a new transaction, basically we do not accept the same transaction, if it is already present in the system
+            backLog++;
             batchOfTransactions.add(clientMessage);
         } finally {
             batchLock.unlock();
@@ -696,6 +705,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         });
 
     }
+
+    // inside lock
     private void recordThroughput(ConcurrentLinkedQueue<Long> queue, long timeStampOfTransaction, boolean addTimeStamp) {
         while (!queue.isEmpty() && timeStampOfTransaction - queue.peek() >= 1000L) {
             queue.poll();
@@ -961,7 +972,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
 
-
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
@@ -983,17 +993,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 .map(cm -> cm.getT().getId())
                 .collect(Collectors.toSet());
 
-        int backLog = 0;
-
         // adding back it in the queue
         batchLock.lock();
         try {
             for(ClientMessage clientMessage : currentBatch) {
                 if(!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-                    backLog++;
                     batchOfTransactions.add(clientMessage);
                 }
             }
+            backLog -= idsOfTransactionsWhichCanBeExecuted.size();
         } finally {
             batchLock.unlock();
         }
@@ -1064,47 +1072,82 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
     }
+//    private void adjustTokenCostsBasedOnLatency() {
+//        final int MIN_COST = 1;
+//        final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
+//        int minTransactions = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+//        double tuningFactor = 2.0;
+//        final double maxTokenCostPerTxn = TOKEN_CAPACITY / (minTransactions * tuningFactor);
+//
+//        synchronized (writeConcernLatency) {
+//            // Filter out zero latencies and get max
+//            long maxLatency = writeConcernLatencies.values().stream()
+//                    .mapToLong(l -> l)
+//                    .max()
+//                    .orElse(1L); // avoid divide by 0
+//
+//            // Sort write concerns to enforce cost hierarchy
+//            List<Integer> writeConcerns = new ArrayList<>(writeConcernLatencies.keySet());
+//            Collections.sort(writeConcerns);
+//
+//
+//            double prevCost = MIN_COST;
+//            for (int wc : writeConcerns) {
+//                long latency = writeConcernLatencies.get(wc);
+//                // Apply EMA smoothing (optional)
+//                double smoothedLatency = smoothedLatencies.compute(wc,
+//                        (k, oldVal) -> oldVal == null ? latency : 0.2 * latency + 0.8 * oldVal);
+//
+//                // Scale cost proportionally to latency
+//                double scaledCost = (smoothedLatency / maxLatency) * maxTokenCostPerTxn;
+//                int tokenCost = (int) Math.ceil(scaledCost * scale);
+//                tokenCost = Math.max((int) prevCost, tokenCost);  // Enforce hierarchy
+//
+//                writeConcernCosts.put(wc, (double) tokenCost);
+//                prevCost = tokenCost;
+//                System.out.printf("[Cost Adjust] WC=%d | Latency=%dms | Cost=%d%n",
+//                        wc, latency, tokenCost);
+//            }
+//        }
+//    }
 
     private void adjustTokenCostsBasedOnLatency() {
         final int MIN_COST = 1;
+        final int MAX_COST = 10;
+        final int HEALTHY_LATENCY = 20;
+        final int MAX_LATENCY = 50;
         final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
-        int minTransactions = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
-        final double maxTokenCostPerTxn = TOKEN_CAPACITY / minTransactions;
-        final int scale = 10;
 
-        synchronized (writeConcernLatency) {
-            // Filter out zero latencies and get max
-            long maxLatency = writeConcernLatencies.values().stream()
-                    .mapToLong(l -> l)
-                    .max()
-                    .orElse(1L); // avoid divide by 0
+        // Throughput sanity check
+        int minTransactionsPerBatch = (int) Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+        if (MAX_COST * minTransactionsPerBatch > TOKEN_CAPACITY) {
+            throw new IllegalStateException("Token capacity too low for minThroughput!");
+        }
 
-            // Sort write concerns to enforce cost hierarchy
+        synchronized (writeConcernLatencies) {
+            // Sort write concerns to enforce hierarchy
             List<Integer> writeConcerns = new ArrayList<>(writeConcernLatencies.keySet());
             Collections.sort(writeConcerns);
 
-
-            double prevCost = MIN_COST;
+            int prevCost = MIN_COST;
             for (int wc : writeConcerns) {
                 long latency = writeConcernLatencies.get(wc);
 
-                // Apply EMA smoothing (optional)
-                double smoothedLatency = smoothedLatencies.compute(wc,
-                        (k, oldVal) -> oldVal == null ? latency : 0.2 * latency + 0.8 * oldVal);
+                // Compute base cost (Step 1)
+                double normalizedLatency = Math.min(1.0,
+                        Math.max(0.0, (double) (latency - HEALTHY_LATENCY) / (MAX_LATENCY - HEALTHY_LATENCY)));
+                int tokenCost = MIN_COST + (int) Math.ceil(normalizedLatency * (MAX_COST - MIN_COST));
+                tokenCost = Math.min(MAX_COST, Math.max(MIN_COST, tokenCost));
 
-                // Scale cost proportionally to latency
-                double scaledCost = (smoothedLatency / maxLatency) * maxTokenCostPerTxn;
-                int tokenCost = (int) Math.ceil(scaledCost * scale);
-                tokenCost = Math.max((int) prevCost, tokenCost);  // Enforce hierarchy
-
+                // Enforce hierarchy (Step 2)
+                tokenCost = Math.max(prevCost, tokenCost);
                 writeConcernCosts.put(wc, (double) tokenCost);
                 prevCost = tokenCost;
-                System.out.printf("[Cost Adjust] WC=%d | Latency=%dms | Cost=%d%n",
-                        wc, latency, tokenCost);
+
+                System.out.printf("WC=%d | Latency=%dms | Cost=%d%n", wc, latency, tokenCost);
             }
         }
     }
-
 
 
     private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch) {
@@ -1115,7 +1158,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // for testing
 //            printAllWriteConernsThroughputAndLatencies();
             adjustTokenCostsBasedOnLatency();
-
             // current metrics
             double currentTps = getSystemWideThroughput();
             TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
@@ -1128,7 +1170,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             int n = currentBatch.size();
 
             // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
-            int transactionsToBeProcessedToMaintainThreshold = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+            int transactionsToBeProcessedToMaintainThreshold = Math.max(MIN_REQUIRED_THROUGHPUT,(int)Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0));
 
             // the optimal number of transactions we can process
             int minNumberOfTransactionsToBeProcessed = Math.min(transactionsToBeProcessedToMaintainThreshold, n);
@@ -1136,18 +1178,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // I convert the clientMessage protobuf object into java object, so that we can use java functions directly on it
             List<TransactionOption> currentBatchInTransactionOption = TransactionOption.convertToTransactionOption(currentBatch);
 
-            // this is scale converts the cost W:1 and W:Majority into int, because we will be using these costs in our dp (and array indexes cannot be float)
-            double scale = 10;
-
             ProcessResult result;
 
             if(throughputLow) {
-                 result =  processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, scale);
+                 result = processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
             } else {
-                result = processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, scale);
+                result = processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
             }
             // updating the token count here (updating in redis)
-            tokenBucket.updateTokens((currentTokens - (result.tokensUsed / scale)), lastUpdate);
+            // tokensUsed are already scaled down
+            tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
             System.out.printf(
                     "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n",
                     result.profit,
@@ -1163,7 +1203,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // use this when throughput is lower than expected
-    private ProcessResult processForThroughput(List<TransactionOption> transactions, double currentTokens, int minTransactions, double scale) {
+    private ProcessResult processForThroughput(List<TransactionOption> transactions, double currentTokens, int minTransactions) {
         // n*log(n)
         Collections.sort(transactions, (a,b)->{
             // if consistency is same select transaction with higher profit
@@ -1211,7 +1251,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // use this when throughput is higher or equal to of the expected value
-    private ProcessResult processForProfit(List<TransactionOption> transactions, double currentTokens, int minTransactions, double scale) {
+    private ProcessResult processForProfit(List<TransactionOption> transactions, double currentTokens, int minTransactions) {
         int n = transactions.size();
         int maxTokens = (int) Math.ceil(currentTokens * scale);
         int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
@@ -1319,11 +1359,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
 
         Collections.reverse(result);
+        // token cost is scaled down
         double tokensUsed = bestT / scale;
 
         return new ProcessResult(result, tokensUsed, bestProfit, transactionsUpgraded);
     }
-
 
     // this gives me the current rolling throughput, at the time of ack I add the transactions timestamp
     private double getSystemWideThroughput() {
@@ -1445,7 +1485,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return false;
     }
     private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
-
         // we need the readLock here because the raft log might be updated with new entries however the clientBalance might not have been, so this lock keeps the raft log and maps in sync
         lock.readLock().lock();
         try {
