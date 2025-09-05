@@ -19,21 +19,35 @@ public class Servers{
     // set the number of servers from here
     public static final int NUM_OF_SERVERS =  9;
 
-    public static void main(String[] args) throws IOException, InterruptedException {
+    public static void main(String[] args) throws IOException{
         List<Server> servers = new ArrayList<>();
+        List<ServerImpl> serversImpl = new ArrayList<>();
         for (int i = 1; i <= NUM_OF_SERVERS; i++) {
             int port = 8000 + i; // Ports 8000 to 8004
+            ServerImpl serverImpl = new ServerImpl(i - 1, NUM_OF_SERVERS);
             Server server = ServerBuilder.forPort(port)
-                    .addService(new ServerImpl(i - 1, NUM_OF_SERVERS))
+                    .addService(serverImpl)
                     .build()
                     .start();
             System.out.println("Server" + (i + 1) + " started on port " + port);
             servers.add(server);
+            serversImpl.add(serverImpl);
         }
-        for (Server server : servers) {
-            server.awaitTermination();
-        }
+        for (int i = 0; i < servers.size(); i++) {
+            final int index = i;
+            Server server = servers.get(i);
+            ServerImpl serverImpl = serversImpl.get(i);
 
+            new Thread(() -> {
+                try {
+                    serverImpl.setUpStubs();
+                    server.awaitTermination();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                    Thread.currentThread().interrupt();
+                }
+            }).start();
+        }
     }
 }
 

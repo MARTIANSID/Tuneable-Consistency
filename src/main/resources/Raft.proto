@@ -8,6 +8,7 @@ service Raft {
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
   rpc printLog(Empty) returns (Empty);
   rpc sendAckToClient(Ack) returns (Empty);
+  rpc sendAckToAllServers(Ack) returns(Empty);
   rpc sendReadRequest(ReadRequest) returns (Balance);
 }
 

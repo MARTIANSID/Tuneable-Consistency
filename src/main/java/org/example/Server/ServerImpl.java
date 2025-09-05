@@ -77,7 +77,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<String, Double> clientBalancesLatest;
 
-    ConcurrentHashMap<HybridClock.TimeStamp, Integer> timeStampsInLog;
+    ConcurrentSkipListMap<HybridClock.TimeStamp, Integer> timeStampsInLog;
 
     AtomicLong totalLatency;
 
@@ -132,7 +132,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 180; // this is in seconds
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -162,7 +162,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.hybridClock = new HybridClock();
         this.clientBalancesMajorityCommitted = new ConcurrentHashMap<>();
         this.clientBalancesLatest = new ConcurrentHashMap<>();
-        this.timeStampsInLog = new ConcurrentHashMap<>();
+        this.timeStampsInLog = new ConcurrentSkipListMap<>();
         this.ackLock = new ReentrantReadWriteLock();
         this.NUM_OF_SERVERS = NUM_OF_SERVERS;
         this.stubs = new RaftStub[NUM_OF_SERVERS];
@@ -197,12 +197,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
-            // setting up the stubs
-            if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).usePlaintext().build();
-                stubs[i] = RaftGrpc.newStub(channel);
-                blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
-            }
 
             int majorityLevel = ((NUM_OF_SERVERS / 2) + 1);
 
@@ -221,6 +215,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // starting the election timer
         this.electionTimer.start();
     }
+    public void setUpStubs() {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            // setting up the stubs
+            if (i != serverId) {
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
+                stubs[i] = RaftGrpc.newStub(channel);
+                blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
+
+            }
+        }
+    }
 
     @Override
     public void appendEntries(AppendEntriesArgument appendEntriesArgument, StreamObserver<AppendEntriesResult> responseObserver) {
@@ -238,6 +243,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             // this is added to replicate network call behaviour
             Thread.sleep(new Random().nextInt(20) + 5);
+//            Thread.sleep(10);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
@@ -258,6 +264,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 responseObserver.onCompleted();
                 return;
             }
+
             // Proceed with appending the entries
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
 
@@ -268,13 +275,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // updating the latest balances
             for (LogEntryProto logEntry : leadersEntries.getLogList()) {
+                String id = logEntry.getT().getId();
                 // adding the entries in tIdToLogIndex, for quick access to check duplicates from client side
-                tIdToLogIndex.put(logEntry.getT().getId(), logEntry.getLogIndex());
+                tIdToLogIndex.put(id, logEntry.getLogIndex());
                 // we need the time stamps in log to provide causal consistency
                 timeStampsInLog.put(HybridClock.TimeStamp.convertToTimeStamp(logEntry.getTimeStamp()), logEntry.getLogIndex());
+                // updating local balances
                 updateBalances(logEntry.getT(), clientBalancesLatest);
+                // updating ackSent Map
+                ackSent.put(id, false);
             }
-
             // Update commit index
             if (leadersCommitIndex > commitIndex.get()) {
                 int prevCommitIndex = commitIndex.get();
@@ -284,21 +294,20 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // update majority committed ap
                 for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
                     updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
+                    // updating the ack sent
+                    ackSent.put(log.get(i).t.getId(), true);
                 }
             }
-
             // Reset the election timer as the leader is active
             startTheElectionTimer();
-            // Send success response
 
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
 
+            // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
 
             responseObserver.onCompleted();
-
-//            System.out.println("Got Append Entries for server -- " + serverId + " Time --- " +(System.currentTimeMillis()));
 
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
@@ -327,11 +336,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
 
             double amount = t.getAmount();
-
             // revert the transaction, and the rollback will be performed in the clientBalancesLatest
             clientBalancesLatest.put(sender, clientBalancesLatest.get(sender) + amount);
             clientBalancesLatest.put(receiver, clientBalancesLatest.get(receiver) - amount);
-
             // remove the entries from tIdToLogIndex
             tIdToLogIndex.remove(id);
             // remove the timestamps
@@ -468,7 +475,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
             if (i == serverId) continue;
-
 
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                 @Override
@@ -608,7 +614,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // it is not in log
-    private void sendAckForEntries(List<LogEntry> entriesToBeAck, CountDownLatch latch) {
+    private CompletableFuture<Void> sendAckForEntries(List<LogEntry> entriesToBeAck) {
 
         List<AckMessage> ackMessages = new ArrayList<>();
 
@@ -660,7 +666,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             // *** this is the calculation of writeConcernLatency ***
             synchronized (writeConcernLatency) {
-                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
+//                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
                 int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
                Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
                // this timeStampOfTransaction is the current time taken at the time of sending ack
@@ -672,11 +678,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
         }
-
+        CompletableFuture<Void> future = new CompletableFuture<>();
         // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on committing
         if (ackMessages.isEmpty()) {
-            latch.countDown();
-            return;
+            future.complete(null);
+            return future;
         }
 
         // refresh the context, not sure if this is required need to research a but
@@ -684,25 +690,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         refreshContextClientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
             @Override
             public void onNext(Empty empty) {
-                latch.countDown();
+                System.out.println("Ack RPC onNext Recevied");
             }
 
             @Override
             public void onError(Throwable throwable) {
-                latch.countDown();
-//                System.out.println("Error in sending ack--" + throwable);
-
-                // implement retry logic
+                future.completeExceptionally(throwable);
             }
 
             @Override
             public void onCompleted() {
-                // this where we receive the message done
-//                System.out.println("Ack Sent successfully");
-                 // not sure if this is required or not
-//                latch.countDown();
+                future.complete(null);
             }
         });
+        return future;
+    }
+
+    @Override
+    public void sendAckToAllServers(Ack ack, StreamObserver<Empty> responseObserver) {
+        List<AckMessage> ackMessages = ack.getAckMessageList();
 
     }
 
@@ -784,25 +790,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             lock.writeLock().unlock(); // Unlock after modifying shared state
 
             // sending ack logic is kept outside the lock to reduce the contention
-            CountDownLatch latch = new CountDownLatch(2);
             // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
             if (!committedEntriesAck.isEmpty()) {
-                sendAckForEntries(committedEntriesAck, latch);
-            } else {
-                latch.countDown();
+                sendAckForEntries(committedEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
+                    System.out.println("Ack failed reason: "+ ex);
+                    return  null;
+                }));
             }
 
             if (!eventualEntriesAck.isEmpty()) {
-                sendAckForEntries(eventualEntriesAck, latch);
-            } else {
-                latch.countDown();
-            }
-
-            // now we have to make the thread kind of wait till both the acks are send, obviously we will keep a certain timeout
-            try {
-                latch.await(100, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+                sendAckForEntries(eventualEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
+                    System.out.println("Ack failed reason: "+ ex);
+                    return  null;
+                }));
             }
         }
         return true;
@@ -1044,18 +1044,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         } finally {
             lock.writeLock().unlock();
-            CountDownLatch latch = new CountDownLatch(1);
             if (!entry.isEmpty()) {
                 // this sends Ack for all transactions together
-                sendAckForEntries(entry, latch);
-            } else {
-                latch.countDown();
-            }
-
-            try {
-                latch.await(200, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+                sendAckForEntries(entry).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally(ex -> {
+                  System.out.println("Ack failed reason : " + ex);
+                  return null;
+                });
             }
         }
     }
@@ -1396,16 +1390,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // causal consistency
             HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp.convertToTimeStamp(readRequest.getTimeStamp());
 
-            if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
+            if (timeStampsInLog.ceilingEntry(timeStampRequestedByClient) == null) {
                 try {
-                    // I wait for 30 ms because I send appendEntries in 15 ms so we are kind of considering one missed appendEntry here (we may want to reduce the time here )
+                    // I wait for 30 ms because I send appendEntries in 15 ms so we are kind of considering one missed appendEntry here (we may want to reduce the time here)
                     Thread.sleep(30);
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
                 }
             }
             // I am checking here again because we might wait 30 ms and still not get the timestamp
-            if (!timeStampsInLog.containsKey(timeStampRequestedByClient)) {
+            if (timeStampsInLog.ceilingEntry(timeStampRequestedByClient) == null) {
                 // send failure, we wait approximately for 2 appendEntries
                 responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
                 responseObserver.onCompleted();
@@ -1413,7 +1407,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // The node was able to catch up till the timestamp and the data will be returned based on the read concern now
                 // but here also there are two things that, if the readConcern is majority then we need to wait till the commit point passes or equals to the expected log entry
                 if (readConcern == ReadConcern.MAJORITY) {
-                    int logIndexOfRequestedEntry = timeStampsInLog.get(timeStampRequestedByClient);
+                    Map.Entry<HybridClock.TimeStamp, Integer> entry = timeStampsInLog.ceilingEntry(timeStampRequestedByClient);
+                    int logIndexOfRequestedEntry = entry.getValue();
                     // the requested logIndex should be safely committed
                     // if the commitIndex is less than the logIndexOfRequestEntry then it is not safely committed till now
                     if (commitIndex.get() < logIndexOfRequestedEntry) {
@@ -1460,7 +1455,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             }
                         });
                     } else {
-                        // this is the leader so return the Majority committed data
+                        // this is the leader so return the Majority committed data, the thing is we might have to confirm here wether this is not actually the leader or not (doubt have to ask professor)
                         responseObserver.onNext(Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setFailure(false).setAccName(accName).build());
                         responseObserver.onCompleted();
                     }
@@ -1478,8 +1473,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // inside read lock
     private boolean isElectionTakingPlace() {
+        // if status is candidate then this server is trying to become the leader
         if (status == ServerCurrentStatus.CANDIDATE) return true;
-        // this condition simply means that the current leader has stepped down because a it saw a server with higher term, and currently it does not know the exact leader, other design shown can be setting the current leader = -1 (which means leader is unknown)
+        // this condition simply means that the current leader has stepped down because it saw a server with higher term, and currently it does not know the exact leader, other design shown can be setting the current leader = -1 (which means leader is unknown)
         if (serverId == currentLeader && status == ServerCurrentStatus.FOLLOWER) return true;
 
         return false;
