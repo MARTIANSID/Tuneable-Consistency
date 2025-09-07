@@ -124,6 +124,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
 
+    ScheduledExecutorService sendAppendEntriesScheduler;
+
     public int backLog;
 
 
@@ -190,6 +192,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencies = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.backLog = 0;
+        this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
 
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
@@ -306,7 +309,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
-
             responseObserver.onCompleted();
 
         } catch (InterruptedException e) {
@@ -830,10 +832,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void sendAppendEntries() {
-        // send appendEntries
-
-        while (status == ServerCurrentStatus.LEADER) {
-
+        sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
+            if(status != ServerCurrentStatus.LEADER) {
+                return;
+            }
             for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
                 if (i == serverId) continue;
@@ -867,7 +869,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
                         // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-                            doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
+                        doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
                     }
 
                     @Override
@@ -882,15 +884,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 });
                 if (!doesLeaderHasHighestTerm.get()) break;
             }
-            if (!doesLeaderHasHighestTerm.get()) break;
-
-            try {
-                // in every 15 milliseconds send appendEntries
-                Thread.sleep(15);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            }
-        }
+        }, 0, 20, TimeUnit.MILLISECONDS);
     }
     // already in writeLock
     public void reinitialiseIndexes() {
@@ -941,6 +935,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             electionTimer.stop();
             // Reinitialize state
             reinitialiseIndexes();
+            // starting the sendAppendEntriesScheduler
+            sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             // This node becomes the leader
             this.status = ServerCurrentStatus.LEADER;
             this.currentLeader = this.serverId;
@@ -965,7 +961,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             batchProcessingTask.cancel(false);  // false = don't interrupt if running
             batchProcessingTask = null;
         }
-
+        // stop leader’s heartbeat task immediately
+        if (sendAppendEntriesScheduler != null && !sendAppendEntriesScheduler.isShutdown()) {
+            sendAppendEntriesScheduler.shutdownNow();
+            sendAppendEntriesScheduler = null;
+        }
     }
     private void processBatch() {
         // here the logic to process the current batch of transaction will come
