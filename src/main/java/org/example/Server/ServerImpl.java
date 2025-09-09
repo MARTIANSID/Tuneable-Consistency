@@ -125,6 +125,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
 
     ScheduledExecutorService sendAppendEntriesScheduler;
+    ScheduledExecutorService causalReadScheduler;
 
     public int backLog;
 
@@ -193,6 +194,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.backLog = 0;
         this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
+        this.causalReadScheduler = Executors.newScheduledThreadPool(1);
 
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
@@ -306,10 +308,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
-
+            System.out.println("this is the server: " + serverId + " the commit index is: " + commitIndex.get());
             // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
             responseObserver.onCompleted();
+
 
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
@@ -936,10 +939,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Reinitialize state
             reinitialiseIndexes();
             // starting the sendAppendEntriesScheduler
-            sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             // This node becomes the leader
             this.status = ServerCurrentStatus.LEADER;
             this.currentLeader = this.serverId;
+            sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
         } finally {
            lock.writeLock().unlock();
         }
@@ -1145,7 +1148,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch) {
-
+        // we can use lua scripts instead of using lock at application level
         redisLock.writeLock().lock();
         try {
 
@@ -1390,38 +1393,36 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // causal consistency
             HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp.convertToTimeStamp(readRequest.getTimeStamp());
 
-            if (timeStampsInLog.ceilingEntry(timeStampRequestedByClient) == null) {
-                try {
-                    // I wait for 30 ms because I send appendEntries in 15 ms so we are kind of considering one missed appendEntry here (we may want to reduce the time here)
-                    Thread.sleep(30);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-            // I am checking here again because we might wait 30 ms and still not get the timestamp
-            if (timeStampsInLog.ceilingEntry(timeStampRequestedByClient) == null) {
-                // send failure, we wait approximately for 2 appendEntries
-                responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
-                responseObserver.onCompleted();
-            } else {
-                // The node was able to catch up till the timestamp and the data will be returned based on the read concern now
-                // but here also there are two things that, if the readConcern is majority then we need to wait till the commit point passes or equals to the expected log entry
-                if (readConcern == ReadConcern.MAJORITY) {
-                    Map.Entry<HybridClock.TimeStamp, Integer> entry = timeStampsInLog.ceilingEntry(timeStampRequestedByClient);
-                    int logIndexOfRequestedEntry = entry.getValue();
-                    // the requested logIndex should be safely committed
-                    // if the commitIndex is less than the logIndexOfRequestEntry then it is not safely committed till now
-                    if (commitIndex.get() < logIndexOfRequestedEntry) {
-                        // return error, or we can wait for some more time, this is dependent on our design choice
-                        responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
-                        responseObserver.onCompleted();
-                        return;
-                    }
-                }
-                // here the readConcern will be majority and local, in case of majority the requested timestamp would have been safely committed here
-                responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
-                responseObserver.onCompleted();
+            if (readConcern == ReadConcern.MAJORITY) {
 
+                long startTime = System.nanoTime();
+                long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
+                Runnable checkLogTask = new Runnable() {
+                    @Override
+                    public void run() {
+                        if (System.nanoTime() - startTime > maxWaitNanos) {
+                            responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
+                            responseObserver.onCompleted();
+                            return;
+                        }
+
+                        int ci = commitIndex.get();
+                        LogEntry lastCommittedEntry = log.get(ci); // thread-safe get
+
+                        if (lastCommittedEntry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
+                            // log has caught up, safe to read
+                            responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+                            responseObserver.onCompleted();
+                        } else {
+                            // still behind, schedule again after a short delay
+                            causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
+                        }
+                    }
+                };
+
+                causalReadScheduler.execute(checkLogTask);
+            } else {
+               // right now we only provide this feature for majority read concern
             }
 
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
@@ -1446,7 +1447,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                             @Override
                             public void onError(Throwable throwable) {
-
+                                responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
+                                responseObserver.onCompleted();
                             }
 
                             @Override
