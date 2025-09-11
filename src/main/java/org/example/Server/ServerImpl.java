@@ -943,16 +943,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             this.status = ServerCurrentStatus.LEADER;
             this.currentLeader = this.serverId;
             sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
+            batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+            sendAppendEntries();
         } finally {
            lock.writeLock().unlock();
         }
-        batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
-        sendAppendEntries();
     }
 
     // should be inside write lock
     private void becomeFollower() {
-
         // the status changes to follower
         status = ServerCurrentStatus.FOLLOWER;
         // we have to start the election timer because now it is a follower
