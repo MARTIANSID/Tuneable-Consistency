@@ -537,8 +537,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
-            // now election is over cannot receive more responses
-            isElectionOver.compareAndSet(false, true);
+
+            // if election was successful the this would have been set to true by now
+            if(isElectionOver.compareAndSet(false, true)) {
+                lock.writeLock().lock();
+                try {
+                    becomeFollower();
+                } finally {
+                    lock.writeLock().unlock();
+                }
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -942,9 +950,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // This node becomes the leader
             this.status = ServerCurrentStatus.LEADER;
             this.currentLeader = this.serverId;
-            sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
-            batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
-            sendAppendEntries();
+            if(sendAppendEntriesScheduler == null || sendAppendEntriesScheduler.isShutdown()) {
+                sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
+                sendAppendEntries();
+            }
+            if(batchProcessingTask == null || batchProcessor.isShutdown()) {
+                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+            }
         } finally {
            lock.writeLock().unlock();
         }

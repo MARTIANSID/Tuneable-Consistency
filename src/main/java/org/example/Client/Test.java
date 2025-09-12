@@ -64,6 +64,7 @@ public class Test {
             executorService.shutdown();
             channel.shutdown();
             System.out.println("All transactions sent.");
+            System.out.println("All transactions sent.");
             try {
                 Thread.sleep(1002);
             } catch (InterruptedException e) {
