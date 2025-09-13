@@ -246,6 +246,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
+            System.out.println(appendEntriesArgument);
             // this is added to replicate network call behaviour
             Thread.sleep(new Random().nextInt(20) + 5);
 //            Thread.sleep(10);
@@ -309,10 +310,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
             System.out.println("this is the server: " + serverId + " the commit index is: " + commitIndex.get());
+            System.out.println(log.size());
             // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
             responseObserver.onCompleted();
-
 
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
@@ -402,6 +403,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
+        System.out.println("Got");
         // check if the current node is leader or not, if not forward request to leader, this might fail if election is going on
         if (serverId != currentLeader) {
             // here I have kept the call blocking for now (with a timeout of 1 second), later we can move it to async,
@@ -539,14 +541,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
 
             // if election was successful the this would have been set to true by now
-            if(isElectionOver.compareAndSet(false, true)) {
+            try {
                 lock.writeLock().lock();
-                try {
-                    becomeFollower();
-                } finally {
-                    lock.writeLock().unlock();
+                if(isElectionOver.compareAndSet(false, true) && status != ServerCurrentStatus.FOLLOWER) {
+                        becomeFollower();
                 }
+            } finally {
+                lock.writeLock().unlock();
             }
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -843,6 +846,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void sendAppendEntries() {
+
         sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
             if(status != ServerCurrentStatus.LEADER) {
                 return;
@@ -952,7 +956,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             this.currentLeader = this.serverId;
             if(sendAppendEntriesScheduler == null || sendAppendEntriesScheduler.isShutdown()) {
                 sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
-                sendAppendEntries();
             }
             if(batchProcessingTask == null || batchProcessor.isShutdown()) {
                 batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
@@ -960,6 +963,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
            lock.writeLock().unlock();
         }
+        sendAppendEntries();
     }
 
     // should be inside write lock
