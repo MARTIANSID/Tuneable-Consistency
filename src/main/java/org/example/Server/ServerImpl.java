@@ -303,7 +303,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(log.get(i).t.getId(), true);
                 }
             }
-            System.out.println(commitIndex.get() + "this is the commitindex of followers");
             // Reset the election timer as the leader is active
             startTheElectionTimer();
             // current time of follower
@@ -462,12 +461,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return true;
     }
 
-    private synchronized void endLatchHold(CountDownLatch latch) {
-        while (latch.getCount() > 0) {
-            latch.countDown();
-        }
-    }
-
     private void requestForVotes() {
         // this function uses readLock so it is thread safe
         RequestVoteArguments requestVoteArguments = getRequestVoteArgumentsObject();
@@ -486,8 +479,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     try {
                         lock.writeLock().lock();
-                        // latch.countDown() is atomic operation
-                        // additional not compulsory
+
                         if (isElectionOver.get()) {
                             latch.countDown();
                             return;
@@ -498,15 +490,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         // if isElectionOver was already false then do not change shared data
                         // since compareAndSet is atomic we protect against the double transitions due to race conditions
                         if (!isSuccessful) {
-                            // if the current term is less then this node has to become a follower
+                            // if the current term is less than this node has to become a follower
                             if (isElectionOver.compareAndSet(false, true)) {
-                                lock.writeLock().lock();
-                                try {
                                     becomeFollower();
-                                } finally {
-                                    lock.writeLock().unlock();
-                                }
-                                endLatchHold(latch);
+                                // not waiting further
+                                latch.notify();
                             }
                         } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
 
@@ -515,7 +503,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 // I call the becomeLeader() here to make thread safe!
                                 becomeLeader();
                                 //no need to wait further
-                                endLatchHold(latch);
+                                latch.notify();
                             }
                         } else {
                             latch.countDown();
@@ -536,17 +524,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
             });
 
-
         }
         try {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
-
             // if election timed out then we do the below
             try {
                 lock.writeLock().lock();
                 if(!success && isElectionOver.compareAndSet(false, true) && status != ServerCurrentStatus.FOLLOWER) {
-                        becomeFollower();
+                    becomeFollower();
                 }
             } finally {
                 lock.writeLock().unlock();
@@ -566,45 +552,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         return result;
     }
-
-
-    // inside write lock
-    private int getCommitIndexIfPossible() {
-        // we can sort the array 5*log5 roughly equal to 11.6 so it is fine
-        int[] sortedMatchIndex = new int[NUM_OF_SERVERS];
-        for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            sortedMatchIndex[i] = matchIndex.get(i);
-        }
-
-        // n*log(n)
-        Arrays.sort(sortedMatchIndex);
-
-        int index = NUM_OF_SERVERS - 1;
-
-
-        while (index >= 0) {
-            // traverse through all the indexes which are equal to this current index
-            int currentIndex = sortedMatchIndex[index], cnt = 0, val = index;
-
-            // currentIndex can be < 0, that means we don't have matchIndex for this follower
-            if (currentIndex == -1) return -1;
-
-
-            while (index >= 0 && sortedMatchIndex[index] == currentIndex) {
-                cnt++;
-                index--;
-            }
-
-            // (4 - val) is there because the indexes on the right hand side of the current index support this index if not equal to -1
-            if ((cnt + ((NUM_OF_SERVERS - 1) - val)) >= (NUM_OF_SERVERS / 2) && log.get(currentIndex).term == currentTerm.get()) {
-                // we return because we want the best index (array is sorted), that is the biggest index
-                return currentIndex;
-            }
-        }
-        // if no commitIndex is possible
-        return -1;
-    }
-
     // should be inside a lock, this method is kind of better because we do not need to sort the matchIndex array and we can get the commit index in roughly O(n) time because usually the log of follower and leader is off by 2-3 entries
     private int getCommitIndexIfPossibleEarlyExitMethod() {
         // Find the max matchIndex
@@ -903,7 +850,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 });
                 if (!doesLeaderHasHighestTerm.get()) break;
             }
-        }, 0, 20, TimeUnit.MILLISECONDS);
+        }, 0, 40, TimeUnit.MILLISECONDS);
     }
     // already in writeLock
     public void reinitialiseIndexes() {
