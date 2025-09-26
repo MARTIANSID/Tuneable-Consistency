@@ -246,7 +246,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
-            System.out.println(appendEntriesArgument);
             // this is added to replicate network call behaviour
             Thread.sleep(new Random().nextInt(20) + 5);
 //            Thread.sleep(10);
@@ -304,13 +303,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(log.get(i).t.getId(), true);
                 }
             }
+            System.out.println(commitIndex.get() + "this is the commitindex of followers");
             // Reset the election timer as the leader is active
             startTheElectionTimer();
-
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
-            System.out.println("this is the server: " + serverId + " the commit index is: " + commitIndex.get());
-            System.out.println(log.size());
             // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
             responseObserver.onCompleted();
@@ -403,7 +400,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
-        System.out.println("Got");
         // check if the current node is leader or not, if not forward request to leader, this might fail if election is going on
         if (serverId != currentLeader) {
             // here I have kept the call blocking for now (with a timeout of 1 second), later we can move it to async,
@@ -421,6 +417,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // this is assuming a new transaction, basically we do not accept the same transaction, if it is already present in the system
             backLog++;
             batchOfTransactions.add(clientMessage);
+//            System.out.println(batchOfTransactions.size() + "This is the batchSize at the leader end");
         } finally {
             batchLock.unlock();
         }
@@ -487,63 +484,68 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 @Override
                 public void onNext(RequestVoteResult requestVoteResult) {
 
-                    // latch.countDown() is atomic operation
-                    // additional not compulsory
-                    if(isElectionOver.get()) {
-                        latch.countDown();
-                        return;
-                    }
-                    boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
-                    // it is not successful when the currentTerm of the leader is not up-to date
-                    // I am handling everything in call backs to make raft election thread safe
-                    // if isElectionOver was already false then do not change shared data
-                    // since compareAndSet is atomic we protect against the double transitions due to race conditions
-                    if (!isSuccessful) {
-                        // if the current term is less then this node has to become a follower
-                        if(isElectionOver.compareAndSet(false, true)) {
-                            lock.writeLock().lock();
-                            try {
-                               becomeFollower();
-                            } finally {
-                                lock.writeLock().unlock();
+                    try {
+                        lock.writeLock().lock();
+                        // latch.countDown() is atomic operation
+                        // additional not compulsory
+                        if (isElectionOver.get()) {
+                            latch.countDown();
+                            return;
+                        }
+                        boolean isSuccessful = handleRequestVoteResult(requestVoteResult);
+                        // it is not successful when the currentTerm of the leader is not up-to date
+                        // I am handling everything in call backs to make raft election thread safe
+                        // if isElectionOver was already false then do not change shared data
+                        // since compareAndSet is atomic we protect against the double transitions due to race conditions
+                        if (!isSuccessful) {
+                            // if the current term is less then this node has to become a follower
+                            if (isElectionOver.compareAndSet(false, true)) {
+                                lock.writeLock().lock();
+                                try {
+                                    becomeFollower();
+                                } finally {
+                                    lock.writeLock().unlock();
+                                }
+                                endLatchHold(latch);
                             }
-                            endLatchHold(latch);
-                        }
-                    } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
+                        } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
 
-                        if(isElectionOver.compareAndSet(false, true)) {
-                            // majority is reached here, no need to continue the election
-                            // I call the becomeLeader() here to make thread safe!
-                            becomeLeader();
-                            //no need to wait further
-                            endLatchHold(latch);
+                            if (isElectionOver.compareAndSet(false, true)) {
+                                // majority is reached here, no need to continue the election
+                                // I call the becomeLeader() here to make thread safe!
+                                becomeLeader();
+                                //no need to wait further
+                                endLatchHold(latch);
+                            }
+                        } else {
+                            latch.countDown();
                         }
-                    } else {
-                        latch.countDown();
+                    } finally {
+                        lock.writeLock().unlock();
                     }
                 }
+                    @Override
+                    public void onError (Throwable throwable){
+                        // in case of error as well we kind of want to terminate early
+                        latch.countDown();
+                    }
 
-                @Override
-                public void onError(Throwable throwable) {
-                    // in case of error as well we kind of want to terminate early
-                    latch.countDown();
-                }
+                    @Override
+                    public void onCompleted () {
 
-                @Override
-                public void onCompleted() {
-
-                }
+                    }
             });
+
 
         }
         try {
             // Wait for up to 50ms for responses
             boolean success = latch.await(50, TimeUnit.MILLISECONDS);
 
-            // if election was successful the this would have been set to true by now
+            // if election timed out then we do the below
             try {
                 lock.writeLock().lock();
-                if(isElectionOver.compareAndSet(false, true) && status != ServerCurrentStatus.FOLLOWER) {
+                if(!success && isElectionOver.compareAndSet(false, true) && status != ServerCurrentStatus.FOLLOWER) {
                         becomeFollower();
                 }
             } finally {
@@ -860,6 +862,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 AppendEntriesArgument appendEntriesArgument = null;
                 lock.readLock().lock();
                 try {
+                    // this check is to avoid race condition where in if leader, becomes follower it should not send the updated term to follower as this old leader is not a leader in the updated term
+                    if(status != ServerCurrentStatus.LEADER) return;
                     // nextIndex tells us the nextIndex from which we need the entries
                     indexToSendFrom = nextIndex.get(i);
                     // prevEntry needed for comparison at the follower end
@@ -968,11 +972,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // should be inside write lock
     private void becomeFollower() {
+
+        if(status != ServerCurrentStatus.FOLLOWER) {
+            startTheElectionTimer();
+        }
         // the status changes to follower
         status = ServerCurrentStatus.FOLLOWER;
         // we have to start the election timer because now it is a follower
-
-        startTheElectionTimer();
 
         // cancelling the batch job
         if (batchProcessingTask != null && !batchProcessingTask.isCancelled()) {
@@ -1472,9 +1478,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             }
                         });
                     } else {
-                        // this is the leader so return the Majority committed data, the thing is we might have to confirm here wether this is not actually the leader or not (doubt have to ask professor)
-                        responseObserver.onNext(Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setFailure(false).setAccName(accName).build());
-                        responseObserver.onCompleted();
+                        // here we need to append this read request in the log actually, need to implement this
+
                     }
                 }
 
