@@ -120,8 +120,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns;
 
-    ConcurrentHashMap<Integer, Long> writeConcernLatencies;
-
+    ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies;
+    ConcurrentHashMap<Integer, Long> writeConcernLatencySum;
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
 
     ScheduledExecutorService sendAppendEntriesScheduler;
@@ -134,7 +134,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 180; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 300; // this is in seconds
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -190,6 +190,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.electionLock = new ReentrantLock();
         this.ackTransactionTimeStampsForAllWriteConcerns = new ConcurrentHashMap<>();
         this.writeConcernLatencies = new ConcurrentHashMap<>();
+        this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.backLog = 0;
         this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
@@ -209,7 +210,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 ackTransactionTimeStampsForAllWriteConcerns.put(i, new ConcurrentLinkedQueue<>());
                 // initially we might want to set the write concerns costs as 1.0 but as the throughput is calculated they are adjusted
                 writeConcernCosts.put(i, 1.0);
-                writeConcernLatencies.put(i, (long) 0);
+                writeConcernLatencies.put(i, new ArrayDeque<>());
+                writeConcernLatencySum.put(i, (long)0);
             }
         }
         // setting up the client stub
@@ -247,7 +249,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             // this is added to replicate network call behaviour
-            Thread.sleep(new Random().nextInt(5) + 1);
+            Thread.sleep(new Random().nextInt(30) + 10);
 //            Thread.sleep(10);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
@@ -320,7 +322,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // inside write lock
     private void updateBalances(Transaction t, ConcurrentHashMap<String, Double> balances) {
-        if(t.getIsReadOnly()) return;
+        if (t.getIsReadOnly()) return;
 
         String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
 
@@ -638,12 +640,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
                 // this timeStampOfTransaction is the current time taken at the time of sending ack
                 Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
-                Long prevLatency = writeConcernLatencies.get(writeConcernOfThisTransaction);
-                // taking average of latencies, later on maybe we can use Exponential Moving Average (which more weightage to the recent latencies)
-                writeConcernLatencies.put(writeConcernOfThisTransaction, prevLatency == 0 ? currentLatency : ((prevLatency + currentLatency) / 2));
+                Deque<Latency> latencies = writeConcernLatencies.get(writeConcernOfThisTransaction);
+                while (!latencies.isEmpty() && (timeStampOfTransaction - latencies.peek().timestamp) >= 1000L) {
+                    Latency latency = latencies.poll();
+                    writeConcernLatencySum.put(writeConcernOfThisTransaction, writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
+                }
+                latencies.add(new Latency(timeStampOfTransaction, currentLatency));
+                writeConcernLatencySum.put(writeConcernOfThisTransaction, writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
 
             }
-
         }
         CompletableFuture<Void> future = new CompletableFuture<>();
         // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on committing
@@ -671,6 +676,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         });
         return future;
+    }
+
+    public long getAverageLatency(int writeConcern) {
+        synchronized (writeConcernLatency) {
+            return writeConcernLatencySum.get(writeConcern)/ Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
+        }
     }
 
     @Override
@@ -760,14 +771,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
             if (!committedEntriesAck.isEmpty()) {
                 sendAckForEntries(committedEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
-                    System.out.println("Ack failed reason: " + ex);
+//                    System.out.println("Ack failed reason: " + ex);
                     return null;
                 }));
             }
 
             if (!eventualEntriesAck.isEmpty()) {
                 sendAckForEntries(eventualEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
-                    System.out.println("Ack failed reason: " + ex);
+//                    System.out.println("Ack failed reason: " + ex);
                     return null;
                 }));
             }
@@ -1025,7 +1036,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (!entry.isEmpty()) {
                 // this sends Ack for all transactions together
                 sendAckForEntries(entry).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally(ex -> {
-                    System.out.println("Ack failed reason : " + ex);
+//                    System.out.println("Ack failed reason : " + ex);
                     return null;
                 });
             }
@@ -1083,42 +1094,78 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        }
 //    }
 
+//    private void adjustTokenCostsBasedOnLatency() {
+//        final int MIN_COST = 1;
+//        final int MAX_COST = 50;
+//        final int HEALTHY_LATENCY = 20;
+//        final int MAX_LATENCY = 50;
+//        final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
+//
+//        // Throughput sanity check
+//        int minTransactionsPerBatch = (int) Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
+//        if (MAX_COST * minTransactionsPerBatch > TOKEN_CAPACITY) {
+//            throw new IllegalStateException("Token capacity too low for minThroughput!");
+//        }
+//
+//        synchronized (writeConcernLatencies) {
+//            // Sort write concerns to enforce hierarchy
+//            List<Integer> writeConcerns = new ArrayList<>(writeConcernLatencies.keySet());
+//            Collections.sort(writeConcerns);
+//
+//            int prevCost = MIN_COST;
+//            for (int wc : writeConcerns) {
+//                long latency = writeConcernLatencies.get(wc);
+//
+//                // Compute base cost (Step 1)
+//                double normalizedLatency = Math.min(1.0,
+//                        Math.max(0.0, (double) (latency - HEALTHY_LATENCY) / (MAX_LATENCY - HEALTHY_LATENCY)));
+//                int tokenCost = MIN_COST + (int) Math.ceil(normalizedLatency * (MAX_COST - MIN_COST));
+//                tokenCost = Math.min(MAX_COST, Math.max(MIN_COST, tokenCost));
+//
+//                // Enforce hierarchy (Step 2)
+//                tokenCost = Math.max(prevCost, tokenCost);
+//                writeConcernCosts.put(wc, (double) tokenCost);
+//                prevCost = tokenCost;
+//
+//                System.out.printf("WC=%d | Latency=%dms | Cost=%d%n", wc, latency, tokenCost);
+//            }
+//        }
+//    }
+
     private void adjustTokenCostsBasedOnLatency() {
         final int MIN_COST = 1;
-        final int MAX_COST = 10;
-        final int HEALTHY_LATENCY = 20;
-        final int MAX_LATENCY = 50;
-        final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
+        final double STEP_FACTOR = 0.3;  // half the fastest-latency
 
-        // Throughput sanity check
-        int minTransactionsPerBatch = (int) Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0);
-        if (MAX_COST * minTransactionsPerBatch > TOKEN_CAPACITY) {
-            throw new IllegalStateException("Token capacity too low for minThroughput!");
-        }
+        // 1) Build per-WC average from your history buffers
+        HashMap<Integer, Long> averageLatency = new HashMap<>();
+        synchronized (writeConcernLatency) {
+            double minLatency = 1.0;
+            for(var entry : writeConcernLatencies.entrySet()) {
+                int wc = entry.getKey();
+                Long latency = getAverageLatency(wc);
+                minLatency = Math.max(latency, minLatency);
+                averageLatency.put(wc, Math.max(latency,1));
+            }
 
-        synchronized (writeConcernLatencies) {
-            // Sort write concerns to enforce hierarchy
-            List<Integer> writeConcerns = new ArrayList<>(writeConcernLatencies.keySet());
-            Collections.sort(writeConcerns);
 
-            int prevCost = MIN_COST;
-            for (int wc : writeConcerns) {
-                long latency = writeConcernLatencies.get(wc);
+            double step = minLatency * STEP_FACTOR;
 
-                // Compute base cost (Step 1)
-                double normalizedLatency = Math.min(1.0,
-                        Math.max(0.0, (double) (latency - HEALTHY_LATENCY) / (MAX_LATENCY - HEALTHY_LATENCY)));
-                int tokenCost = MIN_COST + (int) Math.ceil(normalizedLatency * (MAX_COST - MIN_COST));
-                tokenCost = Math.min(MAX_COST, Math.max(MIN_COST, tokenCost));
+            for (var entry : averageLatency.entrySet()) {
+                int wc = entry.getKey();
+                Long lat = entry.getValue();
 
-                // Enforce hierarchy (Step 2)
-                tokenCost = Math.max(prevCost, tokenCost);
+                // 4) Map latency → integer cost: the slower you are, the more multiples of 'step' you consume
+                int tokenCost = (int) Math.ceil((double)lat / step);
+                tokenCost = Math.max(tokenCost, MIN_COST);
+
                 writeConcernCosts.put(wc, (double) tokenCost);
-                prevCost = tokenCost;
-
-                System.out.printf("WC=%d | Latency=%dms | Cost=%d%n", wc, latency, tokenCost);
+                System.out.printf(
+                        "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%d%n",
+                        wc, lat, step, tokenCost
+                );
             }
         }
+
     }
 
 
