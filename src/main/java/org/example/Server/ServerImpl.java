@@ -418,8 +418,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here I add the transactions in batch
         batchLock.lock();
         try {
-            // this is assuming a new transaction, basically we do not accept the same transaction, if it is already present in the system
-            backLog++;
             batchOfTransactions.add(clientMessage);
 //            System.out.println(batchOfTransactions.size() + "This is the batchSize at the leader end");
         } finally {
@@ -957,6 +955,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void processBatch() {
+        System.out.println("here");
         // here the logic to process the current batch of transaction will come
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
@@ -968,10 +967,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             batchLock.unlock();
         }
+
+        System.out.println(currentBatch);
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
 
         List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
+
+        System.out.println(transactionsToExecute);
 
         // we need add back the transactions which we were not able to execute
 
@@ -990,12 +993,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     batchOfTransactions.add(clientMessage);
                 }
             }
-            backLog -= idsOfTransactionsWhichCanBeExecuted.size();
+            backLog = batchOfTransactions.size();
+            System.out.println("The backlog is--" + backLog);
         } finally {
             batchLock.unlock();
         }
-
-        System.out.println("The backlog is--" + backLog);
 
         // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
