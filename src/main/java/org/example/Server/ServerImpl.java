@@ -134,7 +134,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 300; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 650; // this is in seconds
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -955,7 +955,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void processBatch() {
-        System.out.println("here");
         // here the logic to process the current batch of transaction will come
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
@@ -968,13 +967,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             batchLock.unlock();
         }
 
-        System.out.println(currentBatch);
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
 
         List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
-
-        System.out.println(transactionsToExecute);
 
         // we need add back the transactions which we were not able to execute
 
@@ -1157,12 +1153,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 Long lat = entry.getValue();
 
                 // 4) Map latency → integer cost: the slower you are, the more multiples of 'step' you consume
-                int tokenCost = (int) Math.ceil((double)lat / step);
+                double tokenCost =  Math.ceil((double)lat / step);
                 tokenCost = Math.max(tokenCost, MIN_COST);
 
-                writeConcernCosts.put(wc, (double) tokenCost);
+                writeConcernCosts.put(wc, tokenCost);
                 System.out.printf(
-                        "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%d%n",
+                        "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%.1f%n",
                         wc, lat, step, tokenCost
                 );
             }
@@ -1186,22 +1182,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             long lastUpdate = tb.getLastUpdateTime();
 
             // see if the current throughput is lesser than what is required, if it is then we do not want to upgrade any transaction
-            boolean throughputLow = currentTps < MIN_REQUIRED_THROUGHPUT;
+            boolean throughputLowOrBackLog = currentTps < MIN_REQUIRED_THROUGHPUT || backLog > 0;
 
             int n = currentBatch.size();
 
             // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
-            int transactionsToBeProcessedToMaintainThreshold = Math.max(MIN_REQUIRED_THROUGHPUT, (int) Math.ceil(MIN_REQUIRED_THROUGHPUT * BATCH_INTERVAL_MS / 1000.0));
-
+            int transactionsToBeProcessedToMaintainThreshold = (int)((MIN_REQUIRED_THROUGHPUT + (MIN_REQUIRED_THROUGHPUT - currentTps)) / 1000) * BATCH_INTERVAL_MS;
+            int minTransactions = backLog > 0 ? n : transactionsToBeProcessedToMaintainThreshold;
             // the optimal number of transactions we can process
-            int minNumberOfTransactionsToBeProcessed = Math.min(transactionsToBeProcessedToMaintainThreshold, n);
+            int minNumberOfTransactionsToBeProcessed = Math.min(minTransactions, n);
 
             // I convert the clientMessage protobuf object into java object, so that we can use java functions directly on it
             List<TransactionOption> currentBatchInTransactionOption = TransactionOption.convertToTransactionOption(currentBatch);
 
             ProcessResult result;
 
-            if (throughputLow) {
+            if (throughputLowOrBackLog) {
                 result = processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
             } else {
                 result = processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);

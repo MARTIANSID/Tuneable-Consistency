@@ -10,7 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Test {
-    private static final int THREAD_COUNT = 12; // Number of parallel transactions
+    private static final int THREAD_COUNT = 7; // Number of parallel transactions
     private static final int NUM_OF_SERVERS = 9;
 
     private static int pickWeightedWriteConcern() {
@@ -43,11 +43,11 @@ public class Test {
     }
 
     public static final double[] WC_WEIGHTS = new double[] {
-            0.5,  // weight for write-concern = 1
-            0.1,  // weight for write-concern = 2
-            0.1,  // weight for write-concern = 3
-            0.1,  // weight for write-concern = 4
-            0.2   // weight for write-concern = 5 (MAX_WRITECONCERN)
+            1,  // weight for write-concern = 1
+            0.0,  // weight for write-concern = 2
+            0.0,  // weight for write-concern = 3
+            0.0,  // weight for write-concern = 4
+            0.0   // weight for write-concern = 5 (MAX_WRITECONCERN)
     };
 
     static final int MAX_WRITECONCERN = (NUM_OF_SERVERS / 2) + 1;
@@ -104,7 +104,7 @@ public class Test {
             System.out.println("All transactions sent.");
             System.out.println("All transactions sent.");
             try {
-                Thread.sleep(50);
+                Thread.sleep(10);
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
