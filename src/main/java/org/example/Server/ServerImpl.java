@@ -134,7 +134,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 650; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 3000; // this is in seconds
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -146,7 +146,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 200), TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 1000), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
@@ -211,7 +211,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // initially we might want to set the write concerns costs as 1.0 but as the throughput is calculated they are adjusted
                 writeConcernCosts.put(i, 1.0);
                 writeConcernLatencies.put(i, new ArrayDeque<>());
-                writeConcernLatencySum.put(i, (long)0);
+                writeConcernLatencySum.put(i, (long) 0);
             }
         }
         // setting up the client stub
@@ -249,8 +249,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             // this is added to replicate network call behaviour
-            Thread.sleep(new Random().nextInt(30) + 10);
-//            Thread.sleep(10);
+            if (serverId == 1 || serverId == 2 || serverId == 3 || serverId == 4 || serverId == 5 || serverId == 6) {
+                Thread.sleep(40);
+            }
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
@@ -266,12 +267,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             // If the leader's term is outdated or log mismatch, respond with failure
-            if (leadersTerm < currentTerm.get() || !log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
+            if (leadersTerm < currentTerm.get()) {
                 responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
                 responseObserver.onCompleted();
                 return;
             }
+            // resetting the election timer of the follower
+            startTheElectionTimer();
 
+            if (!log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
+                responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get()).setIsSuccessFull(false).setFollowerId(serverId).build());
+                responseObserver.onCompleted();
+                return;
+            }
             // Proceed with appending the entries
             Log leadersEntries = appendEntriesArgument.getEntriesToAppend();
 
@@ -305,8 +313,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(log.get(i).t.getId(), true);
                 }
             }
-            // Reset the election timer as the leader is active
-            startTheElectionTimer();
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
             // Send success response
@@ -678,7 +684,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     public long getAverageLatency(int writeConcern) {
         synchronized (writeConcernLatency) {
-            return writeConcernLatencySum.get(writeConcern)/ Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
+            return writeConcernLatencySum.get(writeConcern) / Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
         }
     }
 
@@ -690,7 +696,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // inside lock
     private void recordThroughput(ConcurrentLinkedQueue<Long> queue, long timeStampOfTransaction, boolean addTimeStamp) {
-        while (!queue.isEmpty() && timeStampOfTransaction - queue.peek() >= 1000L) {
+        while (!queue.isEmpty() && timeStampOfTransaction - queue.peek() >= 5000L) {
             queue.poll();
         }
         // during processing the batch we do not want to add the timestamp
@@ -935,7 +941,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // should be inside write lock
     private void becomeFollower() {
 
-        if (status != ServerCurrentStatus.FOLLOWER) {
+        if (status == ServerCurrentStatus.LEADER) {
             startTheElectionTimer();
         }
         // the status changes to follower
@@ -1138,11 +1144,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         HashMap<Integer, Long> averageLatency = new HashMap<>();
         synchronized (writeConcernLatency) {
             double minLatency = 1.0;
-            for(var entry : writeConcernLatencies.entrySet()) {
+            for (var entry : writeConcernLatencies.entrySet()) {
                 int wc = entry.getKey();
                 Long latency = getAverageLatency(wc);
                 minLatency = Math.max(latency, minLatency);
-                averageLatency.put(wc, Math.max(latency,1));
+                averageLatency.put(wc, Math.max(latency, 1));
             }
 
 
@@ -1153,7 +1159,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 Long lat = entry.getValue();
 
                 // 4) Map latency → integer cost: the slower you are, the more multiples of 'step' you consume
-                double tokenCost =  Math.ceil((double)lat / step);
+                double tokenCost = Math.ceil((double) lat / step);
                 tokenCost = Math.max(tokenCost, MIN_COST);
 
                 writeConcernCosts.put(wc, tokenCost);
@@ -1187,7 +1193,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             int n = currentBatch.size();
 
             // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
-            int transactionsToBeProcessedToMaintainThreshold = (int)((MIN_REQUIRED_THROUGHPUT + (MIN_REQUIRED_THROUGHPUT - currentTps)) / 1000) * BATCH_INTERVAL_MS;
+            int transactionsToBeProcessedToMaintainThreshold = (int) ((MIN_REQUIRED_THROUGHPUT + (MIN_REQUIRED_THROUGHPUT - currentTps)) / 1000) * BATCH_INTERVAL_MS;
             int minTransactions = backLog > 0 ? n : transactionsToBeProcessedToMaintainThreshold;
             // the optimal number of transactions we can process
             int minNumberOfTransactionsToBeProcessed = Math.min(minTransactions, n);
@@ -1389,7 +1395,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         synchronized (systemWideThroughput) {
             Long currentTimeStamp = System.currentTimeMillis();
             recordThroughput(ackTransactionsTimeStamps, currentTimeStamp, false);
-            return ackTransactionsTimeStamps.size();
+            return ackTransactionsTimeStamps.size() / 5;
         }
     }
 
