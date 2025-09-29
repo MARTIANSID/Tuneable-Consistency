@@ -5,6 +5,9 @@ import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -134,11 +137,48 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 3000; // this is in seconds
+    private static final int MIN_REQUIRED_THROUGHPUT = 100; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
 
+    public static final int MIN_COST = 1;
+    // it smoothnes noisy measurements like latency samples, we don't overreact to short-term spikes
+    private static final double ALPHA = 0.20;  // EWMA smoothing
+
+    // if we increase this then our system will become more sensitive to slow repliase, higher writeConcern's cost will rise faster
+    private static final double P95_WEIGHT = 0.30;
+
+    // we allow moderate fluctuations to be ignored
+    private static final double CHANGE_THRESH = 0.10;  // 10%
+
+    private static final double MAX_STEP_UP = 1.25;
+    private static final double MAX_STEP_DOWN = 0.80;
+
+    /*
+    If bucket is fully utilized (U ≈ 1), your factor becomes 1 + 0.5 * 1 = 1.5 → token costs are 50% higher.
+    If bucket is mostly idle (U ≈ 0), factor ≈ 1 → no extra penalty. This ensures high-cost WCs are penalized when system is busy.
+    */
+
+    private static final double UTIL_K = 0.50;  // utilization price slope
+
+    /*
+    If throughput is below target, all token costs increase proportionally → system throttles heavier WCs to preserve throughput.
+    If TPS ≥ target, factor = 1 → no penalty.
+     */
+    private static final double TPS_K = 0.50;  // throughput price slope
+
+    private static final long MIN_UPDATE_PERIOD_MS = 2000;  // pacing
+    private final Map<Integer, Double> ewmaLatency = new ConcurrentHashMap<>();
+    private final Map<Integer, Long> lastUpdateAt = new ConcurrentHashMap<>();
+
+    private static final double L_HEALTHY_MS = 30.0;   // healthy latency
+    private static final double L_BAD_MS = 100.0;  // bad latency
+    private static final double CONVEX_P = 2.0;    // convexity exponent (>1)
+
+    private static final double HEALTHY_TPS_HEADROOM = 1.30;   // allow 30% above TPS_min at healthy latency
+    private static final double TPS_EPSILON = 0.20;   // allow up to +20% over TPS_min budget
+    private static final double BUCKET_FRACTION_MAX = 0.20;   // max 6% of bucket per request
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -249,9 +289,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             // this is added to replicate network call behaviour
-            if (serverId == 1 || serverId == 2 || serverId == 3 || serverId == 4 || serverId == 5 || serverId == 6) {
-                Thread.sleep(40);
-            }
+//            if (serverId == 1 || serverId == 2 || serverId == 3 || serverId == 4 || serverId == 5 || serverId == 6) {
+//                Thread.sleep(40);
+//            }
+            Thread.sleep(new Random().nextInt(10) + 5);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
@@ -319,7 +360,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
             responseObserver.onCompleted();
 
-        } catch (InterruptedException e) {
+        } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
             lock.writeLock().unlock();
@@ -684,7 +725,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     public long getAverageLatency(int writeConcern) {
         synchronized (writeConcernLatency) {
-            return writeConcernLatencySum.get(writeConcern) / Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
+            long val = writeConcernLatencySum.get(writeConcern) / Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
+            try (FileWriter fw = new FileWriter("avg_latencies.csv", true);
+                 PrintWriter out = new PrintWriter(fw)) {
+                out.printf("%d,%d%n", writeConcern, val);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            return val;
         }
     }
 
@@ -1136,40 +1184,167 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        }
 //    }
 
-    private void adjustTokenCostsBasedOnLatency() {
-        final int MIN_COST = 1;
-        final double STEP_FACTOR = 0.3;  // half the fastest-latency
+//    private void adjustTokenCostsBasedOnLatency() {
+//        final int MIN_COST = 1;
+//        final double STEP_FACTOR = 0.3;  // half the fastest-latency
+//
+//        // 1) Build per-WC average from your history buffers
+//        HashMap<Integer, Long> averageLatency = new HashMap<>();
+//        synchronized (writeConcernLatency) {
+//            double minLatency = 1.0;
+//            for (var entry : writeConcernLatencies.entrySet()) {
+//                int wc = entry.getKey();
+//                Long latency = getAverageLatency(wc);
+//                minLatency = Math.max(latency, minLatency);
+//                averageLatency.put(wc, Math.max(latency, 1));
+//            }
+//
+//
+//            double step = minLatency * STEP_FACTOR;
+//
+//            try (FileWriter csvWriter = new FileWriter("token_costs.csv", true)) {
+//                for (var entry : averageLatency.entrySet()) {
+//                    int wc = entry.getKey();
+//                    Long lat = entry.getValue();
+//
+//                    double tokenCost = Math.ceil((double) lat / step);
+//                    tokenCost = Math.max(tokenCost, MIN_COST);
+//
+//                    writeConcernCosts.put(wc, tokenCost);
+//
+//                    // Print to console
+//                    System.out.printf(
+//                            "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%.1f%n",
+//                            wc, lat, step, tokenCost
+//                    );
+//
+//                    // Append WC, Latency, TokenCost to CSV
+//                    csvWriter.write(String.format("%d,%d,%.1f%n", wc, lat, tokenCost));
+//                }
+//
+//                csvWriter.flush();
+//            } catch (IOException e) {
+//                e.printStackTrace();
+//            }
+//        }
+//
+//    }
 
-        // 1) Build per-WC average from your history buffers
-        HashMap<Integer, Long> averageLatency = new HashMap<>();
-        synchronized (writeConcernLatency) {
-            double minLatency = 1.0;
-            for (var entry : writeConcernLatencies.entrySet()) {
-                int wc = entry.getKey();
-                Long latency = getAverageLatency(wc);
-                minLatency = Math.max(latency, minLatency);
-                averageLatency.put(wc, Math.max(latency, 1));
-            }
+    // Blended latency (P50/P95)
+    // Blended latency (P50/P95); provide your own window source
+    private double blendedLatencyForWC(int wc) {
+        Deque<Latency> latencies = writeConcernLatencies.get(wc);
+        if (latencies == null || latencies.isEmpty()) return 1.0;
+        List<Long> vals = new ArrayList<>(latencies.size());
+        for (Latency l : latencies) vals.add(l.latency);
+        Collections.sort(vals);
+        int n = vals.size();
+        long p50 = vals.get(Math.max(0, (int) Math.floor(0.50 * (n - 1))));
+        long p95 = vals.get(Math.max(0, (int) Math.floor(0.95 * (n - 1))));
+        return (1.0 - P95_WEIGHT) * p50 + P95_WEIGHT * p95; // ms
+    }
 
+    // Map a smoothed latency to an integer cost via convex anchor curve and guardrails
+    private int latencyToCost(double ewmaMs) {
+        double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
 
-            double step = minLatency * STEP_FACTOR;
+        // Anchor costs
+        double costHealthy = (tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM));
+        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
 
-            for (var entry : averageLatency.entrySet()) {
-                int wc = entry.getKey();
-                Long lat = entry.getValue();
-
-                // 4) Map latency → integer cost: the slower you are, the more multiples of 'step' you consume
-                double tokenCost = Math.ceil((double) lat / step);
-                tokenCost = Math.max(tokenCost, MIN_COST);
-
-                writeConcernCosts.put(wc, tokenCost);
-                System.out.printf(
-                        "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%.1f%n",
-                        wc, lat, step, tokenCost
-                );
-            }
+        // Sub-healthy convex taper to 1
+        double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);  // ultra-fast bound
+        if (ewmaMs <= L_HEALTHY_MS) {
+            double denom = Math.max(1e-9, L_HEALTHY_MS - Lmin);
+            double z = (ewmaMs - Lmin) / denom;            // could be <0
+            z = Math.max(0.0, Math.min(1.0, z));           // clamp 0..1
+            double y = 1.0 * (1.0 - Math.pow(z, CONVEX_P))
+                    + costHealthy * Math.pow(z, CONVEX_P);
+            int proposed = Math.max(MIN_COST, (int) Math.ceil(y));
+            return proposed;
         }
 
+        // Healthy..Bad convex increase with same exponent
+        double x;
+        if (ewmaMs >= L_BAD_MS) x = 1.0;
+        else x = (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS - L_HEALTHY_MS);
+
+        double blendedCost = costHealthy * (1.0 - Math.pow(x, CONVEX_P))
+                + costBad * Math.pow(x, CONVEX_P);
+
+        int proposedInt = Math.max(MIN_COST, (int) Math.ceil(blendedCost));
+        return proposedInt;
+    }
+
+    // Main adjustment; currentTps provided by caller's sliding window
+    private void adjustTokenCostsBasedOnLatency(double currentTps) {
+        long now = System.currentTimeMillis();
+
+        synchronized (writeConcernLatency) {
+            Long lastAny = lastUpdateAt.values().stream().findAny().orElse(0L);
+            if (now - lastAny < MIN_UPDATE_PERIOD_MS) return;
+
+            // 1) Smoothed latencies and min (for observability; curve uses anchors)
+            Map<Integer, Double> smoothed = new HashMap<>();
+            double minSmoothed = Double.POSITIVE_INFINITY;
+
+            for (var e : writeConcernLatencies.entrySet()) {
+                int wc = e.getKey();
+                double blended = Math.max(1.0, blendedLatencyForWC(wc));
+                double prev = ewmaLatency.getOrDefault(wc, blended);
+                double ewma = ALPHA * blended + (1.0 - ALPHA) * prev;
+                ewmaLatency.put(wc, ewma);
+                smoothed.put(wc, ewma);
+                if (ewma < minSmoothed) minSmoothed = ewma;
+            }
+            if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0) minSmoothed = 1.0;
+
+            // 2) Compute proposed integer cost per WC via convex anchor mapping
+            try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
+                for (var e : smoothed.entrySet()) {
+                    int wc = e.getKey();
+                    double ewmaMs = e.getValue();
+
+                    int oldCost = (int) Math.ceil(writeConcernCosts.getOrDefault(wc, (double) MIN_COST));
+                    int proposedInt = latencyToCost(ewmaMs);
+
+                    // Hysteresis on integer scale
+                    double relDelta = Math.abs(proposedInt - oldCost) / Math.max(1.0, oldCost);
+                    System.out.println(writeConcernCosts);
+                    if (relDelta < CHANGE_THRESH) {
+
+                        lastUpdateAt.put(wc, now);
+                        continue;
+                    }
+                    // Per-interval step caps
+                    int maxUp = (int) Math.ceil(oldCost * MAX_STEP_UP);
+                    int maxDown = (int) Math.floor(oldCost * MAX_STEP_DOWN);
+                    int cappedInt = proposedInt;
+                    if (proposedInt > oldCost) {
+                        cappedInt = Math.min(proposedInt, Math.max(oldCost + 1, maxUp));
+                    } else if (proposedInt < oldCost) {
+                        cappedInt = Math.max(proposedInt, Math.min(oldCost - 1, maxDown));
+                    }
+
+                    writeConcernCosts.put(wc, (double) cappedInt);
+
+                    System.out.printf(
+                            "[Cost Adjust] WC=%d | ewma=%.1fms [min=%.1f] → old=%d proposed=%d new=%d",
+                            wc, ewmaMs, minSmoothed, oldCost, proposedInt, cappedInt
+                    );
+
+                    csv.write(String.format(
+                            "%d,%.1f,%.1f,%d,%d,%d,%d%n",
+                            wc, ewmaMs, minSmoothed, oldCost, proposedInt, cappedInt, now
+                    ));
+
+                    lastUpdateAt.put(wc, now);
+                }
+                csv.flush();
+            } catch (IOException ex) {
+                ex.printStackTrace();
+            }
+        }
     }
 
 
@@ -1180,9 +1355,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // for testing
 //            printAllWriteConernsThroughputAndLatencies();
-            adjustTokenCostsBasedOnLatency();
             // current metrics
             double currentTps = getSystemWideThroughput();
+            adjustTokenCostsBasedOnLatency(currentTps);
             TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
             double currentTokens = tb.getTokenCount();
             long lastUpdate = tb.getLastUpdateTime();
@@ -1219,6 +1394,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     result.tokensUsed,
                     result.transactionsUpgraded
             );
+            try (FileWriter fw = new FileWriter("tps.csv", true);
+                 PrintWriter out = new PrintWriter(fw)) {
+                // CSV header (only needed once, skip if file exists)
+                // out.println("TPS");
+                out.printf("%.2f%n", currentTps);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
             return result.messages;
         } finally {
             redisLock.writeLock().unlock();
