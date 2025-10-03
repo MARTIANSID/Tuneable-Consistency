@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS =  9;
+    public static final int NUM_OF_SERVERS =  5;
 
     public static void main(String[] args) throws IOException{
         List<Server> servers = new ArrayList<>();
@@ -30,35 +30,22 @@ public class Servers{
                     .build()
                     .start();
             System.out.println("Server" + (i + 1) + " started on port " + port);
+            serverImpl.setUpStubs();
             servers.add(server);
             serversImpl.add(serverImpl);
         }
         for (int i = 0; i < servers.size(); i++) {
             final int index = i;
             Server server = servers.get(i);
-            ServerImpl serverImpl = serversImpl.get(i);
-
-            new Thread(() -> {
                 try {
-                    serverImpl.setUpStubs();
                     server.awaitTermination();
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                     Thread.currentThread().interrupt();
                 }
-            }).start();
         }
     }
 }
-
-//nextIndex = [4,4,4]
-//        matchIndex = [f3, 4, f2, ]
-//f1 - [1,2, 3, 4]
-//f2 - [1,2,3,4]
-//f3 - [1,2, 3 , 4]
-////l1  - [1,2,3,4]
-//commitindex  = 2
-
 
 
 
