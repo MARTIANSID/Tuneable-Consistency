@@ -138,12 +138,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     public int backLog;
 
+    BatchProcessor transactionBatchProcessor;
+
+    // For tracking incoming transactions per second
+    private ConcurrentLinkedQueue<Long> incomingTransactionTimestamps;
+    private final Object incomingTransactionLock;
+    private AtomicLong lastPrintTime;
+
     // all the parameters for knapsack
     private static final int BATCH_INTERVAL_MS = 80;
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 200; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 600; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -240,6 +247,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.backLog = 0;
+        this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS, scale, writeConcernCosts);
+        // Initialize incoming transaction tracking
+        this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
+        this.incomingTransactionLock = new Object();
+        this.lastPrintTime = new AtomicLong(System.currentTimeMillis());
         this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
         this.causalReadScheduler = Executors.newScheduledThreadPool(1);
         this.lastHeartBeatSent = new long[NUM_OF_SERVERS];
@@ -480,8 +492,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return;
         }
         // I send the ack back, to resolve the above blocking call immediately once the message is received
+        
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
+        
+        // Track incoming transaction rate
+        trackIncomingTransaction();
+        
         // here I add the transactions in batch
         batchLock.lock();
         try {
@@ -489,6 +506,36 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //            System.out.println(batchOfTransactions.size() + "This is the batchSize at the leader end");
         } finally {
             batchLock.unlock();
+        }
+    }
+
+    /**
+     * Tracks incoming transactions and prints the rate per second
+     */
+    private void trackIncomingTransaction() {
+        long currentTime = System.currentTimeMillis();
+        
+        synchronized (incomingTransactionLock) {
+            // Add current transaction timestamp
+            incomingTransactionTimestamps.add(currentTime);
+            
+            // Remove timestamps older than 1 second
+            while (!incomingTransactionTimestamps.isEmpty() && 
+                   currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
+                incomingTransactionTimestamps.poll();
+            }
+            
+            // Print every second (with a small buffer to avoid too frequent prints)
+            long lastPrint = lastPrintTime.get();
+            if (currentTime - lastPrint >= 1000L && lastPrintTime.compareAndSet(lastPrint, currentTime)) {
+                int incomingTPS = incomingTransactionTimestamps.size();
+                System.out.printf(
+                    "📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n",
+                    serverId,
+                    incomingTPS,
+                    new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime))
+                );
+            }
         }
     }
 
@@ -1037,55 +1084,55 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
 
-//        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
-          List<ClientMessage> transactionsToExecute = new ArrayList<>(currentBatch);
-          double tps = getSystemWideThroughput();
-          System.out.println("current tps --" + tps);
-            try (FileWriter fw = new FileWriter("throughput.csv", true);
-                 PrintWriter out = new PrintWriter(fw)) {
+        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
+        //   List<ClientMessage> transactionsToExecute = new ArrayList<>(currentBatch);
+        double tps = getSystemWideThroughput();
+        System.out.println("current tps --" + tps);
+        try (FileWriter fw = new FileWriter("throughput.csv", true);
+                PrintWriter out = new PrintWriter(fw)) {
 
-                File file = new File("throughput.csv");
-                if (file.length() == 0) {
-                    out.println("Throughput");
-                }
-                out.printf("%d%n", (int)tps);
-            } catch (IOException e) {
-                System.out.println("Error here!!!");
-                e.printStackTrace();
+            File file = new File("throughput.csv");
+            if (file.length() == 0) {
+                out.println("Throughput");
             }
+            out.printf("%d%n", (int)tps);
+        } catch (IOException e) {
+            System.out.println("Error here!!!");
+            e.printStackTrace();
+        }
         // we need add back the transactions which we were not able to execute
 
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
         // we can add parallelize this stream if needed
-//        Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
-//                .map(cm -> cm.getT().getId())
-//                .collect(Collectors.toSet());
+       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+               .map(cm -> cm.getT().getId())
+               .collect(Collectors.toSet());
 
         // adding back it in the queue
-//        batchLock.lock();
-//        try {
-//            for (ClientMessage clientMessage : currentBatch) {
-//                if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-//                    batchOfTransactions.add(clientMessage);
-//                }
-//            }
-//            backLog = batchOfTransactions.size();
-//            try (FileWriter fw = new FileWriter("backlog.csv", true);
-//                 PrintWriter out = new PrintWriter(fw)) {
-//
-//                File file = new File("backlog.csv");
-//                if (file.length() == 0) {
-//                    out.println("Backlog");
-//                }
-//                out.printf("%d%n", backLog);
-//            } catch (IOException e) {
-//                e.printStackTrace();
-//            }
-//            System.out.println("The backlog is--" + backLog);
-//        } finally {
-//            batchLock.unlock();
-//        }
+       batchLock.lock();
+       try {
+           for (ClientMessage clientMessage : currentBatch) {
+               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+                   batchOfTransactions.add(clientMessage);
+               }
+           }
+           backLog = batchOfTransactions.size();
+           try (FileWriter fw = new FileWriter("backlog.csv", true);
+                PrintWriter out = new PrintWriter(fw)) {
+
+               File file = new File("backlog.csv");
+               if (file.length() == 0) {
+                   out.println("Backlog");
+               }
+               out.printf("%d%n", backLog);
+           } catch (IOException e) {
+               e.printStackTrace();
+           }
+           System.out.println("The backlog is--" + backLog);
+       } finally {
+           batchLock.unlock();
+       }
 
         // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
@@ -1424,7 +1471,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             long lastUpdate = tb.getLastUpdateTime();
 
             // see if the current throughput is lesser than what is required, if it is then we do not want to upgrade any transaction
-            boolean throughputLowOrBackLog = currentTps < MIN_REQUIRED_THROUGHPUT || backLog > 0;
+            // boolean throughputLowOrBackLog = currentTps < MIN_REQUIRED_THROUGHPUT || backLog > 0;  // No longer needed with hybrid approach
 
             int n = currentBatch.size();
 
@@ -1439,11 +1486,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             ProcessResult result;
 
-            if (throughputLowOrBackLog) {
-                result = processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
-            } else {
-                result = processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
-            }
+            // Using the new hybrid approach: process all transactions first, then upgrade for profit
+            result = transactionBatchProcessor.processForThroughputThenProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, currentTps>=MIN_REQUIRED_THROUGHPUT);
+            
+            // Old approach (commented out):
+            // if (throughputLowOrBackLog) {
+            //     result = transactionBatchProcessor.processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
+            // } else {
+            //     result = transactionBatchProcessor.processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
+            // }
+            
             // updating the token count here (updating in redis)
             // tokensUsed are already scaled down
             tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
@@ -1479,170 +1531,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             redisLock.writeLock().unlock();
         }
-    }
-
-    // use this when throughput is lower than expected
-    private ProcessResult processForThroughput(List<TransactionOption> transactions, double currentTokens, int minTransactions) {
-        // n*log(n)
-        Collections.sort(transactions, (a, b) -> {
-            // if consistency is same select transaction with higher profit
-            if (a.minRequiredConsistency == b.minRequiredConsistency) return Double.compare(b.baseProfit, a.baseProfit);
-
-            // select the lower consistency transaction
-            return (a.minRequiredConsistency - b.minRequiredConsistency);
-        });
-
-        List<ClientMessage> selected = new ArrayList<>();
-
-        double usedTokens = 0.0, profit = 0;
-
-        int index = 0;
-
-        for (TransactionOption t : transactions) {
-            int minConsistencyOfTransaction = t.minRequiredConsistency;
-            double profitForMinConsistency = t.baseProfit, tokenCostOfTransaction = tokenCost(minConsistencyOfTransaction);
-
-            if (Double.compare(tokenCostOfTransaction + usedTokens, currentTokens * scale) <= 0) {
-                usedTokens += tokenCostOfTransaction;
-                ClientMessage.Builder cmBuilder = t.clientMessage.toBuilder();
-                // I update the writeConcern of the transaction
-                cmBuilder.setWriteConcern(minConsistencyOfTransaction);
-
-                profit += profitForMinConsistency;
-                selected.add(cmBuilder.build());
-                // added this because we do not want the current batch to consume all the tokens, we want to get the required throughput
-                // we might want to process more transactions if lets say more w:1 are left?? because w:1 is pretty cheap we can use some tokens for it
-                if (selected.size() >= minTransactions && (index + 1) < transactions.size() && transactions.get(index + 1).minRequiredConsistency != 1)
-                    return new ProcessResult(selected, (usedTokens / scale), profit, 0);
-            } else {
-                // we break here because now the token cost will increase because consistency levels are only going to increase
-                break;
-            }
-            index++;
-        }
-        // here no transactions are upgraded so I simply pass 0
-        return new ProcessResult(selected, usedTokens / scale, profit, 0);
-    }
-
-
-    // all the token costs are stored in a map, we use scale to convert them into integer, as we can't store double in DP
-    private double tokenCost(int consistency) {
-        return Math.ceil(writeConcernCosts.getOrDefault(consistency, 0.0));
-    }
-
-    // use this when throughput is higher or equal to of the expected value
-    private ProcessResult processForProfit(List<TransactionOption> transactions, double currentTokens, int minTransactions) {
-        int n = transactions.size();
-        int maxTokens = (int) Math.ceil(currentTokens * scale);
-        int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
-
-        class State {
-            double profit;
-            int count;
-            int prevT;
-            int consistency;
-            boolean taken;
-
-            State(double profit, int count, int prevT, int consistency, boolean taken) {
-                this.profit = profit;
-                this.count = count;
-                this.prevT = prevT;
-                this.consistency = consistency;
-                this.taken = taken;
-            }
-        }
-
-        // **** we can reduce the complexity of this DP by tuning the batch timing ****
-        // complexity of this is (no of transaction in the batch) * (max tokens allowed)
-
-        State[][] dp = new State[n + 1][maxTokens + 1];
-        dp[0][0] = new State(0, 0, -1, 0, false);
-
-        int maxExecutedTransactions = 0;
-
-        for (int i = 0; i < n; i++) {
-            TransactionOption tx = transactions.get(i);
-
-            for (int t = 0; t <= maxTokens; t++) {
-                if (dp[i][t] == null) continue;
-
-                // this the case where we skip the transaction
-                if (dp[i + 1][t] == null || dp[i + 1][t].profit < dp[i][t].profit) {
-                    dp[i + 1][t] = new State(dp[i][t].profit, dp[i][t].count, t, 0, false);
-                }
-
-                // we try all possible writeConcern
-                for (int wc : writeConcernCosts.keySet()) {
-                    int cost = (int) tokenCost(wc);
-
-                    if (wc < tx.minRequiredConsistency) continue;
-
-                    double profit = tx.baseProfit;
-
-                    if (wc >= majorityLevel) {
-                        profit += tx.extraMajorityProfit;
-                    } else if (wc > tx.minRequiredConsistency) {
-                        profit += tx.extraIntermediateProfit * (wc - tx.minRequiredConsistency);
-                    }
-
-                    // obviously it should not exceed the maxTokens limit
-                    if (t + cost <= maxTokens) {
-                        int nt = t + cost;
-                        double newProfit = dp[i][t].profit + profit;
-                        int newCount = dp[i][t].count + 1;
-
-                        if (dp[i + 1][nt] == null || dp[i + 1][nt].profit < newProfit) {
-                            dp[i + 1][nt] = new State(newProfit, newCount, t, wc, true);
-                            // we calculate the max number of transactions we can execute
-                            maxExecutedTransactions = Math.max(maxExecutedTransactions, newCount);
-                        }
-                    }
-                }
-            }
-        }
-
-        double bestProfit = -1;
-        int bestT = -1, transactionsUpgraded = 0;
-
-        for (int t = 0; t <= maxTokens; t++) {
-            // we use Math.min because the minTransactions could be higher than the number of transactions that we can execute
-            if (dp[n][t] != null && dp[n][t].count >= Math.min(maxExecutedTransactions, minTransactions)) {
-                if (dp[n][t].profit > bestProfit) {
-                    bestProfit = dp[n][t].profit;
-                    bestT = t;
-                }
-            }
-        }
-
-        if (bestT == -1) return new ProcessResult(new ArrayList<>(), 0.0, bestProfit, 0);
-
-        List<ClientMessage> result = new ArrayList<>();
-        int t = bestT;
-
-        for (int i = n; i >= 1; i--) {
-            State s = dp[i][t];
-            if (s == null) break;
-
-            if (s.taken) {
-                TransactionOption tx = transactions.get(i - 1);
-                ClientMessage.Builder builder = tx.clientMessage.toBuilder();
-                // set the writeConcern for this particular transaction
-                builder.setWriteConcern(s.consistency);
-
-                // check if we have upgraded the consistency of this particular transaction
-                if (s.consistency > tx.minRequiredConsistency) {
-                    transactionsUpgraded++;
-                }
-                result.add(builder.build());
-            }
-            t = s.prevT;
-        }
-
-        Collections.reverse(result);
-        // token cost is scaled down
-        double tokensUsed = bestT / scale;
-
-        return new ProcessResult(result, tokensUsed, bestProfit, transactionsUpgraded);
     }
 
     // this gives me the current rolling throughput, at the time of ack I add the transactions timestamp

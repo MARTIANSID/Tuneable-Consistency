@@ -1,17 +1,20 @@
 package org.example.Client;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import org.ds.paxos.*;
-
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import org.ds.paxos.ClientMessage;
+import org.ds.paxos.RaftGrpc;
+import org.ds.paxos.Transaction;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+
 public class Test {
-    private static final int THREAD_COUNT = 7; // Number of parallel transactions
-    private static final int NUM_OF_SERVERS = 9;
+    private static final int THREAD_COUNT = 10; // Number of parallel transactions
+    private static final int NUM_OF_SERVERS = 5;
 
     private static int pickWeightedWriteConcern() {
         // 1) compute sum of weights
@@ -43,11 +46,11 @@ public class Test {
     }
 
     public static final double[] WC_WEIGHTS = new double[] {
-            1,  // weight for write-concern = 1
-            0.0,  // weight for write-concern = 2
-            0.0,  // weight for write-concern = 3
-            0.0,  // weight for write-concern = 4
-            0.0   // weight for write-concern = 5 (MAX_WRITECONCERN)
+            0.3,  // weight for write-concern = 1
+            0.3,  // weight for write-concern = 2
+            0.4,  // weight for write-concern = 3
+            // 0.2,  // weight for write-concern = 4
+            // 0.2   // weight for write-concern = 5 (MAX_WRITECONCERN)
     };
 
     static final int MAX_WRITECONCERN = (NUM_OF_SERVERS / 2) + 1;
