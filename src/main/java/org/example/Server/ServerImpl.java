@@ -247,7 +247,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.backLog = 0;
-        this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS, scale, writeConcernCosts);
+        this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
         // Initialize incoming transaction tracking
         this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
         this.incomingTransactionLock = new Object();
@@ -371,12 +371,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(log.get(i).t.getId(), true);
                 }
             }
-
             // current time of follower
             HybridClock.TimeStamp currentTimeOfFollower = hybridClock.now();
             // Send success response
             responseObserver.onNext(AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower)).build());
             responseObserver.onCompleted();
+
 
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -1085,23 +1085,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (currentBatch.isEmpty()) return;
 
         List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
-        //   List<ClientMessage> transactionsToExecute = new ArrayList<>(currentBatch);
-        double tps = getSystemWideThroughput();
-        System.out.println("current tps --" + tps);
-        try (FileWriter fw = new FileWriter("throughput.csv", true);
-                PrintWriter out = new PrintWriter(fw)) {
-
-            File file = new File("throughput.csv");
-            if (file.length() == 0) {
-                out.println("Throughput");
-            }
-            out.printf("%d%n", (int)tps);
-        } catch (IOException e) {
-            System.out.println("Error here!!!");
-            e.printStackTrace();
-        }
-        // we need add back the transactions which we were not able to execute
-
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
         // we can add parallelize this stream if needed
@@ -1112,12 +1095,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // adding back it in the queue
        batchLock.lock();
        try {
+           int initialSizeOfBatch = batchOfTransactions.size();
            for (ClientMessage clientMessage : currentBatch) {
                if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
                    batchOfTransactions.add(clientMessage);
                }
            }
-           backLog = batchOfTransactions.size();
+           backLog = Math.abs(initialSizeOfBatch - batchOfTransactions.size());
            try (FileWriter fw = new FileWriter("backlog.csv", true);
                 PrintWriter out = new PrintWriter(fw)) {
 
@@ -1314,20 +1298,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        }
 //
 //    }
-
-    // Blended latency (P50/P95)
-    // Blended latency (P50/P95); provide your own window source
     private double blendedLatencyForWC(int wc) {
-//        Deque<Latency> latencies = writeConcernLatencies.get(wc);
-//        if (latencies == null || latencies.isEmpty()) return 1.0;
-//        List<Long> vals = new ArrayList<>(latencies.size());
-//        for (Latency l : latencies) vals.add(l.latency);
-//        Collections.sort(vals);
-//        int n = vals.size();
-//        long p50 = vals.get(Math.max(0, (int) Math.floor(0.50 * (n - 1))));
-//        long p95 = vals.get(Math.max(0, (int) Math.floor(0.95 * (n - 1))));
-//        return (1.0 - P95_WEIGHT) * p50 + P95_WEIGHT * p95; // ms
-        // we can improve I mean instead of using average latency can use something better for sure
+        // it is a 1 second window based latency so it works well directly
         return getAverageLatency(wc);
     }
 
@@ -1338,7 +1310,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // Anchor costs
 //        double costHealthy = (tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM));
         double costHealthy = 2;
-        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
+//        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
+        double costBad = 2;
 
         // Sub-healthy convex taper to 1
         double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);  // ultra-fast bound
@@ -1386,6 +1359,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 if (ewma < minSmoothed) minSmoothed = ewma;
             }
             if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0) minSmoothed = 1.0;
+            System.out.println("Costs");
+            System.out.println(writeConcernCosts);
 
             // 2) Compute proposed integer cost per WC via convex anchor mapping
             try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
@@ -1398,8 +1373,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     // Hysteresis on integer scale
                     double relDelta = Math.abs(proposedInt - oldCost) / Math.max(1.0, oldCost);
-                    System.out.println(writeConcernCosts);
-                    System.out.println(smoothed);
                     try (FileWriter fw = new FileWriter("writeconcern.csv", true);
                          PrintWriter out = new PrintWriter(fw)) {
 
@@ -1419,7 +1392,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
 
                     if (relDelta < CHANGE_THRESH) {
-
                         lastUpdateAt.put(wc, now);
                         continue;
                     }
@@ -1434,11 +1406,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
 
                     writeConcernCosts.put(wc, (double) cappedInt);
-
-                    System.out.printf(
-                            "[Cost Adjust] WC=%d | ewma=%.1fms [min=%.1f] → old=%d proposed=%d new=%d",
-                            wc, ewmaMs, minSmoothed, oldCost, proposedInt, cappedInt
-                    );
 
                     csv.write(String.format(
                             "%d,%.1f,%.1f,%d,%d,%d,%d%n",
@@ -1460,26 +1427,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         redisLock.writeLock().lock();
         try {
 
-            // for testing
-//            printAllWriteConernsThroughputAndLatencies();
             // current metrics
             double currentTps = getSystemWideThroughput();
-
             adjustTokenCostsBasedOnLatency(currentTps);
             TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
             double currentTokens = tb.getTokenCount();
             long lastUpdate = tb.getLastUpdateTime();
 
-            // see if the current throughput is lesser than what is required, if it is then we do not want to upgrade any transaction
-            // boolean throughputLowOrBackLog = currentTps < MIN_REQUIRED_THROUGHPUT || backLog > 0;  // No longer needed with hybrid approach
-
             int n = currentBatch.size();
-
-            // this tells us the minimum number of transactions that we must process to maintain the throughput, we divide by 1000 as BATCH_INTERVAL_MS is in milli seconds
-            int transactionsToBeProcessedToMaintainThreshold = (int) ((MIN_REQUIRED_THROUGHPUT + (MIN_REQUIRED_THROUGHPUT - currentTps)) / 1000) * BATCH_INTERVAL_MS;
-            int minTransactions = backLog > 0 ? n : transactionsToBeProcessedToMaintainThreshold;
-            // the optimal number of transactions we can process
-            int minNumberOfTransactionsToBeProcessed = Math.min(minTransactions, n);
 
             // I convert the clientMessage protobuf object into java object, so that we can use java functions directly on it
             List<TransactionOption> currentBatchInTransactionOption = TransactionOption.convertToTransactionOption(currentBatch);
@@ -1487,17 +1442,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             ProcessResult result;
 
             // Using the new hybrid approach: process all transactions first, then upgrade for profit
-            result = transactionBatchProcessor.processForThroughputThenProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed, currentTps>=MIN_REQUIRED_THROUGHPUT);
-            
-            // Old approach (commented out):
-            // if (throughputLowOrBackLog) {
-            //     result = transactionBatchProcessor.processForThroughput(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
-            // } else {
-            //     result = transactionBatchProcessor.processForProfit(currentBatchInTransactionOption, currentTokens, minNumberOfTransactionsToBeProcessed);
-            // }
-            
+            result = transactionBatchProcessor.processForThroughputThenProfit(currentBatchInTransactionOption, currentTokens, (currentTps>=MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
+
             // updating the token count here (updating in redis)
-            // tokensUsed are already scaled down
             tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
             System.out.printf(
                     "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n",
@@ -1515,7 +1462,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 if (file.length() == 0) {
                     out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
-
                 // Write data row
                 out.printf("%.2f,%.2f,%.2f,%.2f,%d%n",
                         result.profit,
