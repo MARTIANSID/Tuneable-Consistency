@@ -13,6 +13,8 @@ public class TokenBucketImpl {
 
     // this key holds the timestamp at which the tokens were updated during the last usage
     private static final String LAST_UPDATE_KEY = "last_update_time";
+    private static final String CURRENT_TERM_KEY = "current_term";
+
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
     private static final double MAX_TOKENS = 1000;
@@ -29,11 +31,17 @@ public class TokenBucketImpl {
     private TokenBucketData getTokenBucketData() {
         String tokenCountStr = masterJedis.get(TOKEN_BUCKET_KEY);
         String lastUpdateTimeStr = masterJedis.get(LAST_UPDATE_KEY);
+        String currentTermStr = masterJedis.get(CURRENT_TERM_KEY);
         // if tokenCount is null then we will treat the bucket as full
         double tokenCount = (tokenCountStr == null) ? MAX_TOKENS : Double.parseDouble(tokenCountStr);
         // if lastUpdateTime is null I set it to -1
         long lastUpdateTime = (lastUpdateTimeStr == null) ? -1 : Long.parseLong(lastUpdateTimeStr);
-        return new TokenBucketData(tokenCount, lastUpdateTime);
+        int currentTerm = 0;
+        if(currentTermStr != null) {
+            currentTerm = Integer.parseInt(currentTermStr);
+        }
+
+        return new TokenBucketData(tokenCount, lastUpdateTime, currentTerm);
     }
 
     // this should be atleast in read lock
@@ -41,6 +49,7 @@ public class TokenBucketImpl {
         TokenBucketData data = getTokenBucketData();
         double tokenCount = data.getTokenCount();
         long lastUpdateTime = data.getLastUpdateTime();
+        int currentTerm = data.getCurrentTerm();
 
         // Calculate the elapsed time in nanoseconds
         long currentTime = System.nanoTime();
@@ -59,7 +68,7 @@ public class TokenBucketImpl {
         if (newTokenCount > MAX_TOKENS) {
             newTokenCount = MAX_TOKENS;
         }
-        return new TokenBucketData(newTokenCount, currentTime);
+        return new TokenBucketData(newTokenCount, currentTime, currentTerm);
     }
 
     // Update the redis master with new token count and last update time
@@ -83,13 +92,16 @@ public class TokenBucketImpl {
         return REFILL_RATE;
     }
 
+
     public static class TokenBucketData {
         private double tokenCount;
         private long lastUpdateTime;
+        private int currentTerm;
 
-        public TokenBucketData(double tokenCount, long lastUpdateTime) {
+        public TokenBucketData(double tokenCount, long lastUpdateTime, int currentTerm) {
             this.tokenCount = tokenCount;
             this.lastUpdateTime = lastUpdateTime;
+            this.currentTerm = currentTerm;
         }
 
         public double getTokenCount() {
@@ -98,6 +110,9 @@ public class TokenBucketImpl {
 
         public long getLastUpdateTime() {
             return lastUpdateTime;
+        }
+        public int getCurrentTerm() {
+            return currentTerm;
         }
     }
 

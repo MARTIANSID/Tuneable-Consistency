@@ -1134,6 +1134,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here append all these transactions in the raft log
         lock.writeLock().lock();
         try {
+            if(status != ServerCurrentStatus.LEADER) return;
 
             for (ClientMessage clientMessage : transactionsToExecute) {
                 int index = log.size();
