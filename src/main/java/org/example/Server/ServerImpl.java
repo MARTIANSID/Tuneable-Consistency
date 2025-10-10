@@ -189,12 +189,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final Map<Integer, Long> lastUpdateAt = new ConcurrentHashMap<>();
 
     private static final double L_HEALTHY_MS = 30.0;   // healthy latency
-    private static final double L_BAD_MS = 100.0;  // bad latency
+    private static final double L_BAD_MS = 1000.0;  // bad latency
     private static final double CONVEX_P = 2.0;    // convexity exponent (>1)
 
     private static final double HEALTHY_TPS_HEADROOM = 1.30;   // allow 30% above TPS_min at healthy latency
     private static final double TPS_EPSILON = 0.20;   // allow up to +20% over TPS_min budget
-    private static final double BUCKET_FRACTION_MAX = 0.20;   // max 6% of bucket per request
+    private static final double BUCKET_FRACTION_MAX = 0.95;   // max 6% of bucket per request
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -311,8 +311,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
-            if(serverId == 1 || serverId == 2 || serverId == 3){
-                Thread.sleep(50);
+            if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 + NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) % NUM_OF_SERVERS){
+                if(log.size() >= 100000 && log.size() < 130000) {
+                    Thread.sleep(60);
+                }
             }
             // this is added to replicate network call behaviour
 //            Thread.sleep(new Random().nextInt(10) + 5);
@@ -1090,47 +1092,67 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
+        List<ClientMessage> transactionsToExecute = new ArrayList<>(currentBatch);
+        double currentTps = getSystemWideThroughput();
+        System.out.println(currentTps);
+        adjustTokenCostsBasedOnLatency(currentTps);
 
-        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
+        try (FileWriter fw = new FileWriter("tps.csv", true);
+             PrintWriter out = new PrintWriter(fw)) {
+
+            // Write header only if file is empty
+            File file = new File("tps.csv");
+            if (file.length() == 0) {
+                out.println("CurrentTPS");
+            }
+            // Write data row
+            out.printf("%.2f%n",
+                    currentTps);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+//        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
-        // we can add parallelize this stream if needed
-       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
-               .map(cm -> cm.getT().getId())
-               .collect(Collectors.toSet());
+//        // we can add parallelize this stream if needed
+//       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+//               .map(cm -> cm.getT().getId())
+//               .collect(Collectors.toSet());
 
-        // adding back it in the queue
-       batchLock.lock();
-       try {
-           for (ClientMessage clientMessage : currentBatch) {
-               String transactionId = clientMessage.getT().getId();
-               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-                   backLogTransactions.add(transactionId);
-                   batchOfTransactions.add(clientMessage);
-               } else {
-                   // it can be executed
-                   backLogTransactions.remove(transactionId);
-               }
-           }
-           backLog = backLogTransactions.size();
-           try (FileWriter fw = new FileWriter("backlog.csv", true);
-                PrintWriter out = new PrintWriter(fw)) {
-
-               File file = new File("backlog.csv");
-               if (file.length() == 0) {
-                   out.println("Backlog");
-               }
-               out.printf("%d%n", backLog);
-           } catch (IOException e) {
-               e.printStackTrace();
-           }
-           System.out.println("The backlog is--" + backLog);
-       } finally {
-           batchLock.unlock();
-       }
-
-        // this list is used to ack transactions with w:1
+//        // adding back it in the queue
+//       batchLock.lock();
+//       try {
+//           for (ClientMessage clientMessage : currentBatch) {
+//               String transactionId = clientMessage.getT().getId();
+//               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+//                   backLogTransactions.add(transactionId);
+//                   batchOfTransactions.add(clientMessage);
+//               } else {
+//                   // it can be executed
+//                   backLogTransactions.remove(transactionId);
+//               }
+//           }
+//           backLog = backLogTransactions.size();
+//           try (FileWriter fw = new FileWriter("backlog.csv", true);
+//                PrintWriter out = new PrintWriter(fw)) {
+//
+//               File file = new File("backlog.csv");
+//               if (file.length() == 0) {
+//                   out.println("Backlog");
+//               }
+//               out.printf("%d%n", backLog);
+//           } catch (IOException e) {
+//               e.printStackTrace();
+//           }
+//           System.out.println("The backlog is--" + backLog);
+//       } finally {
+//           batchLock.unlock();
+//       }
+////
+//        // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
+
         // here append all these transactions in the raft log
         lock.writeLock().lock();
         try {

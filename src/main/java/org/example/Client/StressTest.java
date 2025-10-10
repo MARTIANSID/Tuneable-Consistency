@@ -20,8 +20,8 @@ public class StressTest {
         int majority = (numServers / 2) + 1;
         simulator.addPhase(new WorkloadSimulator.Phase(
                 "MaxThroughput",
-                65,         // duration in seconds
-                200,       // target TPS (adjust as needed)
+                70,         // duration in seconds
+                20000,       // target TPS (adjust as needed)
                 0.0,        // no jitter
                 mapOf(1,0.4,2,0.3,majority, 0.3), // 100% transactions at writeConcern=majority
                 0.0, 0.0   // no extra profit needed for stress test
