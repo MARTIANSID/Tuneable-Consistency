@@ -46,9 +46,9 @@ public class Test {
     }
 
     public static final double[] WC_WEIGHTS = new double[] {
-            0.3,  // weight for write-concern = 1
-            0.3,  // weight for write-concern = 2
-            0.4,  // weight for write-concern = 3
+            0.5,  // weight for write-concern = 1
+            0.4,  // weight for write-concern = 2
+            0.1,  // weight for write-concern = 3
             // 0.2,  // weight for write-concern = 4
             // 0.2   // weight for write-concern = 5 (MAX_WRITECONCERN)
     };

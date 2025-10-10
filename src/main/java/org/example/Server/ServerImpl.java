@@ -136,7 +136,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     long[] lastHeartBeatSent;
     long[] lastIndexSent;
 
-    public int backLog;
 
     BatchProcessor transactionBatchProcessor;
 
@@ -145,12 +144,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final Object incomingTransactionLock;
     private AtomicLong lastPrintTime;
 
+    //  backlog transactions
+    HashSet<String> backLogTransactions;
+
+
     // all the parameters for knapsack
     private static final int BATCH_INTERVAL_MS = 80;
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 600; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 350; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -246,7 +249,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencies = new ConcurrentHashMap<>();
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
-        this.backLog = 0;
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
         // Initialize incoming transaction tracking
         this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
@@ -256,6 +258,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.causalReadScheduler = Executors.newScheduledThreadPool(1);
         this.lastHeartBeatSent = new long[NUM_OF_SERVERS];
         this.lastIndexSent = new long[NUM_OF_SERVERS];
+        this.backLogTransactions = new HashSet<>();
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
@@ -308,6 +311,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
+            if(serverId == 1 || serverId == 2 || serverId == 3){
+                Thread.sleep(50);
+            }
             // this is added to replicate network call behaviour
 //            Thread.sleep(new Random().nextInt(10) + 5);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
@@ -900,7 +906,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         for (int i = Math.max(commitIndex.get() + 1, prevMatchIndexOfFollower + 1); i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
-            if (ackSent.containsKey(id) && !ackSent.get(id)) {
+            if (log.get(i).writeConcern != 0) {
 //                System.out.println("This follower --" + idOfFollower + "is updating the writeConcern of" + log.get(i).t);
                 // updateWriteConcern handles all the necessary conditions so that the same node does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower);
@@ -1072,11 +1078,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here the logic to process the current batch of transaction will come
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
-
+        int backLog = 0;
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
             batchOfTransactions.clear();
+            backLog = backLogTransactions.size();
         } finally {
             batchLock.unlock();
         }
@@ -1084,7 +1091,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
 
-        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch);
+        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
         // we can add parallelize this stream if needed
@@ -1095,13 +1102,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // adding back it in the queue
        batchLock.lock();
        try {
-           int initialSizeOfBatch = batchOfTransactions.size();
            for (ClientMessage clientMessage : currentBatch) {
+               String transactionId = clientMessage.getT().getId();
                if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+                   backLogTransactions.add(transactionId);
                    batchOfTransactions.add(clientMessage);
+               } else {
+                   // it can be executed
+                   backLogTransactions.remove(transactionId);
                }
            }
-           backLog = Math.abs(initialSizeOfBatch - batchOfTransactions.size());
+           backLog = backLogTransactions.size();
            try (FileWriter fw = new FileWriter("backlog.csv", true);
                 PrintWriter out = new PrintWriter(fw)) {
 
@@ -1304,48 +1315,38 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // Map a smoothed latency to an integer cost via convex anchor curve and guardrails
-    private int latencyToCost(double ewmaMs) {
+    private double latencyToCost(double ewmaMs) {
         double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
 
-        // Anchor costs
-//        double costHealthy = (tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM));
-        double costHealthy = 2;
-//        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
-        double costBad = 2;
+        double costHealthy = tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM);
+        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
 
-        // Sub-healthy convex taper to 1
-        double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);  // ultra-fast bound
+        double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
         if (ewmaMs <= L_HEALTHY_MS) {
             double denom = Math.max(1e-9, L_HEALTHY_MS - Lmin);
-            double z = (ewmaMs - Lmin) / denom;            // could be <0
-            z = Math.max(0.0, Math.min(1.0, z));           // clamp 0..1
+            double z = (ewmaMs - Lmin) / denom;
+            z = Math.max(0.0, Math.min(1.0, z));
             double y = 1.0 * (1.0 - Math.pow(z, CONVEX_P))
                     + costHealthy * Math.pow(z, CONVEX_P);
-            int proposed = Math.max(MIN_COST, (int) Math.ceil(y));
-            return proposed;
+            return Math.max(MIN_COST, y);
         }
 
-        // Healthy..Bad convex increase with same exponent
-        double x;
-        if (ewmaMs >= L_BAD_MS) x = 1.0;
-        else x = (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS - L_HEALTHY_MS);
-
+        double x = ewmaMs >= L_BAD_MS ? 1.0 : (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS - L_HEALTHY_MS);
         double blendedCost = costHealthy * (1.0 - Math.pow(x, CONVEX_P))
                 + costBad * Math.pow(x, CONVEX_P);
 
-        int proposedInt = Math.max(MIN_COST, (int) Math.ceil(blendedCost));
-        return proposedInt;
+        return Math.max(MIN_COST, blendedCost);
     }
 
     // Main adjustment; currentTps provided by caller's sliding window
     private void adjustTokenCostsBasedOnLatency(double currentTps) {
+        final double MIN_STEP_EPS = 0.05;
+
         long now = System.currentTimeMillis();
 
         synchronized (writeConcernLatency) {
             Long lastAny = lastUpdateAt.values().stream().findAny().orElse(0L);
             if (now - lastAny < MIN_UPDATE_PERIOD_MS) return;
-
-            // 1) Smoothed latencies and min (for observability; curve uses anchors)
             Map<Integer, Double> smoothed = new HashMap<>();
             double minSmoothed = Double.POSITIVE_INFINITY;
 
@@ -1359,33 +1360,30 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 if (ewma < minSmoothed) minSmoothed = ewma;
             }
             if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0) minSmoothed = 1.0;
-            System.out.println("Costs");
-            System.out.println(writeConcernCosts);
 
-            // 2) Compute proposed integer cost per WC via convex anchor mapping
+            System.out.println(writeConcernCosts);
+            System.out.println(ewmaLatency);
+
             try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
                 for (var e : smoothed.entrySet()) {
                     int wc = e.getKey();
                     double ewmaMs = e.getValue();
 
-                    int oldCost = (int) Math.ceil(writeConcernCosts.getOrDefault(wc, (double) MIN_COST));
-                    int proposedInt = latencyToCost(ewmaMs);
+                    double oldCost = writeConcernCosts.getOrDefault(wc, (double) MIN_COST);
+                    double proposed = latencyToCost(ewmaMs);
 
-                    // Hysteresis on integer scale
-                    double relDelta = Math.abs(proposedInt - oldCost) / Math.max(1.0, oldCost);
+                    double relDelta = Math.abs(proposed - oldCost) / Math.max(1.0, oldCost);
+
                     try (FileWriter fw = new FileWriter("writeconcern.csv", true);
                          PrintWriter out = new PrintWriter(fw)) {
-
                         File file = new File("writeconcern.csv");
                         if (file.length() == 0) {
                             out.println("WriteConcern,Cost,Latency");
                         }
-
-                        // Iterate safely using a different variable name
                         for (Integer level : writeConcernCosts.keySet()) {
                             double cost = writeConcernCosts.get(level);
-                            double latency = smoothed.getOrDefault(level, Double.NaN); // safe lookup
-                            out.printf("%d,%.2f,%.2f%n", level, cost, latency);
+                            double latency = smoothed.getOrDefault(level, Double.NaN);
+                            out.printf("%d,%.4f,%.2f%n", level, cost, latency);
                         }
                     } catch (IOException ex) {
                         ex.printStackTrace();
@@ -1395,23 +1393,26 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         lastUpdateAt.put(wc, now);
                         continue;
                     }
-                    // Per-interval step caps
-                    int maxUp = (int) Math.ceil(oldCost * MAX_STEP_UP);
-                    int maxDown = (int) Math.floor(oldCost * MAX_STEP_DOWN);
-                    int cappedInt = proposedInt;
-                    if (proposedInt > oldCost) {
-                        cappedInt = Math.min(proposedInt, Math.max(oldCost + 1, maxUp));
-                    } else if (proposedInt < oldCost) {
-                        cappedInt = Math.max(proposedInt, Math.min(oldCost - 1, maxDown));
+
+                    double upCap = oldCost * (1.0 + MAX_STEP_UP);
+                    double downCap = oldCost * (1.0 - MAX_STEP_DOWN);
+                    double capped = proposed;
+
+                    if (proposed > oldCost) {
+                        double minUp = oldCost + MIN_STEP_EPS;
+                        capped = Math.min(proposed, Math.max(minUp, upCap));
+                    } else if (proposed < oldCost) {
+                        double maxDownAbs = oldCost - MIN_STEP_EPS;
+                        capped = Math.max(proposed, Math.min(maxDownAbs, downCap));
                     }
 
-                    writeConcernCosts.put(wc, (double) cappedInt);
+                    capped = Math.max(MIN_COST, capped);
+                    writeConcernCosts.put(wc, capped);
 
                     csv.write(String.format(
-                            "%d,%.1f,%.1f,%d,%d,%d,%d%n",
-                            wc, ewmaMs, minSmoothed, oldCost, proposedInt, cappedInt, now
+                            "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n",
+                            wc, ewmaMs, minSmoothed, oldCost, proposed, capped, now
                     ));
-
                     lastUpdateAt.put(wc, now);
                 }
                 csv.flush();
@@ -1422,7 +1423,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
 
-    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch) {
+    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch, int backLog) {
         // we can use lua scripts instead of using lock at application level
         redisLock.writeLock().lock();
         try {
