@@ -312,8 +312,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 + NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) % NUM_OF_SERVERS){
-                if(log.size() >= 100000 && log.size() < 130000) {
-                    Thread.sleep(60);
+                if(log.size() >= 2000 && log.size() < 10000){
+                    Thread.sleep(70);
                 }
             }
             // this is added to replicate network call behaviour
@@ -1342,6 +1342,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
 
         double costHealthy = tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM);
+
         double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
 
         double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
@@ -1536,8 +1537,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // causal consistency
             HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp.convertToTimeStamp(readRequest.getTimeStamp());
 
-
-
                 long startTime = System.nanoTime();
                 long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
                 Runnable checkLogTask = new Runnable() {
@@ -1549,16 +1548,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             return;
                         }
                         LogEntry entry = null;
-                        lock.readLock().lock();
-                        try {
                             if(readConcern == ReadConcern.MAJORITY) {
                                 entry = log.get(commitIndex.get());
                             } else {
                                 entry = log.get(log.size() - 1);
                             }
-                        } finally {
-                            lock.readLock().unlock();
-                        }
+
                         if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
                             // log has caught up, safe to read
                             responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
