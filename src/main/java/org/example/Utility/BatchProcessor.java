@@ -171,6 +171,135 @@ public class BatchProcessor {
         return new ProcessResult(result, usedTokens, profit, transactionsUpgraded);
     }
 
+    public ProcessResult processTransactionUnderutilised(List<TransactionOption> transactions, double budget, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
+
+        int noOfTransactions = transactions.size();
+        int tokensUsed = noOfTransactions;
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        int transactionsUpgraded = 0;
+
+        List<ClientMessage> result = new ArrayList<>();
+
+        int[] consistencyLevels = new int[noOfTransactions];
+
+        double profit = 0;
+
+        for(int i = 0; i < noOfTransactions; i++) {
+            TransactionOption tx = transactions.get(i);
+            consistencyLevels[i] = tx.minRequiredConsistency;
+            profit += tx.baseProfit;
+        }
+
+
+        if(allowUpgrades) {
+            PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+                    (a, b) -> Double.compare(b.ratio, a.ratio)
+            );
+
+            // Initialize possible upgrades from actual current level
+            for (int i = 0; i < noOfTransactions; i++) {
+                TransactionOption tx = transactions.get(i);
+                int currentWC = consistencyLevels[i];
+
+                if (currentWC < majority) {
+                    double currentCost = writeConcernCosts.get(currentWC);
+                    double nextCost = writeConcernCosts.get(currentWC + 1);
+                    double upgradeCost = nextCost - currentCost;
+
+                    // Skip if upgrade cost is negative or negligible
+                        double nextProfit = (currentWC + 1 == majority)
+                                ? tx.extraMajorityProfit
+                                : tx.extraIntermediateProfit;
+                        double ratio = nextProfit / (upgradeCost + EPS);
+                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
+                }
+            }
+
+            boolean[] upgraded = new boolean[noOfTransactions];
+
+            // Greedy upgrading loop
+            while (!pq.isEmpty() &&  budget > EPS) {
+
+                UpgradeOption opt = pq.poll();
+
+                // Check if upgrade is still valid and affordable
+                if (opt.toWC > consistencyLevels[opt.txIndex]) {
+
+                    if (opt.upgradeCost <= budget + EPS) {
+                        budget -= opt.upgradeCost;
+                        profit += opt.additionalProfit;
+                        consistencyLevels[opt.txIndex] = opt.toWC;
+                        if(!upgraded[opt.txIndex]) {
+                            transactionsUpgraded++;
+                        }
+                        upgraded[opt.txIndex] = true;
+
+
+                        // Generate the next upgrade for this transaction (if possible)
+                        if (opt.toWC < majority) {
+                            int nextWC = opt.toWC + 1;
+                            double currentCost = writeConcernCosts.get(opt.toWC);
+                            double nextCost = writeConcernCosts.get(nextWC);
+                            double nextUpgradeCost = nextCost - currentCost;
+
+                            // Only add if cost increase is meaningful
+                                double nextProfit = (nextWC == majority)
+                                        ? transactions.get(opt.txIndex).extraMajorityProfit
+                                        : transactions.get(opt.txIndex).extraIntermediateProfit;
+                                double nextRatio = nextProfit / (nextUpgradeCost + EPS);
+                                pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));}
+                    }
+                }
+            }
+            System.out.println("budget left: " + budget);
+        }
+
+        HashMap<Integer,Integer> map = new HashMap<>();
+
+        // Generate final result messages after upgrades
+        for (int i = 0; i < noOfTransactions; i++) {
+            TransactionOption tx = transactions.get(i);
+            int wc = consistencyLevels[i];
+            // compare original and final consistency levels
+            if(tx.minRequiredConsistency != wc) {
+                map.put(wc, map.getOrDefault(wc,0)+1);
+            }
+
+            // skip the unprocessed transactions
+            if (wc == 0) continue;
+            ClientMessage msg = ClientMessage.newBuilder()
+                    .setT(tx.clientMessage.getT())
+                    .setWriteConcern(wc)
+                    .build();
+            result.add(msg);
+        }
+        System.out.println("Upgrade map: " + map.toString());
+        return new ProcessResult(result, tokensUsed, profit, transactionsUpgraded);
+    }
+
+    public ProcessResult processTransactions(List<TransactionOption> batch, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
+        List<TransactionOption> toProcess = batch;
+        double budget = 1000;
+        if(batch.size() > currentTokens) {
+            double profit = 0;
+            // backlog
+            Collections.sort(batch, Comparator.comparingInt(a -> a.minRequiredConsistency));
+            toProcess = batch.subList(0, (int)currentTokens);
+            List<ClientMessage> result = new ArrayList<>();
+            for(int i = 0; i < toProcess.size(); i++) {
+                TransactionOption tx = toProcess.get(i);
+                profit += tx.baseProfit;
+                ClientMessage msg = ClientMessage.newBuilder()
+                        .setT(tx.clientMessage.getT())
+                        .setWriteConcern(tx.minRequiredConsistency)
+                        .build();
+                result.add(msg);
+            }
+            return new ProcessResult(result, toProcess.size(), profit, 0);
+        } else {
+            return processTransactionUnderutilised(batch, budget, false, writeConcernCosts);
+        }
+    }
     /**
      * Helper class to represent an upgrade opportunity
      */

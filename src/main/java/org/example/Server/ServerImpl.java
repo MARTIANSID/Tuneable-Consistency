@@ -153,7 +153,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 350; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 5000; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -312,8 +312,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         try {
             if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 + NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) % NUM_OF_SERVERS){
-                if(log.size() >= 2000 && log.size() < 10000){
-                    Thread.sleep(70);
+                if(log.size() >= 60000 && log.size() < 120000){
+                    Thread.sleep(40);
                 }
             }
             // this is added to replicate network call behaviour
@@ -1092,63 +1092,44 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
-        List<ClientMessage> transactionsToExecute = new ArrayList<>(currentBatch);
-        double currentTps = getSystemWideThroughput();
-        System.out.println(currentTps);
-        adjustTokenCostsBasedOnLatency(currentTps);
 
-        try (FileWriter fw = new FileWriter("tps.csv", true);
-             PrintWriter out = new PrintWriter(fw)) {
-
-            // Write header only if file is empty
-            File file = new File("tps.csv");
-            if (file.length() == 0) {
-                out.println("CurrentTPS");
-            }
-            // Write data row
-            out.printf("%.2f%n",
-                    currentTps);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-//        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
+        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
 //        // we can add parallelize this stream if needed
-//       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
-//               .map(cm -> cm.getT().getId())
-//               .collect(Collectors.toSet());
+       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+               .map(cm -> cm.getT().getId())
+               .collect(Collectors.toSet());
 
 //        // adding back it in the queue
-//       batchLock.lock();
-//       try {
-//           for (ClientMessage clientMessage : currentBatch) {
-//               String transactionId = clientMessage.getT().getId();
-//               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-//                   backLogTransactions.add(transactionId);
-//                   batchOfTransactions.add(clientMessage);
-//               } else {
-//                   // it can be executed
-//                   backLogTransactions.remove(transactionId);
-//               }
-//           }
-//           backLog = backLogTransactions.size();
-//           try (FileWriter fw = new FileWriter("backlog.csv", true);
-//                PrintWriter out = new PrintWriter(fw)) {
-//
-//               File file = new File("backlog.csv");
-//               if (file.length() == 0) {
-//                   out.println("Backlog");
-//               }
-//               out.printf("%d%n", backLog);
-//           } catch (IOException e) {
-//               e.printStackTrace();
-//           }
-//           System.out.println("The backlog is--" + backLog);
-//       } finally {
-//           batchLock.unlock();
-//       }
+       batchLock.lock();
+       try {
+           for (ClientMessage clientMessage : currentBatch) {
+               String transactionId = clientMessage.getT().getId();
+               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+                   backLogTransactions.add(transactionId);
+                   batchOfTransactions.add(clientMessage);
+               } else {
+                   // it can be executed
+                   backLogTransactions.remove(transactionId);
+               }
+           }
+           backLog = backLogTransactions.size();
+           try (FileWriter fw = new FileWriter("backlog.csv", true);
+                PrintWriter out = new PrintWriter(fw)) {
+
+               File file = new File("backlog.csv");
+               if (file.length() == 0) {
+                   out.println("Backlog");
+               }
+               out.printf("%d%n", backLog);
+           } catch (IOException e) {
+               e.printStackTrace();
+           }
+           System.out.println("The backlog is--" + backLog);
+       } finally {
+           batchLock.unlock();
+       }
 ////
 //        // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
@@ -1374,8 +1355,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             Map<Integer, Double> smoothed = new HashMap<>();
             double minSmoothed = Double.POSITIVE_INFINITY;
 
-            for (var e : writeConcernLatencies.entrySet()) {
-                int wc = e.getKey();
+            double prevWriteConcernCost = 1;
+            for (int i = 1; i <= (NUM_OF_SERVERS / 2 + 1); i++) {
+                int wc = i;
                 double blended = Math.max(1.0, blendedLatencyForWC(wc));
                 double prev = ewmaLatency.getOrDefault(wc, blended);
                 double ewma = ALPHA * blended + (1.0 - ALPHA) * prev;
@@ -1396,8 +1378,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     double oldCost = writeConcernCosts.getOrDefault(wc, (double) MIN_COST);
                     double proposed = latencyToCost(ewmaMs);
 
-                    double relDelta = Math.abs(proposed - oldCost) / Math.max(1.0, oldCost);
-
                     try (FileWriter fw = new FileWriter("writeconcern.csv", true);
                          PrintWriter out = new PrintWriter(fw)) {
                         File file = new File("writeconcern.csv");
@@ -1413,11 +1393,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         ex.printStackTrace();
                     }
 
-                    if (relDelta < CHANGE_THRESH) {
-                        lastUpdateAt.put(wc, now);
-                        continue;
-                    }
-
                     double upCap = oldCost * (1.0 + MAX_STEP_UP);
                     double downCap = oldCost * (1.0 - MAX_STEP_DOWN);
                     double capped = proposed;
@@ -1431,6 +1406,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
 
                     capped = Math.max(MIN_COST, capped);
+                    capped = Math.max(prevWriteConcernCost, capped);
+                    prevWriteConcernCost = capped;
                     writeConcernCosts.put(wc, capped);
 
                     csv.write(String.format(
@@ -1467,7 +1444,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             ProcessResult result;
 
             // Using the new hybrid approach: process all transactions first, then upgrade for profit
-            result = transactionBatchProcessor.processForThroughputThenProfit(currentBatchInTransactionOption, currentTokens, (currentTps>=MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
+            result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, currentTokens, (currentTps>=MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
 
             // updating the token count here (updating in redis)
             tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
