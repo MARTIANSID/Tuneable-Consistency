@@ -149,7 +149,7 @@ public class WorkloadSimulator {
                         // Acquire / rotate channel
                         int port = serverPorts.get(portIndex);
                         portIndex = (portIndex + 1) % serverPorts.size();
-                        ManagedChannel channel = newChannel(port);
+                        ManagedChannel channel = newChannel(8001);
                         RaftGrpc.RaftBlockingStub stub = RaftGrpc.newBlockingStub(channel);
                         CountDownLatch latch = new CountDownLatch(toSend);
                         for (int i = 0; i < toSend; i++) {

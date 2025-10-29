@@ -13,6 +13,7 @@ import java.sql.SQLException;
 import java.util.*;
 import java.io.IOException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 
 public class Servers{
 
@@ -27,9 +28,10 @@ public class Servers{
             ServerImpl serverImpl = new ServerImpl(i - 1, NUM_OF_SERVERS);
             Server server = ServerBuilder.forPort(port)
                     .addService(serverImpl)
+//                    .executor(Executors.newFixedThreadPool(1)) // limit to 2 threads
                     .build()
                     .start();
-            System.out.println("Server" + (i + 1) + " started on port " + port);
+            System.out.println("Server" + (i - 1) + " started on port " + port);
             serverImpl.setUpStubs();
             servers.add(server);
             serversImpl.add(serverImpl);

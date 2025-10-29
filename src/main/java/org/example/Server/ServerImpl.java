@@ -149,11 +149,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 80;
+    private static final int BATCH_INTERVAL_MS = 5;
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 5000; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 3000; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -202,7 +202,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 1000), TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 2000), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
@@ -289,7 +289,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the stubs
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + (i + 1)).enableRetry().usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
 
@@ -311,11 +311,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
-            if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 + NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) % NUM_OF_SERVERS){
-                if(log.size() >= 60000 && log.size() < 120000){
-                    Thread.sleep(40);
-                }
-            }
+//            if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 + NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) % NUM_OF_SERVERS){
+//                if(log.size() >= 60000 && log.size() < 120000){
+//                    Thread.sleep(40);
+//                }
+//            }
             // this is added to replicate network call behaviour
 //            Thread.sleep(new Random().nextInt(10) + 5);
             // update clock of follower using leaders clock, if the follower is behind it can catchup
@@ -650,7 +650,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         try {
             // Wait for up to 50ms for responses
-            boolean success = latch.await(50, TimeUnit.MILLISECONDS);
+            boolean success = latch.await(400, TimeUnit.MILLISECONDS);
             // if election timed out then we do the below
             try {
                 lock.writeLock().lock();
@@ -717,7 +717,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // this field is seperate for each thread, so there will be no race conditions for this
             boolean firstAck = false;
-
 
             // need to add lock because lot of shared variables are being accessed here
             synchronized (systemWideThroughput) {
@@ -983,7 +982,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 });
                 if (!doesLeaderHasHighestTerm.get()) break;
             }
-        }, 0, 50, TimeUnit.MILLISECONDS);
+        }, 0, 80, TimeUnit.MILLISECONDS);
     }
 
     // already in writeLock
@@ -1084,6 +1083,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
+            if(currentBatch.size() > 0)
+            System.out.println(currentBatch.size() + " This is the batch size being processed at leader ");
             batchOfTransactions.clear();
             backLog = backLogTransactions.size();
         } finally {
