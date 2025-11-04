@@ -234,7 +234,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.systemWideThroughput = new Object();
         this.writeConcernThroughput = new Object();
         this.writeConcernLatency = new Object();
-        this.peerData= new Object();
+        this.peerData = new Object();
         this.redisLock = new ReentrantReadWriteLock();
         this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
         this.batchOfTransactions = new LinkedList<>();
@@ -289,7 +289,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the stubs
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + (i + 1)).enableRetry().usePlaintext().build();
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
 
@@ -408,23 +408,24 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // inside write lock
     private void rollbackTillIndex(int logIndex) {
         // remove the entries from the logIndex till the end
-
         for (int i = logIndex; i < log.size(); i++) {
             Transaction t = log.get(logIndex).t;
+            String id = t.getId();
 
-            String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
+            if(!t.getIsReadOnly()) {
+                String sender = t.getSender(), receiver = t.getReceiver();
 
-            double amount = t.getAmount();
-            // revert the transaction, and the rollback will be performed in the clientBalancesLatest
-            clientBalancesLatest.put(sender, clientBalancesLatest.get(sender) + amount);
-            clientBalancesLatest.put(receiver, clientBalancesLatest.get(receiver) - amount);
+                double amount = t.getAmount();
+                // revert the transaction, and the rollback will be performed in the clientBalancesLatest
+                clientBalancesLatest.put(sender, clientBalancesLatest.get(sender) + amount);
+                clientBalancesLatest.put(receiver, clientBalancesLatest.get(receiver) - amount);
+            }
+
             // remove the entries from tIdToLogIndex
             tIdToLogIndex.remove(id);
             // remove the timestamps
             timeStampsInLog.remove(log.get(i).timeStamp);
-
         }
-
     }
 
     // in lock
@@ -491,6 +492,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             responseObserver.onError(Status.UNAVAILABLE.withDescription("forward failed: " + t).asRuntimeException());
                             System.err.println("Failed to forward transaction to leader: " + t.getMessage());
                         }
+
                         @Override
                         public void onCompleted() {
                             responseObserver.onNext(Empty.newBuilder().build());
@@ -500,13 +502,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return;
         }
         // I send the ack back, to resolve the above blocking call immediately once the message is received
-        
+
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
-        
+
         // Track incoming transaction rate
         trackIncomingTransaction();
-        
+
         // here I add the transactions in batch
         batchLock.lock();
         try {
@@ -522,26 +524,26 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
      */
     private void trackIncomingTransaction() {
         long currentTime = System.currentTimeMillis();
-        
+
         synchronized (incomingTransactionLock) {
             // Add current transaction timestamp
             incomingTransactionTimestamps.add(currentTime);
-            
+
             // Remove timestamps older than 1 second
-            while (!incomingTransactionTimestamps.isEmpty() && 
-                   currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
+            while (!incomingTransactionTimestamps.isEmpty() &&
+                    currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
                 incomingTransactionTimestamps.poll();
             }
-            
+
             // Print every second (with a small buffer to avoid too frequent prints)
             long lastPrint = lastPrintTime.get();
             if (currentTime - lastPrint >= 1000L && lastPrintTime.compareAndSet(lastPrint, currentTime)) {
                 int incomingTPS = incomingTransactionTimestamps.size();
                 System.out.printf(
-                    "📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n",
-                    serverId,
-                    incomingTPS,
-                    new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime))
+                        "📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n",
+                        serverId,
+                        incomingTPS,
+                        new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime))
                 );
             }
         }
@@ -704,7 +706,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // it is not in log
     private CompletableFuture<Void> sendAckForEntries(List<LogEntry> entriesToBeAck) {
-
+        System.out.println("Preparing to send Ack for entries: " + entriesToBeAck);
         List<AckMessage> ackMessages = new ArrayList<>();
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
@@ -732,10 +734,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     // this latency is in ms
                     long latency = (timeStampOfTransaction - timeAtWhichTransactionWasReceived.get(id));
                     ackTransactionCount.incrementAndGet();
-                    ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
+                    if(entry.t.getIsReadOnly()) {
+                        ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).setId(id).setBalance(clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0)).build());
+                    } else {
+                        ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
+                    }
 
                 }
             }
+
             // if we are sending the ack of this transaction again we do not want to process the writeConcernThroughput
             if (!firstAck) continue;
             // *** this is the calculation of writeConcernLatency ***
@@ -761,7 +768,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             future.complete(null);
             return future;
         }
-
+        System.out.println(ackMessages);
+        System.out.println("Sending Ack!!");
         // refresh the context, not sure if this is required need to research a but
         RaftGrpc.RaftStub refreshContextClientStub = clientStub.withDeadlineAfter(2, TimeUnit.SECONDS);
         refreshContextClientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
@@ -861,7 +869,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                     if (candidateCommitIndex > commitIndex.get()) {
                         commitIndex.updateAndGet(index -> Math.max(index, candidateCommitIndex)); // Update commitIndex
-
+                        System.out.println(commitIndex.get() + "This is the new commit index---");
                         // update the majority committed map
                         for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
                             updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
@@ -937,7 +945,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 lock.readLock().lock();
                 try {
                     long now = System.currentTimeMillis();
-                    if((nextIndex.get(i) == log.size() - 1) && ((now - lastHeartBeatSent[i]) < 100) && (lastIndexSent[i] == nextIndex.get(i))) continue;
+                    if ((nextIndex.get(i) == log.size() - 1) && ((now - lastHeartBeatSent[i]) < 100) && (lastIndexSent[i] == nextIndex.get(i)))
+                        continue;
                     // this check is to avoid race condition where in if leader, becomes follower it should not send the updated term to follower as this old leader is not a leader in the updated term
                     if (status != ServerCurrentStatus.LEADER) return;
                     // nextIndex tells us the nextIndex from which we need the entries
@@ -1083,8 +1092,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
-            if(currentBatch.size() > 0)
-            System.out.println(currentBatch.size() + " This is the batch size being processed at leader ");
+            if (currentBatch.size() > 0)
+                System.out.println(currentBatch.size() + " This is the batch size being processed at leader ");
             batchOfTransactions.clear();
             backLog = backLogTransactions.size();
         } finally {
@@ -1095,42 +1104,43 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (currentBatch.isEmpty()) return;
 
         List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
+        System.out.println(transactionsToExecute + " This is the number of transactions which can be executed in this batch ");
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
 //        // we can add parallelize this stream if needed
-       Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
-               .map(cm -> cm.getT().getId())
-               .collect(Collectors.toSet());
+        Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream()
+                .map(cm -> cm.getT().getId())
+                .collect(Collectors.toSet());
 
 //        // adding back it in the queue
-       batchLock.lock();
-       try {
-           for (ClientMessage clientMessage : currentBatch) {
-               String transactionId = clientMessage.getT().getId();
-               if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-                   backLogTransactions.add(transactionId);
-                   batchOfTransactions.add(clientMessage);
-               } else {
-                   // it can be executed
-                   backLogTransactions.remove(transactionId);
-               }
-           }
-           backLog = backLogTransactions.size();
-           try (FileWriter fw = new FileWriter("backlog.csv", true);
-                PrintWriter out = new PrintWriter(fw)) {
+        batchLock.lock();
+        try {
+            for (ClientMessage clientMessage : currentBatch) {
+                String transactionId = clientMessage.getT().getId();
+                if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
+                    backLogTransactions.add(transactionId);
+                    batchOfTransactions.add(clientMessage);
+                } else {
+                    // it can be executed
+                    backLogTransactions.remove(transactionId);
+                }
+            }
+            backLog = backLogTransactions.size();
+            try (FileWriter fw = new FileWriter("backlog.csv", true);
+                 PrintWriter out = new PrintWriter(fw)) {
 
-               File file = new File("backlog.csv");
-               if (file.length() == 0) {
-                   out.println("Backlog");
-               }
-               out.printf("%d%n", backLog);
-           } catch (IOException e) {
-               e.printStackTrace();
-           }
-           System.out.println("The backlog is--" + backLog);
-       } finally {
-           batchLock.unlock();
-       }
+                File file = new File("backlog.csv");
+                if (file.length() == 0) {
+                    out.println("Backlog");
+                }
+                out.printf("%d%n", backLog);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            System.out.println("The backlog is--" + backLog);
+        } finally {
+            batchLock.unlock();
+        }
 ////
 //        // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
@@ -1138,7 +1148,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here append all these transactions in the raft log
         lock.writeLock().lock();
         try {
-            if(status != ServerCurrentStatus.LEADER) return;
+            if (status != ServerCurrentStatus.LEADER) return;
 
             for (ClientMessage clientMessage : transactionsToExecute) {
                 int index = log.size();
@@ -1269,7 +1279,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 //        }
 //    }
 
-//    private void adjustTokenCostsBasedOnLatency() {
+    //    private void adjustTokenCostsBasedOnLatency() {
 //        final int MIN_COST = 1;
 //        final double STEP_FACTOR = 0.3;  // half the fastest-latency
 //
@@ -1445,7 +1455,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             ProcessResult result;
 
             // Using the new hybrid approach: process all transactions first, then upgrade for profit
-            result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, currentTokens, (currentTps>=MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
+            result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, currentTokens, (currentTps >= MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
 
             // updating the token count here (updating in redis)
             tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
@@ -1505,44 +1515,47 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // need to review the logic
     @Override
-    public void sendReadRequest(ClientMessage readRequest, StreamObserver<Balance> responseObserver) {
-        Transaction t = readRequest.getT();
-        ReadConcern readConcern = t.getReadConcern();
+    public void sendReadRequest(ClientReadRequest readRequest, StreamObserver<Ack> responseObserver) {
+        ReadConcern readConcern = readRequest.getReadConcern();
 
-        String accName = t.getAccNameToRead();
+        String accName = readRequest.getAccNameToRead();
+        ReadLevel readLevel = readRequest.getReadLevel();
+        String id = readRequest.getId();
 
-        if (readRequest.hasTimeStamp()) {
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+
+        if (readConcern == ReadConcern.CAUSAL) {
             // causal consistency
             HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp.convertToTimeStamp(readRequest.getTimeStamp());
 
-                long startTime = System.nanoTime();
-                long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
-                Runnable checkLogTask = new Runnable() {
-                    @Override
-                    public void run() {
-                        if (System.nanoTime() - startTime > maxWaitNanos) {
-                            responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
-                            responseObserver.onCompleted();
-                            return;
-                        }
-                        LogEntry entry = null;
-                            if(readConcern == ReadConcern.MAJORITY) {
-                                entry = log.get(commitIndex.get());
-                            } else {
-                                entry = log.get(log.size() - 1);
-                            }
-
-                        if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
-                            // log has caught up, safe to read
-                            responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
-                            responseObserver.onCompleted();
-                        } else {
-                            // still behind, schedule again after a short delay
-                            causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
-                        }
+            long startTime = System.nanoTime();
+            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
+            Runnable checkLogTask = new Runnable() {
+                @Override
+                public void run() {
+                    if (System.nanoTime() - startTime > maxWaitNanos) {
+                        responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build()).build());
+                        responseObserver.onCompleted();
+                        return;
                     }
-                };
-                causalReadScheduler.execute(checkLogTask);
+                    LogEntry entry = null;
+                    if (readLevel == ReadLevel.MAJORITY) {
+                        entry = log.get(commitIndex.get());
+                    } else {
+                        entry = log.get(log.size() - 1);
+                    }
+
+                    if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
+                        // log has caught up, safe to read
+                        responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
+                        responseObserver.onCompleted();
+                    } else {
+                        // still behind, schedule again after a short delay
+                        causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
+                    }
+                }
+            };
+            causalReadScheduler.execute(checkLogTask);
 
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
             // this readRequest should go to leader
@@ -1552,7 +1565,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             lock.readLock().lock();
             try {
                 if (status != ServerCurrentStatus.LEADER) {
-                    responseObserver.onNext(Balance.newBuilder().setFailure(true).build());
+                    responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build()).build());
                     responseObserver.onCompleted();
                     return;
                 }
@@ -1561,31 +1574,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             batchLock.lock();
             try {
-                batchOfTransactions.add(readRequest);
+                batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).build());
+                System.out.println(batchOfTransactions);
             } finally {
                 batchLock.unlock();
             }
-            responseObserver.onNext(Balance.newBuilder().setResultNotReady(true).build());
+            responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
             responseObserver.onCompleted();
         } else {
             // here the readConcern is just local
-            responseObserver.onNext(getBalanceBasedOnReadConcern(readConcern, accName));
+            responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
             responseObserver.onCompleted();
         }
     }
 
-    private Balance getBalanceBasedOnReadConcern(ReadConcern readConcern, String accName) {
-        // we need the readLock here because the raft log might be updated with new entries however the clientBalance might not have been, so this lock keeps the raft log and maps in sync
-        lock.readLock().lock();
-        try {
-            if (readConcern == ReadConcern.LOCAL) {
-                return Balance.newBuilder().setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).build();
-            } else {
-                // here readConcern will be majority
-                return Balance.newBuilder().setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).build();
-            }
-        } finally {
-            lock.readLock().unlock();
+    private Ack getBalanceBasedOnReadConcern(ReadLevel readLevel, String accName, String id) {
+        if (readLevel == ReadLevel.LOCAL) {
+            return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName).setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
+        } else {
+            return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName).setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build()).build();
         }
     }
 

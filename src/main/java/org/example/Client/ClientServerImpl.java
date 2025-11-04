@@ -1,88 +1,188 @@
 package org.example.Client;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.*;
 import io.grpc.stub.StreamObserver;
 import org.ds.paxos.*;
-import org.example.Server.ServerImpl;
 import org.example.Utility.HybridClock;
-import org.example.Utility.RaftLog;
 
 import java.io.IOException;
-import java.sql.Time;
-import java.time.Duration;
-import java.util.List;
-import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 
 public class ClientServerImpl extends RaftGrpc.RaftImplBase {
-    ConcurrentHashMap<String, Boolean> ackReceived;
-    ReadWriteLock lock;
-    int currentLeader;
-    // used for causal consistency
-    HybridClock.TimeStamp lastWriteTimeStamp;
 
-    // clock of client
-    HybridClock hybridClock;
+    // --- Core State ---
+    private final ConcurrentHashMap<String, Boolean> ackReceived;
+    private final ReadWriteLock lock;
+    private final HybridClock hybridClock;
+    private HybridClock.TimeStamp lastTimeStamp;
+    private final RaftGrpc.RaftStub[] stubs;
+    private final int NUM_OF_SERVERS = 5;
 
-    private static final int THREAD_COUNT = 50;
+    private int currentLeader = 3;
+    private int totalTransactions = 0;
+    private long totalTime = 0;
 
-    public static ConcurrentHashMap<String, Long> timeTakenForTransactionToBeExecuted;
+    public static final ConcurrentHashMap<String, Long> timeTakenForTransactionToBeExecuted = new ConcurrentHashMap<>();
 
-    int totalTransactions;
-
-    long totalTime = 0;
+    // --- Constructor ---
     public ClientServerImpl() {
-       this.ackReceived = new ConcurrentHashMap<>();
-       this.lock = new ReentrantReadWriteLock();
-       this.currentLeader = 0;
-       this.hybridClock = new HybridClock();
-       this.timeTakenForTransactionToBeExecuted = new ConcurrentHashMap<>();
-       this.totalTransactions = 0;
-       this.totalTime = 0;
+        this.ackReceived = new ConcurrentHashMap<>();
+        this.lock = new ReentrantReadWriteLock();
+        this.hybridClock = new HybridClock();
+        this.lastTimeStamp = hybridClock.now();
+        this.stubs = new RaftGrpc.RaftStub[NUM_OF_SERVERS];
     }
 
-    // no need to acquire lock as it is already thread safe
+    // --- Setup gRPC Stubs ---
+    public void setUpStubs() {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            ManagedChannel channel = ManagedChannelBuilder
+                    .forAddress("localhost", 8000 + (i + 1))
+                    .enableRetry()
+                    .usePlaintext()
+                    .build();
+            stubs[i] = RaftGrpc.newStub(channel);
+        }
+        System.out.println("✅ Client connected to all " + NUM_OF_SERVERS + " Raft servers");
+    }
+
+    // --- Handle ACKs from Raft servers ---
     @Override
     public void sendAckToClient(Ack ack, StreamObserver<Empty> responseObserver) {
-
-
-        // we ack the server that yes the ack has been received, then implement the ack processing logic
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
 
-
-        List<AckMessage> ackMessages = ack.getAckMessageList();
-
-        for (AckMessage ackMessage : ackMessages) {
+        for (AckMessage ackMessage : ack.getAckMessageList()) {
             Transaction t = ackMessage.getT();
             String id = t.getId();
-            if(ackReceived.containsKey(id)) continue;
-            totalTransactions += 1;
+
+            // Only log successful reads
+            if (t.getIsReadOnly()) {
+                long latency = System.currentTimeMillis() - timeTakenForTransactionToBeExecuted.get(id);
+                System.out.println("[READ SUCCESS] ID=" + id +
+                        " | Concern=" + "LINEARIZABLE" +
+                        " | Account=" + ackMessage.getAccName() +
+                        " | Balance=" + ackMessage.getBalance() +
+                        " | Leader=" + ackMessage.getCurrentLeader()
+                        + " | Latency=" + latency + "ms"    );
+            }
+
+            if (ackReceived.containsKey(id)) continue;
+
+            totalTransactions++;
             totalTime += System.currentTimeMillis() - t.getTransactionSendTimeInMs();
             ackReceived.put(id, true);
+            currentLeader = ackMessage.getCurrentLeader();
+
+            // Update clock if timestamp present
+            if (ackMessage.hasTimStamp()) {
+                HybridClock.TimeStamp timeStamp = HybridClock.TimeStamp.convertToTimeStamp(ackMessage.getTimStamp());
+                hybridClock.update(timeStamp);
+                if (lastTimeStamp.compareTo(timeStamp) < 0) {
+                    lastTimeStamp = timeStamp;
+                }
+            }
+        }
+    }
+
+    // --- Send Read Request (with optional provided ID) ---
+    public void sendReadRequest(String accName, ReadConcern readConcern, ReadLevel readLevel, String readId) {
+        String requestId = readId != null ? readId : UUID.randomUUID().toString();
+
+        ClientReadRequest request = ClientReadRequest.newBuilder()
+                .setAccNameToRead(accName)
+                .setReadConcern(readConcern)
+                .setReadLevel(readLevel)
+                .setTimeStamp(HybridClock.TimeStamp.convertToProto(lastTimeStamp))
+                .setId(requestId)
+                .build();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        RaftGrpc.RaftStub leaderStub;
+
+        lock.readLock().lock();
+        try {
+            leaderStub = stubs[currentLeader];
+        } finally {
+            lock.readLock().unlock();
         }
 
-        System.out.println(ackMessages.size() + "Messages received on the client end");
-        System.out.println("Current Throughput --" + (double)((totalTransactions * 1000) / totalTime));
-        System.out.println("Total transactions received till now--" + totalTransactions);
+        long sendTime = System.currentTimeMillis();
+
+        leaderStub.sendReadRequest(request, new StreamObserver<>() {
+            @Override
+            public void onNext(Ack ack) {
+                for (AckMessage msg : ack.getAckMessageList()) {
+                    if (!msg.getFailure() && !msg.getResultNotReady()) {
+                        long latency = System.currentTimeMillis() - sendTime;
+                        System.out.println("[READ OK] ID=" + requestId +
+                                " | Concern=" + readConcern +
+                                " | Account=" + msg.getAccName() +
+                                " | Balance=" + msg.getBalance() +
+                                " | Latency=" + latency + "ms");
+                    }
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                latch.countDown();
+            }
+        });
+
+        try {
+            latch.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
+
+    // --- Overload for standalone reads ---
+    public void sendReadRequest(String accName, ReadConcern readConcern, ReadLevel readLevel) {
+        sendReadRequest(accName, readConcern, readLevel, null);
+    }
+
+    // --- Main Method: Parallel Periodic Reads with unique IDs ---
     public static void main(String[] args) throws IOException, InterruptedException {
-        // starting client server at 9000 port
+        ClientServerImpl clientServer = new ClientServerImpl();
+
         Server server = ServerBuilder.forPort(9000)
-                .addService(new ClientServerImpl())
+                .addService(clientServer)
                 .build()
                 .start();
 
-        System.out.println("Client server started on port 9000");
+        System.out.println("🚀 Client server started on port 9000");
+        clientServer.setUpStubs();
 
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        String accountName = "AcctA";
+
+        // Schedule parallel read groups every 100ms
+        scheduler.scheduleAtFixedRate(() -> {
+            System.out.println("\n=== 🧩 NEW READ GROUP ===");
+
+            ExecutorService exec = Executors.newFixedThreadPool(3);
+            String id = UUID.randomUUID().toString();
+            timeTakenForTransactionToBeExecuted.put(id, System.currentTimeMillis());
+
+            exec.submit(() ->
+                    clientServer.sendReadRequest(accountName, ReadConcern.EVENTUAL, ReadLevel.LOCAL, id));
+            exec.submit(() ->
+                    clientServer.sendReadRequest(accountName, ReadConcern.CAUSAL, ReadLevel.MAJORITY, id));
+            exec.submit(() ->
+                    clientServer.sendReadRequest(accountName, ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY, id));
+
+            exec.shutdown();
+        }, 20, 100, TimeUnit.MILLISECONDS);
+
+        System.out.println("⏱️ Parallel read groups scheduled every 100ms with unique IDs");
         server.awaitTermination();
     }
 }

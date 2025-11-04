@@ -9,9 +9,8 @@ service Raft {
   rpc printLog(Empty) returns (Empty);
   rpc sendAckToClient(Ack) returns (Empty);
   rpc sendAckToAllServers(Ack) returns(Empty);
-  rpc sendReadRequest(ClientMessage) returns (Balance);
+  rpc sendReadRequest(ClientReadRequest) returns (Ack);
 }
-
 
 
 message Empty{
@@ -28,14 +27,25 @@ message Balance {
 
 enum ReadConcern {
   LINEARIZABLE = 0;
-  LOCAL = 1;
-  MAJORITY = 2;
+  CAUSAL = 1;
+  EVENTUAL = 2;
+}
+enum ReadLevel {
+  LOCAL = 0;
+  MAJORITY = 1;
 }
 
 message AckMessage {
   Transaction t = 1;
   TimeStampProto timStamp = 2;
   int32 currentLeader = 3;
+
+  // for read transactions
+  double balance = 4;
+  string accName = 5;
+  bool failure = 6;
+  bool resultNotReady = 7;
+  string id = 8;
 }
 
 message Ack {
@@ -47,8 +57,16 @@ message ClientMessage {
   Transaction t = 1;
   int32 writeConcern = 2;
   TimeStampProto timeStamp = 3;
-
 }
+
+message ClientReadRequest {
+  string accNameToRead = 1;
+  ReadConcern readConcern = 2;
+  TimeStampProto timeStamp = 3;
+  ReadLevel readLevel = 4;
+  string id = 5;
+}
+
 
 message Transaction {
   string sender = 1;
