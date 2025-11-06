@@ -661,8 +661,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
                     if (shouldBecomeLeader) {
                         becomeLeader();
+                        while (latch.getCount() > 0) latch.countDown();
                     } else if (shouldBecomeFollower) {
                         becomeFollower();
+                        while (latch.getCount() > 0) latch.countDown();
                     }
                 }
 
