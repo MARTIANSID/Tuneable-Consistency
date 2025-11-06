@@ -431,7 +431,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private void rollbackTillIndex(int logIndex) {
         // remove the entries from the logIndex till the end
         for (int i = logIndex; i < log.size(); i++) {
-            Transaction t = log.get(logIndex).t;
+            Transaction t = log.get(i).t;
             String id = t.getId();
 
             if(!t.getIsReadOnly()) {
@@ -452,7 +452,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // in lock
     private boolean isUpToDateCandidateLog(int lastLogTermOfCandidate, int lastLogIndexOfCandidate) {
-        int lastLogTermOfCurrentNode = getLastLogTerm(), lastLogIndexOfCurrentNode = getLastLogTerm();
+        int lastLogTermOfCurrentNode = getLastLogTerm(), lastLogIndexOfCurrentNode = getLastLogIndex();
 
         // deny vote condition
         if ((lastLogTermOfCurrentNode > lastLogTermOfCandidate) || ((lastLogTermOfCurrentNode == lastLogTermOfCandidate) && (lastLogIndexOfCurrentNode > lastLogIndexOfCandidate))) {
