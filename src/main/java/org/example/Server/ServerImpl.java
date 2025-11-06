@@ -102,6 +102,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private final Object systemWideThroughput;
 
+    private final Object ackUpdateLock;
+
     private final Object writeConcernThroughput;
 
     private final Object writeConcernLatency;
@@ -135,6 +137,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     long[] lastHeartBeatSent;
     long[] lastIndexSent;
+
 
 
     BatchProcessor transactionBatchProcessor;
@@ -242,6 +245,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.systemWideThroughput = new Object();
         this.writeConcernThroughput = new Object();
         this.writeConcernLatency = new Object();
+        this.ackUpdateLock = new Object();
         this.peerData = new Object();
         this.redisLock = new ReentrantReadWriteLock();
         this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
@@ -741,18 +745,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             boolean firstAck = false;
 
             // need to add lock because lot of shared variables are being accessed here
-            synchronized (systemWideThroughput) {
+            synchronized (ackUpdateLock) {
                 if (ackSent.containsKey(id) && !ackSent.get(id)) {
                     firstAck = true;
                     // marking it as sent, if it fails the client can retry from its end
                     ackSent.put(id, true);
                     // send ack for this entry
-                    // here I have implemented the logic of rolling throughput
-                    // remove the old transactions from the queue, we maintain a window of 1 seconds
-                    // *** this is system wide throughput calculation ***
-                    recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
-                    // this latency is in ms
-                    long latency = (timeStampOfTransaction - timeAtWhichTransactionWasReceived.get(id));
                     ackTransactionCount.incrementAndGet();
                     if(entry.t.getIsReadOnly()) {
                         ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).setId(id).setBalance(clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0)).build());
@@ -765,6 +763,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // if we are sending the ack of this transaction again we do not want to process the writeConcernThroughput
             if (!firstAck) continue;
+            synchronized (systemWideThroughput) {
+                recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
+            }
             // *** this is the calculation of writeConcernLatency ***
             synchronized (writeConcernLatency) {
 //                System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +" replication---" + entry.serversThatReplicatedThisEntry);
