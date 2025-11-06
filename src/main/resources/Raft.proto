@@ -116,7 +116,8 @@ message AppendEntriesArgument {
   int32 leadersCommit = 6;
   int32 ackIndex = 7;
   TimeStampProto timeStamp = 8;
-
+  double systemThroughput = 9;
+  bool systemThroughputIncluded = 10;
 }
 
 message RequestVoteArguments {
@@ -131,6 +132,8 @@ message AppendEntriesResult {
   bool isSuccessFull = 2;
   int32 followerId = 3;
   TimeStampProto timeStamp = 4;
+  double followerReadThroughput = 5;
+  bool readThroughputIncluded = 6;
 }
 message RequestVoteResult {
   int32 currentTerm = 1;
