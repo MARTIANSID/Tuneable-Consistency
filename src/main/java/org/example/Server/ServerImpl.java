@@ -737,7 +737,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // it is not in log
     private CompletableFuture<Void> sendAckForEntries(List<LogEntry> entriesToBeAck) {
-        System.out.println("Preparing to send Ack for entries: " + entriesToBeAck);
         List<AckMessage> ackMessages = new ArrayList<>();
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
@@ -796,8 +795,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             future.complete(null);
             return future;
         }
-        System.out.println(ackMessages);
-        System.out.println("Sending Ack!!");
         // refresh the context, not sure if this is required need to research a but
         RaftGrpc.RaftStub refreshContextClientStub = clientStub.withDeadlineAfter(2, TimeUnit.SECONDS);
         refreshContextClientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
@@ -1132,8 +1129,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
-            if (currentBatch.size() > 0)
-                System.out.println(currentBatch.size() + " This is the batch size being processed at leader ");
             batchOfTransactions.clear();
             backLog = backLogTransactions.size();
         } finally {
@@ -1144,7 +1139,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (currentBatch.isEmpty()) return;
 
         List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
-        System.out.println(transactionsToExecute + " This is the number of transactions which can be executed in this batch ");
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
 //        // we can add parallelize this stream if needed

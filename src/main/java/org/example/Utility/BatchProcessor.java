@@ -183,7 +183,6 @@ public class BatchProcessor {
         int[] consistencyLevels = new int[noOfTransactions];
 
         double profit = 0;
-
         for(int i = 0; i < noOfTransactions; i++) {
             TransactionOption tx = transactions.get(i);
             consistencyLevels[i] = tx.minRequiredConsistency;
@@ -256,15 +255,14 @@ public class BatchProcessor {
 
         HashMap<Integer,Integer> map = new HashMap<>();
 
+
         // Generate final result messages after upgrades
         for (int i = 0; i < noOfTransactions; i++) {
             TransactionOption tx = transactions.get(i);
             int wc = consistencyLevels[i];
-            // compare original and final consistency levels
             if(tx.minRequiredConsistency != wc) {
                 map.put(wc, map.getOrDefault(wc,0)+1);
             }
-
             // skip the unprocessed transactions
             if (wc == 0) continue;
             ClientMessage msg = ClientMessage.newBuilder()
@@ -279,7 +277,7 @@ public class BatchProcessor {
 
     public ProcessResult processTransactions(List<TransactionOption> batch, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
         List<TransactionOption> toProcess = batch;
-        double budget = 1000;
+        double budget = 10000;
         if(batch.size() > currentTokens) {
             double profit = 0;
             // backlog
@@ -297,7 +295,7 @@ public class BatchProcessor {
             }
             return new ProcessResult(result, toProcess.size(), profit, 0);
         } else {
-            return processTransactionUnderutilised(batch, budget, false, writeConcernCosts);
+            return processTransactionUnderutilised(batch, budget, allowUpgrades, writeConcernCosts);
         }
     }
     /**
