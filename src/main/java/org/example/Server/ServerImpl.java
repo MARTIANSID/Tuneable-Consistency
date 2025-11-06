@@ -602,12 +602,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // making this thread safe and the term is only updated to max value
             currentTerm.updateAndGet(term -> Math.max(term, requestVoteResult.getCurrentTerm()));
             return false;
-        } else if (requestVoteResult.getIsVoteGranted()) {
+        }
+        if (requestVoteResult.getIsVoteGranted()) {
             // vote granted
             votes.incrementAndGet();
             return true;
         }
-        return true;
+        return false;
     }
 
     private void requestForVotes(RequestVoteArguments requestVoteArguments) {
@@ -640,7 +641,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             if (isElectionOver.compareAndSet(false, true)) {
                                 becomeFollower();
                                 // not waiting further
-                                latch.notify();
                             }
                         } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
 
@@ -648,8 +648,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 // majority is reached here, no need to continue the election
                                 // I call the becomeLeader() here to make thread safe!
                                 becomeLeader();
-                                //no need to wait further
-                                latch.notify();
                             }
                         } else {
                             latch.countDown();
