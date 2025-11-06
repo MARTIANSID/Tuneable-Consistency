@@ -139,7 +139,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     long[] lastIndexSent;
 
 
-
     BatchProcessor transactionBatchProcessor;
 
     // For tracking incoming transactions per second
@@ -356,7 +355,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // resetting the election timer of the follower
             startTheElectionTimer();
 
-            if(appendEntriesArgument.getSystemThroughputIncluded()) {
+            if (appendEntriesArgument.getSystemThroughputIncluded()) {
                 combinedSystemWideThroughputOnFollower = appendEntriesArgument.getSystemThroughput();
             }
 
@@ -404,7 +403,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Send success response
             AppendEntriesResult.Builder appendEntriesResultBuilder = AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower));
             long currentTime = System.currentTimeMillis();
-            if(currentTime - lastThroughputSentTime >= 200) {
+            if (currentTime - lastThroughputSentTime >= 200) {
                 lastThroughputSentTime = currentTime;
                 appendEntriesResultBuilder.setReadThroughputIncluded(true);
                 appendEntriesResultBuilder.setFollowerReadThroughput(getSystemWideThroughput());
@@ -438,7 +437,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             Transaction t = log.get(i).t;
             String id = t.getId();
 
-            if(!t.getIsReadOnly()) {
+            if (!t.getIsReadOnly()) {
                 String sender = t.getSender(), receiver = t.getReceiver();
 
                 double amount = t.getAmount();
@@ -610,9 +609,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (requestVoteResult.getIsVoteGranted()) {
             // vote granted
             votes.incrementAndGet();
-            return true;
         }
-        return false;
+        // if vote is not granted then I decrease the latchCount but do not increase the vote count
+        return true;
     }
 
     private void requestForVotes(RequestVoteArguments requestVoteArguments) {
@@ -627,7 +626,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             stubs[i].requestVote(requestVoteArguments, new StreamObserver<RequestVoteResult>() {
                 @Override
                 public void onNext(RequestVoteResult requestVoteResult) {
-
+                    boolean shouldBecomeLeader = false;
+                    boolean shouldBecomeFollower = false;
                     try {
                         lock.writeLock().lock();
 
@@ -643,7 +643,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         if (!isSuccessful) {
                             // if the current term is less than this node has to become a follower
                             if (isElectionOver.compareAndSet(false, true)) {
-                                becomeFollower();
+                                shouldBecomeFollower = true;
                                 // not waiting further
                             }
                         } else if (votes.get() > (NUM_OF_SERVERS / 2)) {
@@ -651,13 +651,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             if (isElectionOver.compareAndSet(false, true)) {
                                 // majority is reached here, no need to continue the election
                                 // I call the becomeLeader() here to make thread safe!
-                                becomeLeader();
+                                shouldBecomeLeader = true;
                             }
                         } else {
                             latch.countDown();
                         }
                     } finally {
                         lock.writeLock().unlock();
+                    }
+                    if (shouldBecomeLeader) {
+                        becomeLeader();
+                    } else if (shouldBecomeFollower) {
+                        becomeFollower();
                     }
                 }
 
@@ -752,7 +757,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(id, true);
                     // send ack for this entry
                     ackTransactionCount.incrementAndGet();
-                    if(entry.t.getIsReadOnly()) {
+                    if (entry.t.getIsReadOnly()) {
                         ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).setId(id).setBalance(clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0)).build());
                     } else {
                         ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
@@ -868,7 +873,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 return false;
             }
             // updating the throughput of follower
-            if(appendEntriesResult.getReadThroughputIncluded()){
+            if (appendEntriesResult.getReadThroughputIncluded()) {
                 combinedThroughputOfFollowers = combinedThroughputOfFollowers - followerReadThroughput[idOfFollower] + appendEntriesResult.getFollowerReadThroughput();
                 followerReadThroughput[idOfFollower] = appendEntriesResult.getFollowerReadThroughput();
             }
@@ -985,7 +990,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     // making appendEntries proto object
                     double combinedSystemThroughput = 0;
                     boolean throughputIndcluded = false;
-                    if(now - lastThroughputSentTime >= 200) {
+                    if (now - lastThroughputSentTime >= 200) {
                         lastThroughputSentTime = now;
                         combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
                         throughputIndcluded = true;
@@ -1579,7 +1584,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
 
                     if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
-                        synchronized (systemWideThroughput){
+                        synchronized (systemWideThroughput) {
                             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
                         }
                         // log has caught up, safe to read
@@ -1601,7 +1606,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             lock.readLock().lock();
             try {
                 if (status != ServerCurrentStatus.LEADER) {
-                    if(currentLeader == -1) {
+                    if (currentLeader == -1) {
                         responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build()).build());
                         responseObserver.onCompleted();
                     } else {
@@ -1639,7 +1644,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             responseObserver.onCompleted();
         } else {
             // here the readConcern is just local
-            synchronized (systemWideThroughput){
+            synchronized (systemWideThroughput) {
                 recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
             }
             responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
