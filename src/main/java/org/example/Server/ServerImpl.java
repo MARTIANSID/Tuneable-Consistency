@@ -299,17 +299,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.electionTimer.start();
     }
 
-    public void setUpStubs() {
-        for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            // setting up the stubs
-            if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
-                stubs[i] = RaftGrpc.newStub(channel);
-                blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
+ public void setUpStubs() {
+    // CloudLab nodes participating in the cluster
+    String[] hosts = {
+        "clnode061.clemson.cloudlab.us",
+        "clnode046.clemson.cloudlab.us",
+        "clnode063.clemson.cloudlab.us"
+    };
 
-            }
+    for (int i = 0; i < NUM_OF_SERVERS; i++) {
+        if (i != serverId) {
+            int port = 8000 + (i + 1); // 8001, 8002, 8003
+            ManagedChannel channel = ManagedChannelBuilder
+                    .forAddress(hosts[i], port)
+                    .enableRetry()
+                    .usePlaintext()
+                    .build();
+
+            stubs[i] = RaftGrpc.newStub(channel);
+            blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
+
+            System.out.println("Server " + serverId + " connected to " + hosts[i] + ":" + port);
         }
     }
+}
+
 
     @Override
     public void appendEntries(AppendEntriesArgument appendEntriesArgument, StreamObserver<AppendEntriesResult> responseObserver) {
@@ -504,6 +518,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
+        System.out.println("Got Transaction");
         // check if the current node is leader or not, if not forward request to leader, this might fail if election is going on
         if (serverId != currentLeader && currentLeader != -1) {
             stubs[currentLeader]
