@@ -20,11 +20,14 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
     private final RaftGrpc.RaftStub[] stubs;
     private final int NUM_OF_SERVERS = 5;
 
-    private int currentLeader = 3;
+    private int currentLeader = 2;
     private int totalTransactions = 0;
     private long totalTime = 0;
 
     public static final ConcurrentHashMap<String, Long> timeTakenForTransactionToBeExecuted = new ConcurrentHashMap<>();
+
+    // --- New: Latency tracking per ReadConcern ---
+    private final ConcurrentHashMap<ReadConcern, List<Long>> latencyPerConcern = new ConcurrentHashMap<>();
 
     // --- Constructor ---
     public ClientServerImpl() {
@@ -33,6 +36,10 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
         this.hybridClock = new HybridClock();
         this.lastTimeStamp = hybridClock.now();
         this.stubs = new RaftGrpc.RaftStub[NUM_OF_SERVERS];
+        // initialize lists for each ReadConcern
+        for (ReadConcern rc : ReadConcern.values()) {
+            latencyPerConcern.put(rc, Collections.synchronizedList(new ArrayList<>()));
+        }
     }
 
     // --- Setup gRPC Stubs ---
@@ -58,15 +65,16 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
             Transaction t = ackMessage.getT();
             String id = t.getId();
 
-            // Only log successful reads
+            // Only log successful reads and measure latency
             if (t.getIsReadOnly()) {
                 long latency = System.currentTimeMillis() - timeTakenForTransactionToBeExecuted.get(id);
-                System.out.println("[READ SUCCESS] ID=" + id +
-                        " | Concern=" + "LINEARIZABLE" +
-                        " | Account=" + ackMessage.getAccName() +
-                        " | Balance=" + ackMessage.getBalance() +
-                        " | Leader=" + ackMessage.getCurrentLeader()
-                        + " | Latency=" + latency + "ms"    );
+                latencyPerConcern.get(ReadConcern.LINEARIZABLE).add(latency);
+//                System.out.println("[READ SUCCESS] ID=" + id +
+//                        " | Concern=" + "LINEARIZABLE" +
+//                        " | Account=" + ackMessage.getAccName() +
+//                        " | Balance=" + ackMessage.getBalance() +
+//                        " | Leader=" + ackMessage.getCurrentLeader()
+//                        + " | Latency=" + latency + "ms"    );
             }
 
             if (ackReceived.containsKey(id)) continue;
@@ -83,6 +91,15 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
                 if (lastTimeStamp.compareTo(timeStamp) < 0) {
                     lastTimeStamp = timeStamp;
                 }
+            }
+        }
+
+        // --- Compute average latency per ReadConcern ---
+        for (ReadConcern rc : latencyPerConcern.keySet()) {
+            List<Long> latencies = latencyPerConcern.get(rc);
+            if (!latencies.isEmpty()) {
+                double avg = latencies.stream().mapToLong(Long::longValue).average().orElse(0);
+                System.out.println("[AVG LATENCY] Concern=" + rc + " | AvgLatency=" + avg + "ms");
             }
         }
     }
@@ -104,7 +121,10 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
 
         lock.readLock().lock();
         try {
-            leaderStub = stubs[currentLeader];
+            if(readConcern == ReadConcern.LINEARIZABLE)
+                leaderStub = stubs[currentLeader];
+            else
+                leaderStub = stubs[new Random().nextInt(NUM_OF_SERVERS)];
         } finally {
             lock.readLock().unlock();
         }
@@ -117,11 +137,12 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
                 for (AckMessage msg : ack.getAckMessageList()) {
                     if (!msg.getFailure() && !msg.getResultNotReady()) {
                         long latency = System.currentTimeMillis() - sendTime;
-                        System.out.println("[READ OK] ID=" + requestId +
-                                " | Concern=" + readConcern +
-                                " | Account=" + msg.getAccName() +
-                                " | Balance=" + msg.getBalance() +
-                                " | Latency=" + latency + "ms");
+                        latencyPerConcern.get(readConcern).add(latency);
+//                        System.out.println("[READ OK] ID=" + requestId +
+//                                " | Concern=" + readConcern +
+//                                " | Account=" + msg.getAccName() +
+//                                " | Balance=" + msg.getBalance() +
+//                                " | Latency=" + latency + "ms");
                     }
                 }
             }
@@ -165,23 +186,41 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
         String accountName = "AcctA";
 
         // Schedule parallel read groups every 100ms
+        // Schedule a recurring task
         scheduler.scheduleAtFixedRate(() -> {
             System.out.println("\n=== 🧩 NEW READ GROUP ===");
 
-            ExecutorService exec = Executors.newFixedThreadPool(3);
+            int transactionCount = 50; // number of concurrent transactions
+            ExecutorService exec = Executors.newFixedThreadPool(transactionCount);
+
             String id = UUID.randomUUID().toString();
             timeTakenForTransactionToBeExecuted.put(id, System.currentTimeMillis());
 
-            exec.submit(() ->
-                    clientServer.sendReadRequest(accountName, ReadConcern.EVENTUAL, ReadLevel.LOCAL, id));
-            exec.submit(() ->
-                    clientServer.sendReadRequest(accountName, ReadConcern.CAUSAL, ReadLevel.MAJORITY, id));
-            exec.submit(() ->
-                    clientServer.sendReadRequest(accountName, ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY, id));
+            // Submit 30 read requests in parallel
+            for (int i = 0; i < transactionCount; i++) {
+                int index = i; // capture loop variable
+                exec.submit(() -> {
+                    ReadConcern concern;
+                    ReadLevel level;
+
+                    if (index % 3 == 0) {
+                        concern = ReadConcern.EVENTUAL;
+                        level = ReadLevel.LOCAL;
+                    } else if (index % 3 == 1) {
+                        concern = ReadConcern.CAUSAL;
+                        level = ReadLevel.MAJORITY;
+                    } else {
+                        concern = ReadConcern.LINEARIZABLE;
+                        level = ReadLevel.MAJORITY;
+                    }
+
+                    clientServer.sendReadRequest(accountName, concern, level, id);
+                });
+            }
 
             exec.shutdown();
-        }, 20, 100, TimeUnit.MILLISECONDS);
 
+        }, 20, 50, TimeUnit.MILLISECONDS); // initial delay = 20ms, run every 1 second
         System.out.println("⏱️ Parallel read groups scheduled every 100ms with unique IDs");
         server.awaitTermination();
     }

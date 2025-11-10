@@ -1126,9 +1126,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<ClientMessage> currentBatch = new ArrayList<>();
         // remove and add the current batch of transactions to currentBatch List
         int backLog = 0;
+        double totalFollowerTps = 0;
         batchLock.lock();
         try {
             currentBatch.addAll(batchOfTransactions);
+            totalFollowerTps = combinedThroughputOfFollowers;
             batchOfTransactions.clear();
             backLog = backLogTransactions.size();
         } finally {
@@ -1138,7 +1140,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty()) return;
 
-        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog);
+        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog, totalFollowerTps);
         // first I create a hashset of all the transactions id which are going to be executed
         // this part can be optimised a bit
 //        // we can add parallelize this stream if needed
@@ -1469,13 +1471,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
 
-    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch, int backLog) {
+    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch, int backLog, double totalFollowerTps) {
         // we can use lua scripts instead of using lock at application level
         redisLock.writeLock().lock();
         try {
 
             // current metrics
-            double currentTps = getSystemWideThroughput();
+            double currentTps = getSystemWideThroughput() + totalFollowerTps;
             adjustTokenCostsBasedOnLatency(currentTps);
             TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
             double currentTokens = tb.getTokenCount();
