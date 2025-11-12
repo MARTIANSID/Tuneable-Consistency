@@ -726,7 +726,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     count++;
                 }
             }
-
             // check majority and term
             if (count >= (NUM_OF_SERVERS / 2) && log.get(idx).term == currentTerm.get()) {
                 return idx;
@@ -1575,12 +1574,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         return;
                     }
                     LogEntry entry = null;
-                    if (readLevel == ReadLevel.MAJORITY) {
-                        entry = log.get(commitIndex.get());
-                    } else {
-                        entry = log.get(log.size() - 1);
+                    lock.readLock().lock();
+                    try {
+                        if (readLevel == ReadLevel.MAJORITY) {
+                            entry = log.get(commitIndex.get());
+                        } else {
+                            entry = log.get(log.size() - 1);
+                        }
+                    } finally {
+                        lock.readLock().unlock();
                     }
-
                     if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
                         synchronized (systemWideThroughput) {
                             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
