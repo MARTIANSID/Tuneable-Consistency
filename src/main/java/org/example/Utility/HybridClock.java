@@ -55,9 +55,12 @@ public class HybridClock {
             return Objects.hash(physical, logical); // Create hash code based on physical and logical
         }
     }
+
     static class PhysicalClock {
         long physical;
-        public PhysicalClock() {}
+
+        public PhysicalClock() {
+        }
 
         public long now() {
             this.physical = System.currentTimeMillis();
@@ -72,6 +75,7 @@ public class HybridClock {
     public HybridClock() {
         this.physicalClock = new PhysicalClock();
     }
+
     public TimeStamp now() {
         TimeStamp now;
         long currentPhysical = this.physicalClock.now();
@@ -89,15 +93,31 @@ public class HybridClock {
         return now;
     }
 
+    //    public void update(TimeStamp in) {
+//        TimeStamp now = now();
+//
+//        if (now.physical > in.physical) {
+//            return;
+//        }
+//
+//        this.lastPhysical = in.physical;
+//        this.nextLogical = Math.max(in.logical, now.logical) + 1;
+//    }
     public void update(TimeStamp in) {
-        TimeStamp now = now();
-
-        if (now.physical > in.physical) {
+        // If remote physical < local physical, ignore (local is ahead).
+        if (in.physical < lastPhysical) {
             return;
         }
 
-        this.lastPhysical = in.physical;
-        this.nextLogical = Math.max(in.logical, now.logical) + 1;
+        if (in.physical > lastPhysical) {
+            // Adopt remote physical; set logical to remote.logical + 1
+            lastPhysical = in.physical;
+            nextLogical = in.logical + 1;
+        } else {
+            // Equal physical: set logical to max(localLogical, remoteLogical) + 1
+            // Note: nextLogical is the next value to be emitted by now() when physical is tied.
+            nextLogical = Math.max(nextLogical, in.logical) + 1;
+        }
     }
 
     // some test cases
