@@ -302,9 +302,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
  public void setUpStubs() {
     // CloudLab nodes participating in the cluster
     String[] hosts = {
-        "clnode061.clemson.cloudlab.us",
-        "clnode046.clemson.cloudlab.us",
-        "clnode063.clemson.cloudlab.us"
+        "pc50.cloudlab.umass.edu",
+        "pc52.cloudlab.umass.edu",
+        "pc56.cloudlab.umass.edu",
+        "pc58.cloudlab.umass.edu",
+        "pc59.cloudlab.umass.edu",
+        "pc61.cloudlab.umass.edu"
     };
 
     for (int i = 0; i < NUM_OF_SERVERS; i++) {
