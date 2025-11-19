@@ -190,6 +190,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final Map<Integer, Double> ewmaLatency = new ConcurrentHashMap<>();
     private final Map<Integer, Long> lastUpdateAt = new ConcurrentHashMap<>();
 
+    public ConcurrentHashMap<String, RaftStub> clientStubs;
+
     private static final double L_HEALTHY_MS = 30.0;   // healthy latency
     private static final double L_BAD_MS = 1000.0;  // bad latency
     private static final double CONVEX_P = 2.0;    // convexity exponent (>1)
@@ -205,6 +207,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     long lastThroughputSentTime;
 
     double combinedSystemWideThroughputOnFollower;
+
+
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -273,6 +277,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.followerReadThroughput = new double[NUM_OF_SERVERS];
         this.combinedThroughputOfFollowers = 0;
         this.lastThroughputSentTime = 0;
+        this.clientStubs = new ConcurrentHashMap<>();
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
@@ -533,6 +538,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // Track incoming transaction rate
         trackIncomingTransaction();
+        String clientId = getClientId(clientMessage.getCallbackHost(), clientMessage.getCallbackPort());
+
+        clientStubs.computeIfAbsent(clientId,
+                k -> createClientStub(clientMessage.getCallbackHost(), clientMessage.getCallbackPort()));
 
         // here I add the transactions in batch
         batchLock.lock();
@@ -542,6 +551,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             batchLock.unlock();
         }
+    }
+
+    private String getClientId(String host, int port) {
+        return host + ":" + port;
+    }
+
+    private RaftStub createClientStub(String host, int port) {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
+        return RaftGrpc.newStub(channel);
     }
 
     /**
@@ -704,7 +722,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<LogEntryProto> result = new ArrayList<>();
 
         for (LogEntry entry : entries) {
-            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCopyOfWriteConcern(entry.copyOfWriteConcern).build());
+            result.add(LogEntryProto.newBuilder().setLogIndex(entry.index).setT(entry.t).setTerm(entry.term).addAllServersThatReplicatedThisEntry(entry.serversThatReplicatedThisEntry).setWriteConcern(entry.writeConcern).setTimeStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCopyOfWriteConcern(entry.copyOfWriteConcern).setCallbackHost(entry.clientHost).setCallbackPort(entry.clientPort).setTimeOfArrivalAtLeader(entry.timeOfArrivalAtLeader).build());
         }
         return result;
     }
@@ -736,7 +754,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // it is not in log
     private CompletableFuture<Void> sendAckForEntries(List<LogEntry> entriesToBeAck) {
-        List<AckMessage> ackMessages = new ArrayList<>();
+        Map<String, List<AckMessage>> ackMessagesPerClient = new HashMap<>();
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock specific to the sendAck logic to avoid sending multiple ack
         // this is just about minimising repeated acks, not compulsory to add it, now for the calculation of the metrics this is strictly required
@@ -745,6 +763,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         for (LogEntry entry : entriesToBeAck) {
             String id = entry.t.getId();
+            String clientHost = entry.clientHost;
+            int clientPort = entry.clientPort;
+            String clientId= getClientId(clientHost, clientPort);
+
+            clientStubs.computeIfAbsent(clientId, k -> createClientStub(clientHost, clientPort));
 
             // this field is seperate for each thread, so there will be no race conditions for this
             boolean firstAck = false;
@@ -757,12 +780,21 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     ackSent.put(id, true);
                     // send ack for this entry
                     ackTransactionCount.incrementAndGet();
+                    AckMessage.Builder ackBuilder = AckMessage.newBuilder()
+                            .setT(entry.t)
+                            .setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp))
+                            .setCurrentLeader(serverId);
+
                     if (entry.t.getIsReadOnly()) {
-                        ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).setId(id).setBalance(clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0)).build());
-                    } else {
-                        ackMessages.add(AckMessage.newBuilder().setT(entry.t).setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp)).setCurrentLeader(serverId).build());
+                        ackBuilder.setId(id)
+                                .setBalance(clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
                     }
 
+                    AckMessage ackMessage = ackBuilder.build();
+
+                    // grouping the ack messages based on the clientId
+                    ackMessagesPerClient.putIfAbsent(clientId, new ArrayList<>());
+                    ackMessagesPerClient.get(clientId).add(ackMessage);
                 }
             }
 
@@ -788,31 +820,32 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             }
         }
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        // this is the case when ack was sent earlier because of lesser writeConcern but now it is being sent again on committing
-        if (ackMessages.isEmpty()) {
-            future.complete(null);
-            return future;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (Map.Entry<String, List<AckMessage>> clientEntry : ackMessagesPerClient.entrySet()) {
+            String clientId = clientEntry.getKey();
+            List<AckMessage> messages = clientEntry.getValue();
+
+
+            RaftGrpc.RaftStub stub = clientStubs.get(clientId);
+
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            futures.add(future);
+
+            stub.sendAckToClient(Ack.newBuilder().addAllAckMessage(messages).build(), new StreamObserver<Empty>() {
+                @Override
+                public void onNext(Empty empty) {}
+                @Override
+                public void onError(Throwable t) {
+                    future.completeExceptionally(t);
+                }
+                @Override
+                public void onCompleted() {
+                    future.complete(null);
+                }
+            });
         }
-        // refresh the context, not sure if this is required need to research a but
-        RaftGrpc.RaftStub refreshContextClientStub = clientStub.withDeadlineAfter(2, TimeUnit.SECONDS);
-        refreshContextClientStub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(), new StreamObserver<Empty>() {
-            @Override
-            public void onNext(Empty empty) {
-                System.out.println("Ack RPC onNext Recevied");
-            }
 
-            @Override
-            public void onError(Throwable throwable) {
-                future.completeExceptionally(throwable);
-            }
-
-            @Override
-            public void onCompleted() {
-                future.complete(null);
-            }
-        });
-        return future;
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
     }
 
     public long getAverageLatency(int writeConcern) {
@@ -1195,12 +1228,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 Transaction t = clientMessage.getT();
                 int writeConcern = clientMessage.getWriteConcern();
+                String host = clientMessage.getCallbackHost();
+                int port = clientMessage.getCallbackPort();
                 String id = t.getId();
-
                 // we do update the clock of leader using followers
                 HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
                 // appending the entry in log
-                log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS, System.currentTimeMillis()));
+                log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS, System.currentTimeMillis(), host, port));
                 updateBalances(t, clientBalancesLatest);
                 // we need this to implement causal consistency
                 timeStampsInLog.put(currentTimeStamp, index);
@@ -1555,6 +1589,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         String accName = readRequest.getAccNameToRead();
         ReadLevel readLevel = readRequest.getReadLevel();
+        String host = readRequest.getCallbackHost();
+        int port = readRequest.getCallbackPort();
         String id = readRequest.getId();
 
         int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -1636,7 +1672,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             batchLock.lock();
             try {
-                batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).build());
+                batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).setCallbackHost(host).setCallbackPort(port).build());
                 System.out.println(batchOfTransactions);
             } finally {
                 batchLock.unlock();

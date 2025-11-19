@@ -222,7 +222,7 @@ public class BatchProcessor {
                 UpgradeOption opt = pq.poll();
 
                 // Check if upgrade is still valid and affordable
-                if (opt.toWC > consistencyLevels[opt.txIndex]) {
+                if (opt.toWC > consistencyLevels[opt.txIndex] && opt.fromWC == consistencyLevels[opt.txIndex]){
 
                     if (opt.upgradeCost <= budget + EPS) {
                         budget -= opt.upgradeCost;
@@ -268,6 +268,8 @@ public class BatchProcessor {
             ClientMessage msg = ClientMessage.newBuilder()
                     .setT(tx.clientMessage.getT())
                     .setWriteConcern(wc)
+                    .setCallbackHost(tx.clientHost)
+                    .setCallbackPort(tx.clientPort)
                     .build();
             result.add(msg);
         }
@@ -290,6 +292,8 @@ public class BatchProcessor {
                 ClientMessage msg = ClientMessage.newBuilder()
                         .setT(tx.clientMessage.getT())
                         .setWriteConcern(tx.minRequiredConsistency)
+                        .setCallbackPort(tx.clientPort)
+                        .setCallbackHost(tx.clientHost)
                         .build();
                 result.add(msg);
             }

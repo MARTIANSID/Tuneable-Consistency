@@ -21,8 +21,11 @@ public class LogEntry {
     // now if this timestamp is used at the follower end, there will some miscalculations for follower (this can only happen when leader fails and is not able to replicate to majority of servers, and on of the servers which have this entry becomes the leader). These little bit of miscalculations are fine as we only use them to adjust the writeConcern costs (this will ideally have the same effect for all)
     public Long timeOfArrivalAtLeader;
 
+    public String clientHost;
+    public int clientPort;
+
     // this constructor is for the leader
-    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, int NUM_OF_SERVERS, long timeOfArrivalAtLeader) {
+    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, int NUM_OF_SERVERS, long timeOfArrivalAtLeader, String clientHost, int clientPort) {
         this.index = index;
         this.term = term;
         this.t = t;
@@ -34,6 +37,8 @@ public class LogEntry {
         // this copy is used at the time of ack to compute the throughput for individual writeConcerns
         this.copyOfWriteConcern = writeConcern;
         this.timeOfArrivalAtLeader = timeOfArrivalAtLeader;
+        this.clientHost = clientHost;
+        this.clientPort = clientPort;
 
         for(int i = 0 ; i < NUM_OF_SERVERS; i ++) {
             // false means that this entry was not replicated on this server
@@ -41,7 +46,7 @@ public class LogEntry {
         }
     }
     // this constructor is for the follower to use
-    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, List<Boolean> serversThatReplicatedThisEntry, int copyOfWriteConcern) {
+    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, List<Boolean> serversThatReplicatedThisEntry, int copyOfWriteConcern, String clientHost, int clientPort, long timeOfArrivalAtLeader){
         this.index = index;
         this.term = term;
         this.t = t;
@@ -50,7 +55,9 @@ public class LogEntry {
         this.timeStamp = timeStamp;
         this.serversThatReplicatedThisEntry = serversThatReplicatedThisEntry;
         this.copyOfWriteConcern = copyOfWriteConcern;
-
+        this.clientHost = clientHost;
+        this.clientPort = clientPort;
+        this.timeOfArrivalAtLeader = timeOfArrivalAtLeader;
 
 //        for(int i = 0 ; i < 5; i ++) {
 //            serversThatReplicatedThisEntry.set(i, serversThatReplicatedThisEntry.get(i));

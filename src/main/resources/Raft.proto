@@ -57,6 +57,9 @@ message ClientMessage {
   Transaction t = 1;
   int32 writeConcern = 2;
   TimeStampProto timeStamp = 3;
+
+  string callbackHost = 4;
+  int32 callbackPort = 5;
 }
 
 message ClientReadRequest {
@@ -65,7 +68,11 @@ message ClientReadRequest {
   TimeStampProto timeStamp = 3;
   ReadLevel readLevel = 4;
   string id = 5;
+
+  string callbackHost = 6;
+  int32 callbackPort = 7;
 }
+
 
 
 message Transaction {
@@ -96,6 +103,10 @@ message LogEntryProto {
   TimeStampProto timeStamp = 5;
   repeated bool serversThatReplicatedThisEntry = 6;
   int32 copyOfWriteConcern = 7;
+  string callbackHost = 8;
+  int32 callbackPort = 9;
+  int64 timeOfArrivalAtLeader = 10;
+
 }
 
 message TimeStampProto {
