@@ -17,14 +17,19 @@ public class TransactionOption {
 
     public double extraIntermediateProfit;
 
-   public String id;
+    public String clientHost;
+    public int clientPort;
 
-    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit) {
+    public String id;
+
+    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit, String clientHost, int clientPort) {
         this.minRequiredConsistency = minRequiredConsistency;
         this.baseProfit = baseProfit;
         this.extraMajorityProfit = extraMajorityProfit;
         this.clientMessage = clientMessage;
         this.extraIntermediateProfit = extraIntermediateProfit;
+        this.clientHost = clientHost;
+        this.clientPort = clientPort;
     }
 
     public static List<TransactionOption> convertToTransactionOption(List<ClientMessage> clientMessageList) {
@@ -33,10 +38,9 @@ public class TransactionOption {
 
         for(ClientMessage cm : clientMessageList) {
             Transaction t = cm.getT();
-            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit()));
+            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit(),cm.getCallbackHost(), cm.getCallbackPort() ));
         }
         return transactionOptionList;
     }
 }
-
 

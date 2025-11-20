@@ -206,11 +206,11 @@ public class BatchProcessor {
                     double upgradeCost = nextCost - currentCost;
 
                     // Skip if upgrade cost is negative or negligible
-                        double nextProfit = (currentWC + 1 == majority)
-                                ? tx.extraMajorityProfit
-                                : tx.extraIntermediateProfit;
-                        double ratio = nextProfit / (upgradeCost + EPS);
-                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
+                    double nextProfit = (currentWC + 1 == majority)
+                            ? tx.extraMajorityProfit
+                            : tx.extraIntermediateProfit;
+                    double ratio = nextProfit / (upgradeCost + EPS);
+                    pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
                 }
             }
 
@@ -222,7 +222,7 @@ public class BatchProcessor {
                 UpgradeOption opt = pq.poll();
 
                 // Check if upgrade is still valid and affordable
-                if (opt.toWC > consistencyLevels[opt.txIndex]) {
+                if (opt.toWC > consistencyLevels[opt.txIndex] && opt.fromWC == consistencyLevels[opt.txIndex]){
 
                     if (opt.upgradeCost <= budget + EPS) {
                         budget -= opt.upgradeCost;
@@ -242,11 +242,11 @@ public class BatchProcessor {
                             double nextUpgradeCost = nextCost - currentCost;
 
                             // Only add if cost increase is meaningful
-                                double nextProfit = (nextWC == majority)
-                                        ? transactions.get(opt.txIndex).extraMajorityProfit
-                                        : transactions.get(opt.txIndex).extraIntermediateProfit;
-                                double nextRatio = nextProfit / (nextUpgradeCost + EPS);
-                                pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));}
+                            double nextProfit = (nextWC == majority)
+                                    ? transactions.get(opt.txIndex).extraMajorityProfit
+                                    : transactions.get(opt.txIndex).extraIntermediateProfit;
+                            double nextRatio = nextProfit / (nextUpgradeCost + EPS);
+                            pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));}
                     }
                 }
             }
@@ -268,6 +268,8 @@ public class BatchProcessor {
             ClientMessage msg = ClientMessage.newBuilder()
                     .setT(tx.clientMessage.getT())
                     .setWriteConcern(wc)
+                    .setCallbackHost(tx.clientHost)
+                    .setCallbackPort(tx.clientPort)
                     .build();
             result.add(msg);
         }
@@ -290,6 +292,8 @@ public class BatchProcessor {
                 ClientMessage msg = ClientMessage.newBuilder()
                         .setT(tx.clientMessage.getT())
                         .setWriteConcern(tx.minRequiredConsistency)
+                        .setCallbackPort(tx.clientPort)
+                        .setCallbackHost(tx.clientHost)
                         .build();
                 result.add(msg);
             }

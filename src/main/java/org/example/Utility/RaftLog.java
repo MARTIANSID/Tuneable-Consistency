@@ -41,7 +41,7 @@ public class RaftLog {
     }
     public LogEntry get(int index) {
         if (index < 0) {
-            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L), NUM_OF_SERVERS, 0);
+            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L), new ArrayList<>(), 0,"",-1, -1);
         }
         lock.readLock().lock();
         try {
@@ -54,7 +54,7 @@ public class RaftLog {
     public List<LogEntry> getEntries(int start, int end) {
         lock.readLock().lock();
         try {
-           return log.subList(start, end + 1);
+            return log.subList(start, end + 1);
         } finally {
             lock.readLock().unlock();
         }
@@ -131,7 +131,7 @@ public class RaftLog {
                 // I use new ArrayList here because for some reason the list returned from protobuf is immutable
                 log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(),
                         HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),
-                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()), entry.getCopyOfWriteConcern())); // Ensure it's mutable
+                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()), entry.getCopyOfWriteConcern(), entry.getCallbackHost(), entry.getCallbackPort(), entry.getTimeOfArrivalAtLeader())); // Ensure it's mutable
 
                 // here I update the writeConcern as well, but this method does not acquire lock and is private, this when followers add the entries sent from the leader
                 updateWriteConcernInternal(log.size() - 1, serverId);
