@@ -209,6 +209,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     double combinedSystemWideThroughputOnFollower;
 
 
+    AtomicLong[] lastHeartBeatReceived;
+
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
@@ -278,6 +280,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.combinedThroughputOfFollowers = 0;
         this.lastThroughputSentTime = 0;
         this.clientStubs = new ConcurrentHashMap<>();
+        this.lastHeartBeatReceived = new AtomicLong[NUM_OF_SERVERS];
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             //setting up the nextIndex and matchIndex
@@ -765,7 +768,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             String id = entry.t.getId();
             String clientHost = entry.clientHost;
             int clientPort = entry.clientPort;
-            String clientId= getClientId(clientHost, clientPort);
+            String clientId = getClientId(clientHost, clientPort);
 
             clientStubs.computeIfAbsent(clientId, k -> createClientStub(clientHost, clientPort));
 
@@ -833,11 +836,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             stub.sendAckToClient(Ack.newBuilder().addAllAckMessage(messages).build(), new StreamObserver<Empty>() {
                 @Override
-                public void onNext(Empty empty) {}
+                public void onNext(Empty empty) {
+                }
+
                 @Override
                 public void onError(Throwable t) {
                     future.completeExceptionally(t);
                 }
+
                 @Override
                 public void onCompleted() {
                     future.complete(null);
@@ -887,11 +893,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<LogEntry> committedEntriesAck = new ArrayList<>();
         List<LogEntry> eventualEntriesAck = new ArrayList<>();
 
+        boolean stillLeader = true;
+
         // Lock for reading and writing shared state
         lock.writeLock().lock();  // Lock to ensure exclusive write access for updating `nextIndex`, `matchIndex`, etc.
         try {
             // this makes the function idempotent
             if (status != ServerCurrentStatus.LEADER) {
+                stillLeader = false;
                 return false;
             }
             // updating the clock of leader, if its behind it can catchup
@@ -901,6 +910,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 currentTerm.updateAndGet(term -> Math.max(term, termOfFollower));
                 // Become follower
                 becomeFollower();
+                stillLeader = false;
                 return false;
             }
             // updating the throughput of follower
@@ -908,6 +918,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 combinedThroughputOfFollowers = combinedThroughputOfFollowers - followerReadThroughput[idOfFollower] + appendEntriesResult.getFollowerReadThroughput();
                 followerReadThroughput[idOfFollower] = appendEntriesResult.getFollowerReadThroughput();
             }
+
 
             if (!result) {
                 // added just to ensure that nextIndex does not decrement twice (maybe it can happen, need to think of this situation again)
@@ -949,20 +960,23 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
 
-            // sending ack logic is kept outside the lock to reduce the contention
-            // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
-            if (!committedEntriesAck.isEmpty()) {
-                sendAckForEntries(committedEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
+            if (stillLeader) {
+                // sending ack logic is kept outside the lock to reduce the contention
+                // after releasing the lock maybe I can wait for a certain time till all the acks are sent?
+                if (!committedEntriesAck.isEmpty()) {
+                    sendAckForEntries(committedEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
 //                    System.out.println("Ack failed reason: " + ex);
-                    return null;
-                }));
-            }
+                        return null;
+                    }));
+                }
 
-            if (!eventualEntriesAck.isEmpty()) {
-                sendAckForEntries(eventualEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
+                if (!eventualEntriesAck.isEmpty()) {
+                    sendAckForEntries(eventualEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
 //                    System.out.println("Ack failed reason: " + ex);
-                    return null;
-                }));
+                        return null;
+                    }));
+                }
+                lastHeartBeatReceived[idOfFollower].set(System.currentTimeMillis());
             }
         }
         return true;
@@ -1582,6 +1596,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    boolean canServeLinearizableRead() {
+        long LEASE_DURATION_MS = 1900;
+        long now = System.currentTimeMillis();
+        int freshCount = 0;
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            if (i == serverId) continue;
+            if (now - lastHeartBeatReceived[i].get() < LEASE_DURATION_MS) {
+                freshCount++;
+            }
+        }
+        return freshCount >= (NUM_OF_SERVERS / 2);
+    }
+
     // need to review the logic
     @Override
     public void sendReadRequest(ClientReadRequest readRequest, StreamObserver<Ack> responseObserver) {
@@ -1671,13 +1698,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 lock.readLock().unlock();
             }
             batchLock.lock();
-            try {
-                batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).setCallbackHost(host).setCallbackPort(port).build());
-                System.out.println(batchOfTransactions);
-            } finally {
-                batchLock.unlock();
+//            try {
+//                batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).setCallbackHost(host).setCallbackPort(port).build());
+//                System.out.println(batchOfTransactions);
+//            } finally {
+//                batchLock.unlock();
+//            }
+
+
+//            responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
+//            responseObserver.onCompleted();
+            if (!canServeLinearizableRead()) {
+                responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build()).build());
+                responseObserver.onCompleted();
+                return;
             }
-            responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
+            responseObserver.onNext(getBalanceBasedOnReadConcern(ReadLevel.MAJORITY, accName, id));
             responseObserver.onCompleted();
         } else {
             // here the readConcern is just local
