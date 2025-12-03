@@ -1,7 +1,11 @@
 package org.example.Utility;
 
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.PriorityQueue;
 
 import org.ds.paxos.ClientMessage;
 
@@ -20,16 +24,17 @@ public class BatchProcessor {
      * <p>
      * Algorithm:
      * Phase 1: Execute ALL transactions at their minimum required consistency level
-     * Phase 2: Only if ALL transactions were processed, use remaining tokens to upgrade
+     * Phase 2: Only if ALL transactions were processed, use remaining budget to upgrade
      * transactions up to majority level to maximize profit
      */
     public ProcessResult processForThroughputThenProfit(
             List<TransactionOption> transactions,
+            double budget,
             double currentTokens,
             boolean allowUpgrades,
             HashMap<Integer, Double> writeConcernCosts) {
 
-        double usedTokens = 0.0;
+        double usedBudget = 0.0;
         double profit = 0.0;
         List<ClientMessage> result = new ArrayList<>();
         int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -75,11 +80,11 @@ public class BatchProcessor {
             double cost = writeConcernCosts.get(currentWC);
 
             // Check if we can afford this transaction (with tolerance)
-            double availableTokens = currentTokens - usedTokens;
-            double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(availableTokens), Math.abs(cost)));
+            double availableBudget = budget - usedBudget;
+            double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(availableBudget), Math.abs(cost)));
 
-            if (cost <= availableTokens + relativeEps) {
-                usedTokens += cost;
+            if (cost <= availableBudget + relativeEps) {
+                usedBudget += cost;
                 profit += txProfit;
                 consistencyLevels[i] = currentWC;
             } else {
@@ -88,11 +93,11 @@ public class BatchProcessor {
             }
         }
 
-        double remainingTokens = currentTokens - usedTokens;
+        double remainingBudget = budget - usedBudget;
         int transactionsUpgraded = 0;
 
-        // Phase 2: Upgrade transactions using remaining tokens (greedy)
-        if (allTransactionsProcessed && remainingTokens > EPS && allowUpgrades) {
+        // Phase 2: Upgrade transactions using remaining budget (greedy)
+        if (allTransactionsProcessed && remainingBudget > EPS && allowUpgrades) {
             PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
                     (a, b) -> Double.compare(b.ratio, a.ratio)
             );
@@ -119,16 +124,16 @@ public class BatchProcessor {
             }
 
             // Greedy upgrading loop
-            while (!pq.isEmpty() && remainingTokens > EPS) {
+            while (!pq.isEmpty() && remainingBudget > EPS) {
                 UpgradeOption opt = pq.poll();
 
                 // Check if upgrade is still valid and affordable
                 if (opt.toWC > consistencyLevels[opt.txIndex]) {
-                    double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(remainingTokens), Math.abs(opt.upgradeCost)));
+                    double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(remainingBudget), Math.abs(opt.upgradeCost)));
 
-                    if (opt.upgradeCost <= remainingTokens + relativeEps) {
-                        remainingTokens -= opt.upgradeCost;
-                        usedTokens += opt.upgradeCost;
+                    if (opt.upgradeCost <= remainingBudget + relativeEps) {
+                        remainingBudget -= opt.upgradeCost;
+                        usedBudget += opt.upgradeCost;
                         profit += opt.additionalProfit;
                         consistencyLevels[opt.txIndex] = opt.toWC;
                         transactionsUpgraded++;
@@ -168,7 +173,7 @@ public class BatchProcessor {
             result.add(msg);
         }
 
-        return new ProcessResult(result, usedTokens, profit, transactionsUpgraded);
+        return new ProcessResult(result, usedBudget, profit, transactionsUpgraded);
     }
 
     public ProcessResult processTransactionUnderutilised(List<TransactionOption> transactions, double budget, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
@@ -277,28 +282,44 @@ public class BatchProcessor {
         return new ProcessResult(result, tokensUsed, profit, transactionsUpgraded);
     }
 
-    public ProcessResult processTransactions(List<TransactionOption> batch, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
-        List<TransactionOption> toProcess = batch;
-        double budget = 10000;
-        if(batch.size() > currentTokens) {
+    public ProcessResult processTransactions(List<TransactionOption> batch, double budget, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
+        // Calculate total cost of processing all transactions at minimum consistency
+        double totalMinCost = 0;
+        for (TransactionOption tx : batch) {
+            totalMinCost += writeConcernCosts.get(tx.minRequiredConsistency);
+        }
+        
+        // If total cost exceeds budget, process subset of transactions
+        if (totalMinCost > budget + EPS) {
             double profit = 0;
-            // backlog
+            double usedBudget = 0;
+            // Sort by minimum consistency to process cheaper transactions first
             Collections.sort(batch, Comparator.comparingInt(a -> a.minRequiredConsistency));
-            toProcess = batch.subList(0, (int)currentTokens);
+            
             List<ClientMessage> result = new ArrayList<>();
-            for(int i = 0; i < toProcess.size(); i++) {
-                TransactionOption tx = toProcess.get(i);
-                profit += tx.baseProfit;
-                ClientMessage msg = ClientMessage.newBuilder()
-                        .setT(tx.clientMessage.getT())
-                        .setWriteConcern(tx.minRequiredConsistency)
-                        .setCallbackPort(tx.clientPort)
-                        .setCallbackHost(tx.clientHost)
-                        .build();
-                result.add(msg);
+            List<TransactionOption> toProcess = new ArrayList<>();
+            
+            // Process transactions until budget is exhausted
+            for (TransactionOption tx : batch) {
+                double txCost = writeConcernCosts.get(tx.minRequiredConsistency);
+                if (usedBudget + txCost <= budget + EPS) {
+                    usedBudget += txCost;
+                    profit += tx.baseProfit;
+                    toProcess.add(tx);
+                    ClientMessage msg = ClientMessage.newBuilder()
+                            .setT(tx.clientMessage.getT())
+                            .setWriteConcern(tx.minRequiredConsistency)
+                            .build();
+                    result.add(msg);
+                } else {
+                    break; // Budget exhausted
+                }
             }
+            
+            System.out.println("Budget exceeded: processed " + toProcess.size() + "/" + batch.size() + " transactions, used budget: " + usedBudget);
             return new ProcessResult(result, toProcess.size(), profit, 0);
         } else {
+            // Budget sufficient for all transactions at min consistency + upgrades
             return processTransactionUnderutilised(batch, budget, allowUpgrades, writeConcernCosts);
         }
     }

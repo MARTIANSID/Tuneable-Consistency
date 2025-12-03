@@ -1,17 +1,24 @@
 package org.example.Client;
 
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
 import org.ds.paxos.ClientMessage;
 import org.ds.paxos.RaftGrpc;
 import org.ds.paxos.Transaction;
 
-import java.time.Duration;
-import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 
 /**
  * WorkloadSimulator drives a sequence of traffic phases to emulate a realistic production style pattern:
@@ -112,6 +119,8 @@ public class WorkloadSimulator {
                 .setT(tx)
                 // initial writeConcern = minConsistency; server may upgrade if profitable
                 .setWriteConcern(minConsistency)
+            .setCallbackHost("localhost")
+            .setCallbackPort(9000)
                 .build();
         try {
             stub.sendTransaction(msg); // fire & forget (blocking call but quick)
@@ -149,7 +158,7 @@ public class WorkloadSimulator {
                         // Acquire / rotate channel
                         int port = serverPorts.get(portIndex);
                         portIndex = (portIndex + 1) % serverPorts.size();
-                        ManagedChannel channel = newChannel(8001);
+                        ManagedChannel channel = newChannel(port);
                         RaftGrpc.RaftBlockingStub stub = RaftGrpc.newBlockingStub(channel);
                         CountDownLatch latch = new CountDownLatch(toSend);
                         for (int i = 0; i < toSend; i++) {
@@ -197,43 +206,43 @@ public class WorkloadSimulator {
 
         // Phase 1: Warm-up (high rate, mostly WC=1, encourage upgrades via profit incentives)
         simulator.addPhase(new Phase(
-                "WarmUp", 15, 2000, 0.15,
+                "WarmUp", 100, 10000, 0.15,
                 mapOf(
                         1, 0.75,
                         2, 0.10,
-                        3, 0.10,
-                        (numServers / 2) + 1, 0.05
-                ),
-                0.5, // extraIntermediateProfit
-                0.5  // extraMajorityProfit
+                        3, 0.15
+                                    ),
+                0.0, // extraIntermediateProfit
+                0.0  // extraMajorityProfit
         ));
 
         // Phase 2: Heavy Spike (dominantly higher write concerns 3 & majority to drain tokens and cause backlog)
         simulator.addPhase(new Phase(
-                "Spike", 8, 520, 0.25,
+                "Spike", 150, 30000, 0.25,
                 mapOf(
                         1, 0.10,
-                        3, 0.50,
-                        (numServers / 2) + 1, 0.40
+                        2, 0.50,
+                        3, 0.40
                 ),
-                0.3,
-                0.4
+                0.0,
+                0.0
         ));
 
         // Phase 3: Stabilization (mixed workload, moderate rate)
         simulator.addPhase(new Phase(
-                "Stabilize", 25, 300, 0.20,
+                "Stabilize", 100, 15000, 0.20,
                 mapOf(
                         1, 0.50,
-                        2, 0.20,
-                        3, 0.20,
-                        (numServers / 2) + 1, 0.10
-                ),
-                0.4,
-                0.4
+                        2, 0.30,
+                        3, 0.20                
+                    ),
+                0.0,
+                0.0
         ));
 
+        // Run phases in a continuous cycle
         simulator.run();
+        
     }
 
     // Convenience for inline map creation using varargs (k1,v1,k2,v2,...)

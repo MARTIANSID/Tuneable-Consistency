@@ -1,14 +1,35 @@
 package org.example.Client;
 
-import io.grpc.*;
-import io.grpc.stub.StreamObserver;
-import org.ds.paxos.*;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import org.ds.paxos.Ack;
+import org.ds.paxos.AckMessage;
+import org.ds.paxos.ClientReadRequest;
+import org.ds.paxos.Empty;
+import org.ds.paxos.RaftGrpc;
+import org.ds.paxos.ReadConcern;
+import org.ds.paxos.ReadLevel;
+import org.ds.paxos.Transaction;
 import org.example.Utility.HybridClock;
 
-import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.locks.*;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+import io.grpc.stub.StreamObserver;
 
 public class ClientServerImpl extends RaftGrpc.RaftImplBase {
 
@@ -18,7 +39,7 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
     private final HybridClock hybridClock;
     private HybridClock.TimeStamp lastTimeStamp;
     private final RaftGrpc.RaftStub[] stubs;
-    private final int NUM_OF_SERVERS = 5;
+    private final int NUM_OF_SERVERS = 3;
 
     private int currentLeader = 2;
     private int totalTransactions = 0;
@@ -43,16 +64,36 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // --- Setup gRPC Stubs ---
+    // public void setUpStubs() {
+    //     for (int i = 0; i < NUM_OF_SERVERS; i++) {
+    //         ManagedChannel channel = ManagedChannelBuilder
+    //                 .forAddress("clnode063.clemson.cloudlab.us", 8000 + (i + 1))
+    //                 .enableRetry()
+    //                 .usePlaintext()
+    //                 .build();
+    //         stubs[i] = RaftGrpc.newStub(channel);
+    //     }
+    //     System.out.println("✅ Client connected to all " + NUM_OF_SERVERS + " Raft servers");
+    // }
     public void setUpStubs() {
+    // CloudLab nodes participating in the cluster
+        String[] hosts = {
+            "clnode061.clemson.cloudlab.us",
+            "clnode046.clemson.cloudlab.us",
+            "clnode063.clemson.cloudlab.us"
+        };
+
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            int port = 8000; // 8001, 8002, 8003
             ManagedChannel channel = ManagedChannelBuilder
-                    .forAddress("localhost", 8000 + (i + 1))
+                    .forAddress(hosts[i], port)
                     .enableRetry()
                     .usePlaintext()
                     .build();
+
             stubs[i] = RaftGrpc.newStub(channel);
-        }
-        System.out.println("✅ Client connected to all " + NUM_OF_SERVERS + " Raft servers");
+                
+            }
     }
 
     // --- Handle ACKs from Raft servers ---
@@ -190,7 +231,7 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
         scheduler.scheduleAtFixedRate(() -> {
             System.out.println("\n=== 🧩 NEW READ GROUP ===");
 
-            int transactionCount = 50; // number of concurrent transactions
+            int transactionCount = 10; // number of concurrent transactions
             ExecutorService exec = Executors.newFixedThreadPool(transactionCount);
 
             String id = UUID.randomUUID().toString();
@@ -202,7 +243,6 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
                 exec.submit(() -> {
                     ReadConcern concern;
                     ReadLevel level;
-
                     if (index % 3 == 0) {
                         concern = ReadConcern.EVENTUAL;
                         level = ReadLevel.LOCAL;
@@ -213,6 +253,8 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
                         concern = ReadConcern.LINEARIZABLE;
                         level = ReadLevel.MAJORITY;
                     }
+                    concern = ReadConcern.LINEARIZABLE;
+                    level = ReadLevel.MAJORITY;
 
                     clientServer.sendReadRequest(accountName, concern, level, id);
                 });
@@ -220,7 +262,7 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
 
             exec.shutdown();
 
-        }, 20, 50, TimeUnit.MILLISECONDS); // initial delay = 20ms, run every 1 second
+        }, 20, 20, TimeUnit.MILLISECONDS); // initial delay = 20ms, run every 1 second
         System.out.println("⏱️ Parallel read groups scheduled every 100ms with unique IDs");
         server.awaitTermination();
     }

@@ -14,10 +14,11 @@ import io.grpc.ManagedChannelBuilder;
 
 public class Test {
     private static final int THREAD_COUNT = 10; // Number of parallel transactions
-    private static final int NUM_OF_SERVERS = 5;
+    private static final int NUM_OF_SERVERS = 3;
 
     private static int pickWeightedWriteConcern() {
         // 1) compute sum of weights
+        
         double total = 0;
         for (double w : WC_WEIGHTS) {
             total += w;
@@ -58,7 +59,7 @@ public class Test {
         final Random random = new Random();
 
         while (true) {
-            ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8003).usePlaintext().build();
+            ManagedChannel channel = ManagedChannelBuilder.forAddress("clnode063.clemson.cloudlab.us", 8000).usePlaintext().build();
             RaftGrpc.RaftBlockingStub stub = RaftGrpc.newBlockingStub(channel);
 
             ExecutorService executorService = Executors.newFixedThreadPool(THREAD_COUNT);
@@ -84,7 +85,7 @@ public class Test {
 
                         ClientMessage message = ClientMessage.newBuilder()
                                 .setT(parallelTransaction)
-                                .setWriteConcern(minConsistency)
+                                .setWriteConcern(1)
                                 .build();
 
                         stub.sendTransaction(message);

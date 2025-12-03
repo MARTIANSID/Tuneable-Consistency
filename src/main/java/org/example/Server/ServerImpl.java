@@ -140,6 +140,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     BatchProcessor transactionBatchProcessor;
+    
+    // RL Model Client for budget prediction
+    RLModelGrpcClient rlModelClient;
+    ProcessResult previousBatchResult;
 
     // For tracking incoming transactions per second
     private ConcurrentLinkedQueue<Long> incomingTransactionTimestamps;
@@ -151,11 +155,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 5;
+    private static final int BATCH_INTERVAL_MS = 20;
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 3000; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 6500; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -199,6 +203,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private static final double HEALTHY_TPS_HEADROOM = 1.30;   // allow 30% above TPS_min at healthy latency
     private static final double TPS_EPSILON = 0.20;   // allow up to +20% over TPS_min budget
     private static final double BUCKET_FRACTION_MAX = 0.95;   // max 6% of bucket per request
+    private static final double DEFAULT_BUDGET = 10000.0;  // default budget for transaction processing
 
     double[] followerReadThroughput;
 
@@ -267,6 +272,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
+        
+        // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
+        try {
+            this.rlModelClient = new RLModelGrpcClient("localhost", 50051, true, DEFAULT_BUDGET);
+            System.out.println("✓ RL Model Client initialized successfully");
+        } catch (Exception e) {
+            System.out.println("⚠ RL Model Client initialization failed, using default budget: " + e.getMessage());
+            this.rlModelClient = null;
+        }
+        this.previousBatchResult = null;
+        
         // Initialize incoming transaction tracking
         this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
         this.incomingTransactionLock = new Object();
@@ -535,7 +551,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         responseObserver.onCompleted();
 
         // Track incoming transaction rate
-        trackIncomingTransaction();
+            trackIncomingTransaction(); // Track incoming transaction rate
         String clientId = getClientId(clientMessage.getCallbackHost(), clientMessage.getCallbackPort());
 
         clientStubs.computeIfAbsent(clientId, k -> createClientStub(clientMessage.getCallbackHost(), clientMessage.getCallbackPort()));
@@ -580,6 +596,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 int incomingTPS = incomingTransactionTimestamps.size();
                 System.out.printf("📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n", serverId, incomingTPS, new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
             }
+        }
+    }
+
+    /**
+     * Compute incoming transactions per second from the timestamp window.
+     */
+    private int getIncomingTransactionsPerSecond() {
+        long now = System.currentTimeMillis();
+        synchronized (incomingTransactionLock) {
+            while (!incomingTransactionTimestamps.isEmpty() && now - incomingTransactionTimestamps.peek() >= 1000L) {
+                incomingTransactionTimestamps.poll();
+            }
+            return incomingTransactionTimestamps.size();
         }
     }
 
@@ -1499,9 +1528,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // current metrics
             double currentTps = getSystemWideThroughput() + totalFollowerTps;
             adjustTokenCostsBasedOnLatency(currentTps);
-            TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
-            double currentTokens = tb.getTokenCount();
-            long lastUpdate = tb.getLastUpdateTime();
+            // TokenBucketData tb = tokenBucket.getCurrentTokenBucketData();
+            // double currentTokens = tb.getTokenCount();
+            // long lastUpdate = tb.getLastUpdateTime();
 
             int n = currentBatch.size();
 
@@ -1509,13 +1538,38 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             List<TransactionOption> currentBatchInTransactionOption = TransactionOption.convertToTransactionOption(currentBatch);
 
             ProcessResult result;
+            
+            // Get budget from RL model or use default
+            double budget;
+            if (rlModelClient != null) {
+                try {
+                        int incomingTps = getIncomingTransactionsPerSecond();
+                        budget = rlModelClient.predictBudgetAndRecord(
+                        incomingTps,                // current_load (incoming txns/sec)
+                        currentTps,                 // current_throughput
+                        backLog,                    // current_backlog
+                        new HashMap<>(writeConcernCosts), // write concern costs
+                        0,              // capacity
+                        previousBatchResult         // previous result for training
+                    );
+                    System.out.println("🤖 Using RL-predicted budget: " + budget);
+                } catch (Exception e) {
+                    budget = DEFAULT_BUDGET;
+                    System.out.println("⚠ RL prediction failed, using default budget: " + budget);
+                }
+            } else {
+                budget = DEFAULT_BUDGET;
+            }
 
             // Using the new hybrid approach: process all transactions first, then upgrade for profit
-            result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, currentTokens, (currentTps >= MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
+            result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, budget, 0, (currentTps >= MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
+            
+            // Save result for next RL prediction
+            previousBatchResult = result;
 
             // updating the token count here (updating in redis)
-            tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
-            System.out.printf("\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n", result.profit, currentTps, currentTokens, result.tokensUsed, result.transactionsUpgraded);
+            // tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
+            System.out.printf("\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n", result.profit, currentTps, 0.0, result.tokensUsed, result.transactionsUpgraded);
             try (FileWriter fw = new FileWriter("tps.csv", true); PrintWriter out = new PrintWriter(fw)) {
 
                 // Write header only if file is empty
@@ -1524,7 +1578,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
                 // Write data row
-                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, currentTps, currentTokens, result.tokensUsed, result.transactionsUpgraded);
+                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, currentTps, 0.0, result.tokensUsed, result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();
             }
