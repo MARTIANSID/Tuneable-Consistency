@@ -1,24 +1,16 @@
 package org.example.Server;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
-
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.security.NoSuchAlgorithmException;
-import java.security.PublicKey;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.SQLException;
-import java.util.*;
-import java.io.IOException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS =  5;
+    public static final int NUM_OF_SERVERS =  3;
 
     public static void main(String[] args) throws IOException{
         List<Server> servers = new ArrayList<>();

@@ -159,7 +159,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     //    private static final double COST_W1 = 1;
 //    private static final double COST_MAJORITY = 2.0;
-    private static final int MIN_REQUIRED_THROUGHPUT = 6500; // this is in second
+    private static final int MIN_REQUIRED_THROUGHPUT = 2000; // this is in second
 
     // this based on the adjustedTokenCosts
     public static final double scale = 1;
@@ -196,7 +196,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     public ConcurrentHashMap<String, RaftStub> clientStubs;
 
-    private static final double L_HEALTHY_MS = 30.0;   // healthy latency
+    private static final double L_HEALTHY_MS = 50.0;   // healthy latency
     private static final double L_BAD_MS = 1000.0;  // bad latency
     private static final double CONVEX_P = 2.0;    // convexity exponent (>1)
 
@@ -223,7 +223,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.commitIndex = new AtomicInteger(-1);
         this.lastApplied = new AtomicInteger(-1);
         this.serverId = serverId;
-        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(400) + 2000), TimeUnit.MILLISECONDS);
+        this.electionTimer = new CustomTimer(() -> startElection(), (new Random().nextInt(700) + 2000), TimeUnit.MILLISECONDS);
         this.peers = new ArrayList<>();
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
@@ -328,7 +328,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the stubs
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + (i + 1)).enableRetry().usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
 
@@ -721,7 +721,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         try {
             // Wait for up to 50ms for responses
-            boolean success = latch.await(400, TimeUnit.MILLISECONDS);
+            boolean success = latch.await(800, TimeUnit.MILLISECONDS);
             // if election timed out then we do the below
             try {
                 lock.writeLock().lock();
@@ -1424,9 +1424,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private double latencyToCost(double ewmaMs) {
         double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
 
-        double costHealthy = tokenBucket.getRefillRate() / (tpsMin * HEALTHY_TPS_HEADROOM);
+        double costHealthy = 10;
 
-        double costBad = BUCKET_FRACTION_MAX * tokenBucket.getMaxTokens();
+        double costBad = 300;
 
         double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
         if (ewmaMs <= L_HEALTHY_MS) {

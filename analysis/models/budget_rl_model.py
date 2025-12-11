@@ -57,7 +57,7 @@ class BudgetRLAgent:
     """
     
     # Discretized budget actions (in cost units)
-    BUDGET_ACTIONS = [0, 50, 100, 150, 200, 250, 300]
+    BUDGET_ACTIONS = [4000000, 8000000, 12000000, 16000000, 20000000, 25000000, 30000000]
     
     def __init__(
         self,
@@ -212,7 +212,7 @@ class RewardCalculator:
     Emphasizes maintaining MIN_TPS = 3000 as critical requirement
     """
     
-    def __init__(self, min_tps=3000, alpha=5.0, beta=2.0, gamma=0.3, delta=10.0):
+    def __init__(self, min_tps=2000, alpha=5.0, beta=2.0, gamma=0.3, delta=10.0):
         """
         Args:
             min_tps: minimum required throughput (3000 TPS)
@@ -299,20 +299,20 @@ class RewardCalculator:
         
         # 4. Budget cost penalty (allow necessary spending for MIN_TPS)
         # Base cost penalty
-        if throughput_current >= self.min_tps:
-            budget_penalty = self.gamma * (budget_used / 20000.0)
-        else:
-            budget_penalty = self.gamma * (budget_used / 20000.0) * 0.3
+        # if throughput_current >= self.min_tps:
+        #     budget_penalty = self.gamma * (budget_used / 20000.0)
+        # else:
+        #     budget_penalty = self.gamma * (budget_used / 20000.0) * 0.3
         
         # 5. Profit bonus
-        profit_bonus = profit_gained / 1000.0
+        profit_bonus = profit_gained
         
         # Total reward with MIN_TPS as top priority
         reward = (
             throughput_reward 
             - min_tps_penalty      # SEVERE penalty for violating MIN_TPS
             - backlog_penalty 
-            - budget_penalty 
+            # - budget_penalty 
             + profit_bonus
         )
         
@@ -359,7 +359,7 @@ class RewardCalculator:
         else:
             efficiency_penalty = 0.0
 
-        return base_reward - efficiency_penalty
+        return base_reward
 
 
 def create_state(current_load, current_throughput, current_backlog, write_concern_costs, capacity):

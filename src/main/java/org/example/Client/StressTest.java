@@ -8,7 +8,7 @@ import static org.example.Client.WorkloadSimulator.mapOf;
 
 public class StressTest {
     public static void main(String[] args) {
-        int numServers = args.length > 0 ? Integer.parseInt(args[0]) : 5;
+        int numServers = args.length > 0 ? Integer.parseInt(args[0]) : 3;
         int concurrency = args.length > 1 ? Integer.parseInt(args[1]) : 16;
         List<Integer> ports = new ArrayList<>();
         for (int i = 1; i <= numServers; i++) {
@@ -28,11 +28,10 @@ public class StressTest {
         // ));
         // simulator.run();
         simulator.addPhase(new WorkloadSimulator.Phase(
-                "WarmUp", 100, 10000, 0,
+                "WarmUp", 100, 12000, 0,
                 mapOf(
-                        1, 0.75,
-                        2, 0.10,
-                        3, 0.15
+                        1, 1,
+                        2, 0
                                     ),
                 0.0, // extraIntermediateProfit
                 0.0  // extraMajorityProfit
@@ -40,11 +39,10 @@ public class StressTest {
 
         // Phase 2: Heavy Spike (dominantly higher write concerns 3 & majority to drain tokens and cause backlog)
         simulator.addPhase(new WorkloadSimulator.Phase(
-                "Spike", 150, 12000, 0,
+                "Spike", 150, 5000, 0,
                 mapOf(
                         1, 0.10,
-                        2, 0.00,
-                        3, 0.90
+                        2, 0.90
                 ),
                 0.0,
                 0.0
@@ -52,11 +50,10 @@ public class StressTest {
 
         // Phase 3: Stabilization (mixed workload, moderate rate)
         simulator.addPhase(new WorkloadSimulator.Phase(
-                "Stabilize", 100, 10000, 0,
+                "Stabilize", 100, 4000, 0,
                 mapOf(
                         1, 0.50,
-                        2, 0.30,
-                        3, 0.20                
+                        2, 0.50            
                     ),
                 0.0,
                 0.0

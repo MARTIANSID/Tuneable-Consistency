@@ -309,6 +309,8 @@ public class BatchProcessor {
                     ClientMessage msg = ClientMessage.newBuilder()
                             .setT(tx.clientMessage.getT())
                             .setWriteConcern(tx.minRequiredConsistency)
+                            .setCallbackHost(tx.clientHost)
+                            .setCallbackPort(tx.clientPort)
                             .build();
                     result.add(msg);
                 } else {
@@ -320,7 +322,7 @@ public class BatchProcessor {
             return new ProcessResult(result, toProcess.size(), profit, 0);
         } else {
             // Budget sufficient for all transactions at min consistency + upgrades
-            return processTransactionUnderutilised(batch, budget, allowUpgrades, writeConcernCosts);
+            return processTransactionUnderutilised(batch, budget, false, writeConcernCosts);
         }
     }
     /**
