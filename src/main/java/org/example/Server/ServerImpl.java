@@ -1014,79 +1014,173 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return entries;
     }
 
+    // private void sendAppendEntries() {
+
+    //     sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
+    //         if (status != ServerCurrentStatus.LEADER) {
+    //             return;
+    //         }
+    //         for (int i = 0; i < NUM_OF_SERVERS; i++) {
+
+    //             if (i == serverId) continue;
+
+    //             int matchIndexForFollower = -1, indexToSendFrom = log.size() - 1;
+
+    //             AppendEntriesArgument appendEntriesArgument = null;
+
+    //             lock.readLock().lock();
+    //             try {
+    //                 long now = System.currentTimeMillis();
+    //                 if ((nextIndex.get(i) == log.size() - 1) && ((now - lastHeartBeatSent[i]) < 100) && (lastIndexSent[i] == nextIndex.get(i)))
+    //                     continue;
+    //                 // this check is to avoid race condition where in if leader, becomes follower it should not send the updated term to follower as this old leader is not a leader in the updated term
+    //                 if (status != ServerCurrentStatus.LEADER) return;
+    //                 // nextIndex tells us the nextIndex from which we need the entries
+    //                 indexToSendFrom = nextIndex.get(i);
+    //                 // prevEntry needed for comparison at the follower end
+    //                 LogEntry prevEntry = log.get(indexToSendFrom - 1);
+    //                 // all entries after this index
+    //                 List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
+    //                 // making the proto log object
+    //                 Log l = Log.newBuilder().addAllLog(entries).build();
+    //                 // making appendEntries proto object
+    //                 double combinedSystemThroughput = 0;
+    //                 boolean throughputIndcluded = false;
+    //                 if (now - lastThroughputSentTime >= 200) {
+    //                     lastThroughputSentTime = now;
+    //                     combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
+    //                     throughputIndcluded = true;
+    //                 }
+    //                 appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now())).setSystemThroughputIncluded(throughputIndcluded).setSystemThroughput(combinedSystemThroughput).build();
+
+    //                 // if update of the followers log is successful what will be the new matchIndex of follower
+    //                 matchIndexForFollower = entries.size() + indexToSendFrom - 1;
+    //                 lastHeartBeatSent[i] = System.currentTimeMillis();
+    //                 lastIndexSent[i] = nextIndex.get(i);
+    //             } finally {
+    //                 lock.readLock().unlock();
+    //             }
+
+    //             // index to send from
+    //             int matchIndexFollowerTemp = matchIndexForFollower;
+    //             int nextIndexTemp = indexToSendFrom;
+
+
+    //             stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
+    //                 @Override
+    //                 public void onNext(AppendEntriesResult appendEntriesResult) {
+    //                     // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
+    //                     doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
+    //                 }
+
+    //                 @Override
+    //                 public void onError(Throwable throwable) {
+
+    //                 }
+
+    //                 @Override
+    //                 public void onCompleted() {
+
+    //                 }
+    //             });
+    //             if (!doesLeaderHasHighestTerm.get()) break;
+    //         }
+    //     }, 0, 80, TimeUnit.MILLISECONDS);
+    // }
     private void sendAppendEntries() {
+    int MAX_ENTRIES_PER_RPC = 1000; // cap the number of entries per RPC
 
-        sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
-            if (status != ServerCurrentStatus.LEADER) {
-                return;
-            }
-            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+    sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
+        if (status != ServerCurrentStatus.LEADER) {
+            return;
+        }
 
-                if (i == serverId) continue;
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            if (i == serverId) continue;
 
-                int matchIndexForFollower = -1, indexToSendFrom = log.size() - 1;
+            final int followerId = i;
 
-                AppendEntriesArgument appendEntriesArgument = null;
-
+            executorService.submit(() -> {
+                int indexToSendFrom;
+                long lastSentTime;
+                
+                // Snapshot of state to minimize locking
                 lock.readLock().lock();
                 try {
-                    long now = System.currentTimeMillis();
-                    if ((nextIndex.get(i) == log.size() - 1) && ((now - lastHeartBeatSent[i]) < 100) && (lastIndexSent[i] == nextIndex.get(i)))
-                        continue;
-                    // this check is to avoid race condition where in if leader, becomes follower it should not send the updated term to follower as this old leader is not a leader in the updated term
-                    if (status != ServerCurrentStatus.LEADER) return;
-                    // nextIndex tells us the nextIndex from which we need the entries
-                    indexToSendFrom = nextIndex.get(i);
-                    // prevEntry needed for comparison at the follower end
-                    LogEntry prevEntry = log.get(indexToSendFrom - 1);
-                    // all entries after this index
-                    List<LogEntryProto> entries = convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
-                    // making the proto log object
-                    Log l = Log.newBuilder().addAllLog(entries).build();
-                    // making appendEntries proto object
-                    double combinedSystemThroughput = 0;
-                    boolean throughputIndcluded = false;
-                    if (now - lastThroughputSentTime >= 200) {
-                        lastThroughputSentTime = now;
-                        combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
-                        throughputIndcluded = true;
+                    indexToSendFrom = nextIndex.get(followerId);
+                    lastSentTime = lastHeartBeatSent[followerId];
+                    if (indexToSendFrom >= log.size() && (System.currentTimeMillis() - lastSentTime) < 100) {
+                        return; // Nothing new to send and recent heartbeat already sent
                     }
-                    appendEntriesArgument = AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now())).setSystemThroughputIncluded(throughputIndcluded).setSystemThroughput(combinedSystemThroughput).build();
-
-                    // if update of the followers log is successful what will be the new matchIndex of follower
-                    matchIndexForFollower = entries.size() + indexToSendFrom - 1;
-                    lastHeartBeatSent[i] = System.currentTimeMillis();
-                    lastIndexSent[i] = nextIndex.get(i);
                 } finally {
                     lock.readLock().unlock();
                 }
 
-                // index to send from
-                int matchIndexFollowerTemp = matchIndexForFollower;
-                int nextIndexTemp = indexToSendFrom;
+                // Construct entries outside the lock
+                List<LogEntry> entriesToSend;
+                LogEntry prevEntry;
+                lock.readLock().lock();
+                try {
+                    if (indexToSendFrom == 0) {
+                        prevEntry = null;
+                    } else {
+                        prevEntry = log.get(indexToSendFrom - 1);
+                    }
+                    int endIndex = Math.min(log.size(), indexToSendFrom + MAX_ENTRIES_PER_RPC);
+                    entriesToSend = log.logEntriesFromIndex(indexToSendFrom, endIndex);
+                } finally {
+                    lock.readLock().unlock();
+                }
 
+                List<LogEntryProto> protoEntries = convertLogEntryToProto(entriesToSend);
+                Log l = Log.newBuilder().addAllLog(protoEntries).build();
 
-                stubs[i].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
+                double combinedSystemThroughput = 0;
+                boolean throughputIncluded = false;
+                long now = System.currentTimeMillis();
+                if (now - lastThroughputSentTime >= 200) {
+                    lastThroughputSentTime = now;
+                    combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
+                    throughputIncluded = true;
+                }
+
+                AppendEntriesArgument appendEntriesArgument = AppendEntriesArgument.newBuilder()
+                        .setLeadersTerm(currentTerm.get())
+                        .setLeadersId(serverId)
+                        .setLeadersCommit(commitIndex.get())
+                        .setPrevLogIndex(prevEntry != null ? prevEntry.index : 0)
+                        .setPrevLogTerm(prevEntry != null ? prevEntry.term : 0)
+                        .setEntriesToAppend(l)
+                        .setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now()))
+                        .setSystemThroughputIncluded(throughputIncluded)
+                        .setSystemThroughput(combinedSystemThroughput)
+                        .build();
+
+                int matchIndexForFollower = indexToSendFrom + entriesToSend.size() - 1;
+
+                stubs[followerId].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
                     @Override
                     public void onNext(AppendEntriesResult appendEntriesResult) {
-                        // this doesLeaderHasHighestTerm tells us if the follower has a higher term than this leader, if it is true then it will become follower
-                        doesLeaderHasHighestTerm.compareAndSet(true, handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp, nextIndexTemp));
+                        doesLeaderHasHighestTerm.compareAndSet(true,
+                                handleAppendEntriesResult(appendEntriesResult, matchIndexForFollower, indexToSendFrom));
                     }
 
                     @Override
                     public void onError(Throwable throwable) {
-
+                        LOG.warn("AppendEntries RPC failed for follower {}", followerId, throwable);
                     }
 
                     @Override
                     public void onCompleted() {
-
                     }
                 });
-                if (!doesLeaderHasHighestTerm.get()) break;
-            }
-        }, 0, 80, TimeUnit.MILLISECONDS);
-    }
+
+                // Update last heartbeat sent timestamp
+                lastHeartBeatSent[followerId] = System.currentTimeMillis();
+            });
+        }
+    }, 0, 80, TimeUnit.MILLISECONDS);
+}
 
     // already in writeLock
     public void reinitialiseIndexes() {
