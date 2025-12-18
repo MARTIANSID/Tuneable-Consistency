@@ -1107,6 +1107,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // Snapshot of state to minimize locking
                 lock.readLock().lock();
                 try {
+                    if (status != ServerCurrentStatus.LEADER) return;
                     indexToSendFrom = nextIndex.get(followerId);
                     lastSentTime = lastHeartBeatSent[followerId];
                     if (indexToSendFrom >= log.size() && (System.currentTimeMillis() - lastSentTime) < 100) {
