@@ -137,8 +137,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ScheduledExecutorService sendAppendEntriesScheduler;
     ScheduledExecutorService causalReadScheduler;
 
-    long[] lastHeartBeatSent;
-    long[] lastIndexSent;
+
+    AtomicLongArray lastThroughputSentTime;
+
+    AtomicLongArray lastHeartBeatSent;
+    AtomicIntegerArray lastIndexSent;
 
 
     BatchProcessor transactionBatchProcessor;
@@ -211,11 +214,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     double combinedThroughputOfFollowers;
 
-    long lastThroughputSentTime;
-
     double combinedSystemWideThroughputOnFollower;
 
-
+    long lastThroughputSentTimeOnFollower;
     AtomicLong[] lastHeartBeatReceived;
     private ExecutorService executorService;
     private static final Logger LOG =
@@ -278,6 +279,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
         this.executorService =  Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        this.lastThroughputSentTimeOnFollower = 0;
 
 
         // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
@@ -296,12 +298,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.lastPrintTime = new AtomicLong(System.currentTimeMillis());
         this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
         this.causalReadScheduler = Executors.newScheduledThreadPool(1);
-        this.lastHeartBeatSent = new long[NUM_OF_SERVERS];
-        this.lastIndexSent = new long[NUM_OF_SERVERS];
+        this.lastHeartBeatSent = new AtomicLongArray(NUM_OF_SERVERS);
+        this.lastIndexSent = new AtomicIntegerArray(NUM_OF_SERVERS);
         this.backLogTransactions = new HashSet<>();
         this.followerReadThroughput = new double[NUM_OF_SERVERS];
         this.combinedThroughputOfFollowers = 0;
-        this.lastThroughputSentTime = 0;
+        this.lastThroughputSentTime = new AtomicLongArray(NUM_OF_SERVERS);
         this.clientStubs = new ConcurrentHashMap<>();
         this.lastHeartBeatReceived = new AtomicLong[NUM_OF_SERVERS];
         // setting the peers list
@@ -430,8 +432,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Send success response
             AppendEntriesResult.Builder appendEntriesResultBuilder = AppendEntriesResult.newBuilder().setIsSuccessFull(true).setFollowerId(serverId).setTimeStamp(HybridClock.TimeStamp.convertToProto(currentTimeOfFollower));
             long currentTime = System.currentTimeMillis();
-            if (currentTime - lastThroughputSentTime >= 200) {
-                lastThroughputSentTime = currentTime;
+            if (currentTime - lastThroughputSentTimeOnFollower >= 200) {
+                lastThroughputSentTimeOnFollower = currentTime;
                 appendEntriesResultBuilder.setReadThroughputIncluded(true);
                 appendEntriesResultBuilder.setFollowerReadThroughput(getSystemWideThroughput());
             }
@@ -1123,11 +1125,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         if (status != ServerCurrentStatus.LEADER) return;
 
                         // Heartbeat suppression
-                        if (nextIndex.get(followerId) == log.size() - 1 &&
-                                (now - lastHeartBeatSent[followerId]) < 100 &&
-                                lastIndexSent[followerId] == nextIndex.get(followerId)) {
-                            return;
-                        }
+//                        if (nextIndex.get(followerId) == log.size() - 1 &&
+//                                (now - lastHeartBeatSent[followerId]) < 100 &&
+//                                lastIndexSent[followerId] == nextIndex.get(followerId)) {
+//                            return;
+//                        }
 
                         indexToSendFrom = nextIndex.get(followerId);
 
@@ -1140,15 +1142,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                         matchIndexForFollower = endIndex - 1;
 
-                        includeThroughput = (now - lastThroughputSentTime >= 200);
+                        includeThroughput = (now - lastThroughputSentTime.get(followerId) >= 200);
                         if (includeThroughput) {
-                            lastThroughputSentTime = now;
+                            lastThroughputSentTime.set(followerId, now);
                             combinedSystemThroughput =
                                     combinedThroughputOfFollowers + getSystemWideThroughput();
                         }
 
-                        lastHeartBeatSent[followerId] = now;
-                        lastIndexSent[followerId] = indexToSendFrom;
+                        lastHeartBeatSent.set(followerId,now);
+                        lastIndexSent.set(followerId,indexToSendFrom);
 
                     } finally {
                         lock.readLock().unlock();
