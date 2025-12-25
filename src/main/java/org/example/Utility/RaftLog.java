@@ -19,6 +19,13 @@ public class RaftLog {
         this.NUM_OF_SERVERS = NUM_OF_SERVERS;
     }
 
+    public List<LogEntry> logEntriesFromIndex(int start, int end) {
+        if (start >= log.size()) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(log.subList(start, end));
+    }
+
     public void append(LogEntry entry) {
         lock.writeLock().lock();
         try {

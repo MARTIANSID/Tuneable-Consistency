@@ -34,6 +34,8 @@ import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.util.prefs.PreferenceChangeEvent;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class ServerImpl extends RaftGrpc.RaftImplBase {
     int NUM_OF_SERVERS;
@@ -215,6 +217,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
 
     AtomicLong[] lastHeartBeatReceived;
+    private ExecutorService executorService;
+    private static final Logger LOG =
+            LoggerFactory.getLogger(ServerImpl.class);
 
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
@@ -272,7 +277,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
-        
+        this.executorService =  Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+
+
         // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
         try {
             this.rlModelClient = new RLModelGrpcClient("localhost", 50051, true, DEFAULT_BUDGET);
