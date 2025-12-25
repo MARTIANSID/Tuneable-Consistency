@@ -1095,100 +1095,124 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     //     }, 0, 80, TimeUnit.MILLISECONDS);
     // }
     private void sendAppendEntries() {
-    int MAX_ENTRIES_PER_RPC = 1000; // cap the number of entries per RPC
 
-    sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
-        if (status != ServerCurrentStatus.LEADER) {
-            return;
-        }
+        final int MAX_ENTRIES_PER_RPC = 1000;
 
-        for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            if (i == serverId) continue;
+        sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
 
-            final int followerId = i;
+            if (status != ServerCurrentStatus.LEADER) return;
 
-            executorService.submit(() -> {
-                int indexToSendFrom;
-                long lastSentTime;
-                
-                // Snapshot of state to minimize locking
-                lock.readLock().lock();
-                try {
-                    if (status != ServerCurrentStatus.LEADER) return;
-                    indexToSendFrom = nextIndex.get(followerId);
-                    lastSentTime = lastHeartBeatSent[followerId];
-                    if (indexToSendFrom >= log.size() && (System.currentTimeMillis() - lastSentTime) < 100) {
-                        return; // Nothing new to send and recent heartbeat already sent
-                    }
-                } finally {
-                    lock.readLock().unlock();
-                }
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
 
-                // Construct entries outside the lock
-                List<LogEntry> entriesToSend;
-                LogEntry prevEntry;
-                lock.readLock().lock();
-                try {
-                    if (indexToSendFrom == 0) {
-                        prevEntry = null;
-                    } else {
+                if (i == serverId) continue;
+                final int followerId = i;
+
+                executorService.submit(() -> {
+
+                    int indexToSendFrom;
+                    int endIndex;
+                    int matchIndexForFollower;
+                    LogEntry prevEntry;
+                    boolean includeThroughput;
+                    double combinedSystemThroughput = 0;
+                    long now = System.currentTimeMillis();
+
+                    // ================= SNAPSHOT UNDER READ LOCK =================
+                    lock.readLock().lock();
+                    try {
+                        if (status != ServerCurrentStatus.LEADER) return;
+
+                        // Heartbeat suppression
+                        if (nextIndex.get(followerId) == log.size() - 1 &&
+                                (now - lastHeartBeatSent[followerId]) < 100 &&
+                                lastIndexSent[followerId] == nextIndex.get(followerId)) {
+                            return;
+                        }
+
+                        indexToSendFrom = nextIndex.get(followerId);
+
                         prevEntry = log.get(indexToSendFrom - 1);
-                    }
-                    int endIndex = Math.min(log.size(), indexToSendFrom + MAX_ENTRIES_PER_RPC);
-                    entriesToSend = log.logEntriesFromIndex(indexToSendFrom, endIndex);
-                } finally {
-                    lock.readLock().unlock();
-                }
 
-                List<LogEntryProto> protoEntries = convertLogEntryToProto(entriesToSend);
-                Log l = Log.newBuilder().addAllLog(protoEntries).build();
+                        endIndex = Math.min(
+                                log.size(),
+                                indexToSendFrom + MAX_ENTRIES_PER_RPC
+                        );
 
-                double combinedSystemThroughput = 0;
-                boolean throughputIncluded = false;
-                long now = System.currentTimeMillis();
-                if (now - lastThroughputSentTime >= 200) {
-                    lastThroughputSentTime = now;
-                    combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
-                    throughputIncluded = true;
-                }
+                        matchIndexForFollower = endIndex - 1;
 
-                AppendEntriesArgument appendEntriesArgument = AppendEntriesArgument.newBuilder()
-                        .setLeadersTerm(currentTerm.get())
-                        .setLeadersId(serverId)
-                        .setLeadersCommit(commitIndex.get())
-                        .setPrevLogIndex(prevEntry != null ? prevEntry.index : 0)
-                        .setPrevLogTerm(prevEntry != null ? prevEntry.term : 0)
-                        .setEntriesToAppend(l)
-                        .setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now()))
-                        .setSystemThroughputIncluded(throughputIncluded)
-                        .setSystemThroughput(combinedSystemThroughput)
-                        .build();
+                        includeThroughput = (now - lastThroughputSentTime >= 200);
+                        if (includeThroughput) {
+                            lastThroughputSentTime = now;
+                            combinedSystemThroughput =
+                                    combinedThroughputOfFollowers + getSystemWideThroughput();
+                        }
 
-                int matchIndexForFollower = indexToSendFrom + entriesToSend.size() - 1;
+                        lastHeartBeatSent[followerId] = now;
+                        lastIndexSent[followerId] = indexToSendFrom;
 
-                stubs[followerId].appendEntries(appendEntriesArgument, new StreamObserver<AppendEntriesResult>() {
-                    @Override
-                    public void onNext(AppendEntriesResult appendEntriesResult) {
-                        doesLeaderHasHighestTerm.compareAndSet(true,
-                                handleAppendEntriesResult(appendEntriesResult, matchIndexForFollower, indexToSendFrom));
+                    } finally {
+                        lock.readLock().unlock();
                     }
 
-                    @Override
-                    public void onError(Throwable throwable) {
-                        LOG.warn("AppendEntries RPC failed for follower {}", followerId, throwable);
-                    }
+                    List<LogEntry> entriesSnapshot =
+                            log.logEntriesFromIndex(indexToSendFrom, endIndex);
 
-                    @Override
-                    public void onCompleted() {
-                    }
+                    List<LogEntryProto> protoEntries =
+                            convertLogEntryToProto(entriesSnapshot);
+
+                    Log logProto = Log.newBuilder()
+                            .addAllLog(protoEntries)
+                            .build();
+
+                    AppendEntriesArgument request =
+                            AppendEntriesArgument.newBuilder()
+                                    .setLeadersTerm(currentTerm.get())
+                                    .setLeadersId(serverId)
+                                    .setLeadersCommit(commitIndex.get())
+                                    .setPrevLogIndex(prevEntry.index)
+                                    .setPrevLogTerm(prevEntry.term)
+                                    .setEntriesToAppend(logProto)
+                                    .setTimeStamp(
+                                            HybridClock.TimeStamp.convertToProto(hybridClock.now()))
+                                    .setSystemThroughputIncluded(includeThroughput)
+                                    .setSystemThroughput(combinedSystemThroughput)
+                                    .build();
+
+                    stubs[followerId].appendEntries(
+                            request,
+                            new StreamObserver<AppendEntriesResult>() {
+
+                                @Override
+                                public void onNext(AppendEntriesResult result) {
+                                    doesLeaderHasHighestTerm.compareAndSet(
+                                            true,
+                                            handleAppendEntriesResult(
+                                                    result,
+                                                    matchIndexForFollower,
+                                                    indexToSendFrom
+                                            )
+                                    );
+                                }
+
+                                @Override
+                                public void onError(Throwable throwable) {
+                                    LOG.warn(
+                                            "AppendEntries RPC failed for follower {}",
+                                            followerId,
+                                            throwable
+                                    );
+                                }
+
+                                @Override
+                                public void onCompleted() {
+                                }
+                            }
+                    );
                 });
+            }
 
-                // Update last heartbeat sent timestamp
-                lastHeartBeatSent[followerId] = System.currentTimeMillis();
-            });
-        }
-    }, 0, 80, TimeUnit.MILLISECONDS);
-}
+        }, 0, 80, TimeUnit.MILLISECONDS);
+    }
 
     // already in writeLock
     public void reinitialiseIndexes() {
