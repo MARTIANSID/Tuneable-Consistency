@@ -337,7 +337,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the stubs
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000 + (i + 1)).enableRetry().usePlaintext().build();
+                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry().usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
 
@@ -746,7 +746,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    // inside read lock
     private List<LogEntryProto> convertLogEntryToProto(List<LogEntry> entries) {
         List<LogEntryProto> result = new ArrayList<>();
 
@@ -1668,26 +1667,26 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             ProcessResult result;
             
             // Get budget from RL model or use default
-            double budget;
-            if (rlModelClient != null) {
-                try {
-                        int incomingTps = getIncomingTransactionsPerSecond();
-                        budget = rlModelClient.predictBudgetAndRecord(
-                        incomingTps,                // current_load (incoming txns/sec)
-                        currentTps,                 // current_throughput
-                        backLog,                    // current_backlog
-                        new HashMap<>(writeConcernCosts), // write concern costs
-                        0,              // capacity
-                        previousBatchResult         // previous result for training
-                    );
-                    System.out.println("🤖 Using RL-predicted budget: " + budget);
-                } catch (Exception e) {
-                    budget = DEFAULT_BUDGET;
-                    System.out.println("⚠ RL prediction failed, using default budget: " + budget);
-                }
-            } else {
-                budget = DEFAULT_BUDGET;
-            }
+            double budget = 1000000000;
+            // if (rlModelClient != null) {
+            //     try {
+            //             int incomingTps = getIncomingTransactionsPerSecond();
+            //             budget = rlModelClient.predictBudgetAndRecord(
+            //             incomingTps,                // current_load (incoming txns/sec)
+            //             currentTps,                 // current_throughput
+            //             backLog,                    // current_backlog
+            //             new HashMap<>(writeConcernCosts), // write concern costs
+            //             0,              // capacity
+            //             previousBatchResult         // previous result for training
+            //         );
+            //         System.out.println("🤖 Using RL-predicted budget: " + budget);
+            //     } catch (Exception e) {
+            //         budget = DEFAULT_BUDGET;
+            //         System.out.println("⚠ RL prediction failed, using default budget: " + budget);
+            //     }
+            // } else {
+            //     budget = DEFAULT_BUDGET;
+            // }
 
             // Using the new hybrid approach: process all transactions first, then upgrade for profit
             result = transactionBatchProcessor.processTransactions(currentBatchInTransactionOption, budget, 0, (currentTps >= MIN_REQUIRED_THROUGHPUT || backLog > 0), new HashMap<>(writeConcernCosts));
