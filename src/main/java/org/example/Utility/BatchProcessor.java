@@ -14,8 +14,223 @@ public class BatchProcessor {
     private final int NUM_OF_SERVERS;
     final double EPS = 1e-9;
 
+    // ========== TPS Constants (Heuristic) ==========
+    private static final double MIN_TPS = 13000.0;      // Minimum TPS to maintain
+    private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
+    private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
+
     public BatchProcessor(int numOfServers) {
         this.NUM_OF_SERVERS = numOfServers;
+    }
+
+    /**
+     * Get max TPS for a given write concern level
+     */
+    private double getMaxTPS(int writeConcern, HashMap<Integer, Double> wcTpsMap) {
+        return wcTpsMap.getOrDefault(writeConcern, 0.0);
+    }
+
+    /**
+     * Calculate average TPS after adding batch
+     * Formula: (currentTPS + sum of maxTPS[wc_i]) / (1 + batchSize)
+     */
+    private double calculateAvgTPS(double currentTPS, int[] consistencyLevels, HashMap<Integer, Double> wcTpsMap) {
+        double sum = currentTPS;
+        int count = 0;
+        for (int wc : consistencyLevels) {
+            if (wc > 0) {
+                sum += getMaxTPS(wc, wcTpsMap);
+                count++;
+            }
+        }
+        return (count == 0) ? currentTPS : sum / (1 + count);
+    }
+
+    /**
+     * Process transactions with TPS-based heuristic.
+     * 
+     * Algorithm:
+     * 1. Assign all transactions their minimum consistency
+     * 2. Calculate: avgTPS = (currentTPS + Σ maxTPS[wc_i]) / (1 + batchSize)
+     * 3. If avgTPS >= minTPS → execute all
+     * 4. If avgTPS >= minTPS * 1.15 → can upgrade transactions
+     * 5. Upgrade greedily while avgTPS stays >= minTPS * 1.10
+     * 6. If avgTPS < minTPS → process from weakest first until avgTPS >= minTPS
+     */
+    public ProcessResult processWithTPSHeuristic(
+            List<TransactionOption> batch,
+            double currentTPS,
+            HashMap<Integer, Double> wcTpsMap) {
+
+        int n = batch.size();
+        if (n == 0) {
+            return new ProcessResult(new ArrayList<>(), 0, 0, 0);
+        }
+
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        int[] consistencyLevels = new int[n];
+        double profit = 0;
+        int transactionsUpgraded = 0;
+
+        // Step 1: Initialize all at minimum consistency
+        for (int i = 0; i < n; i++) {
+            consistencyLevels[i] = batch.get(i).minRequiredConsistency;
+        }
+
+        // Step 2: Calculate avgTPS with all transactions at min consistency
+        double avgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+
+        System.out.printf("[TPS Heuristic] currentTPS=%.0f | avgTPS=%.0f | minTPS=%.0f%n", 
+                currentTPS, avgTPS, MIN_TPS);
+        
+        // Print individual writeConcern throughputs
+        System.out.print("[WriteConcern TPS] ");
+        for (int wc = 1; wc <= majority; wc++) {
+            System.out.printf("W:%d=%.2f TPS | ", wc, wcTpsMap.get(wc));
+        }
+        System.out.println();
+
+        // Step 3: Check if we can execute all
+        if (avgTPS >= MIN_TPS) {
+            // Execute all transactions
+            for (int i = 0; i < n; i++) {
+                profit += batch.get(i).baseProfit;
+            }
+
+            // Step 4: Check if we can upgrade (need 15% headroom)
+            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD) {
+                
+                // Build priority queue for upgrades (best profit/tps-cost ratio first)
+                PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+                        (a, b) -> Double.compare(b.ratio, a.ratio)
+                );
+
+                for (int i = 0; i < n; i++) {
+                    int currentWC = consistencyLevels[i];
+                    if (currentWC < majority) {
+                        TransactionOption tx = batch.get(i);
+                        double tpsDrop = getMaxTPS(currentWC, wcTpsMap) - getMaxTPS(currentWC + 1, wcTpsMap);
+                        double nextProfit = (currentWC + 1 == majority)
+                                ? tx.extraMajorityProfit
+                                : tx.extraIntermediateProfit;
+                        double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
+                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, tpsDrop, nextProfit, ratio));
+                    }
+                }
+
+                // Step 5: Upgrade while avgTPS stays >= minTPS * 1.10
+                while (!pq.isEmpty()) {
+                    UpgradeOption opt = pq.poll();
+
+                    if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
+
+                    // Simulate upgrade
+                    int[] tempLevels = consistencyLevels.clone();
+                    tempLevels[opt.txIndex] = opt.toWC;
+                    double newAvgTPS = calculateAvgTPS(currentTPS, tempLevels, wcTpsMap);
+
+                    if (newAvgTPS >= MIN_TPS * UPGRADE_FLOOR) {
+                        // Safe to upgrade
+                        consistencyLevels[opt.txIndex] = opt.toWC;
+                        profit += opt.additionalProfit;
+                        transactionsUpgraded++;
+
+                        // Add next upgrade level if possible
+                        if (opt.toWC < majority) {
+                            TransactionOption tx = batch.get(opt.txIndex);
+                            double tpsDrop = getMaxTPS(opt.toWC, wcTpsMap) - getMaxTPS(opt.toWC + 1, wcTpsMap);
+                            double nextProfit = (opt.toWC + 1 == majority)
+                                    ? tx.extraMajorityProfit
+                                    : tx.extraIntermediateProfit;
+                            double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
+                            pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, tpsDrop, nextProfit, ratio));
+                        }
+                    }
+                }
+            }
+
+            // Build result
+            List<ClientMessage> result = buildResultMessages(batch, consistencyLevels);
+            
+            HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
+            System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | FinalAvgTPS=%.0f%n",
+                    wcMix, transactionsUpgraded, calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+
+            return new ProcessResult(result, n, profit, transactionsUpgraded);
+        }
+        // Step 6: avgTPS < minTPS → process from weakest first
+        else {
+            // Sort by weakest consistency first
+            List<Integer> indices = new ArrayList<>();
+            for (int i = 0; i < n; i++) indices.add(i);
+            indices.sort(Comparator.comparingInt(i -> batch.get(i).minRequiredConsistency));
+
+            // Reset consistency levels
+            for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
+
+            // Minimum transactions to process (20% of batch)
+            int minToProcess = Math.max(1, (int) (n * 0.20));
+
+            int processed = 0;
+            for (int idx : indices) {
+                TransactionOption tx = batch.get(idx);
+                
+                // Try adding this transaction
+                consistencyLevels[idx] = tx.minRequiredConsistency;
+                double newAvgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+
+                // Always process minimum required (20%), then check TPS threshold
+                if (processed < minToProcess || newAvgTPS >= MIN_TPS) {
+                    // Must process (below minimum) or can process (TPS allows)
+                    profit += tx.baseProfit;
+                    processed++;
+                } else {
+                    // Would drop below minTPS and we've hit minimum, skip it
+                    consistencyLevels[idx] = 0;
+                }
+            }
+
+            List<ClientMessage> result = buildResultMessages(batch, consistencyLevels);
+            
+            System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | FinalAvgTPS=%.0f%n",
+                    processed, n, calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+
+            return new ProcessResult(result, processed, profit, 0);
+        }
+    }
+
+    /**
+     * Build ClientMessage list from consistency levels
+     */
+    private List<ClientMessage> buildResultMessages(List<TransactionOption> batch, int[] consistencyLevels) {
+        List<ClientMessage> result = new ArrayList<>();
+        for (int i = 0; i < batch.size(); i++) {
+            int wc = consistencyLevels[i];
+            if (wc == 0) continue;
+
+            TransactionOption tx = batch.get(i);
+            ClientMessage msg = ClientMessage.newBuilder()
+                    .setT(tx.clientMessage.getT())
+                    .setWriteConcern(wc)
+                    .setCallbackHost(tx.clientHost)
+                    .setCallbackPort(tx.clientPort)
+                    .build();
+            result.add(msg);
+        }
+        return result;
+    }
+
+    /**
+     * Count transactions by write concern
+     */
+    private HashMap<Integer, Integer> countByWriteConcern(int[] consistencyLevels) {
+        HashMap<Integer, Integer> counts = new HashMap<>();
+        for (int wc : consistencyLevels) {
+            if (wc > 0) {
+                counts.put(wc, counts.getOrDefault(wc, 0) + 1);
+            }
+        }
+        return counts;
     }
 
     /**
@@ -285,6 +500,11 @@ public class BatchProcessor {
     public ProcessResult processTransactions(List<TransactionOption> batch, double budget, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
         // Calculate total cost of processing all transactions at minimum consistency
         double totalMinCost = 0;
+        // for testing
+
+        // writeConcernCosts.put(1,1.0);
+        // writeConcernCosts.put(2,1.0);
+        
         for (TransactionOption tx : batch) {
             totalMinCost += writeConcernCosts.get(tx.minRequiredConsistency);
         }

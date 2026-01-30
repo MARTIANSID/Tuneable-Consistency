@@ -5,6 +5,8 @@ import org.ds.paxos.LogEntryProto;
 import org.ds.paxos.TimeStampProto;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class RaftLog {
@@ -35,12 +37,37 @@ public class RaftLog {
         }
     }
 
-    public void updateWriteConcern(int index, int serverId) {
+    public int getCurrentReplicationStatus(int index) {
+        int count = 0;
+        lock.readLock().lock();
+        try {
+            for(boolean isReplicated : log.get(index).serversThatReplicatedThisEntry) {
+                if(isReplicated) {
+                count++;
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        return count;
+    }
+
+    public void updateWriteConcern(int index, int serverId, ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns, Object writeConcernThroughputLock) {
         lock.writeLock().lock();
         try {
             if(log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
+                int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
+                synchronized(writeConcernThroughputLock) {
+                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
+                    Long currentTime = System.currentTimeMillis();
+                    while(!queue.isEmpty() && currentTime - queue.peek() > 1000) {
+                        queue.poll();
+                    }
+                    queue.add(currentTime);
+                }
+                
             }
         } finally {
             lock.writeLock().unlock();

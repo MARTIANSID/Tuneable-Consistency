@@ -30,16 +30,13 @@ public class TransactionInjector {
      */
     public ServerImpl getLeader() {
         if (servers == null) {
-            System.err.println("❌ Servers not initialized");
             return null;
         }
         for (ServerImpl server : servers) {
             if (server.status == ServerStatus.ServerCurrentStatus.LEADER) {
-                System.out.println("✓ Found leader: Server " + server.serverId);
                 return server;
             }
         }
-        System.err.println("❌ No leader found");
         return null;
     }
 
@@ -53,8 +50,6 @@ public class TransactionInjector {
         server.batchLock.lock();
         try {
             server.batchOfTransactions.addAll(transactions);
-            System.out.println("✓ Injected " + transactions.size() + " transactions into Server " + serverId);
-            System.out.println("  Batch queue size: " + server.batchOfTransactions.size());
         } finally {
             server.batchLock.unlock();
         }
@@ -70,8 +65,6 @@ public class TransactionInjector {
         leader.batchLock.lock();
         try {
             leader.batchOfTransactions.addAll(transactions);
-            System.out.println("✓ Injected " + transactions.size() + " transactions into Leader (Server " + leader.serverId + ")");
-            System.out.println("  Batch queue size: " + leader.batchOfTransactions.size());
         } finally {
             leader.batchLock.unlock();
         }
