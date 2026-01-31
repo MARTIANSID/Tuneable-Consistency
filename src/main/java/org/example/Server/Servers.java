@@ -53,7 +53,7 @@ public class Servers{
         PHASES.add(new Phase("Stabilize", 100, 20000, Map.of(1, 0.50, 2, 0.50)));
     }
 
-    private static final int BATCH_SIZE = 200;  // Transactions per batch
+    private static final int BATCH_SIZE = 1000;  // Transactions per batch (increased to reduce gRPC overhead)
     private static final Random random = new Random();
 
     public static void main(String[] args) throws IOException{

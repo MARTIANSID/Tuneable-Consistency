@@ -384,6 +384,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             if (leadersTerm == currentTerm.get()) {
                 currentLeader = leaderId;
+                // If we're CANDIDATE or LEADER and receive AppendEntries from valid leader, step down
+                if (status != ServerCurrentStatus.FOLLOWER) {
+                    becomeFollower();
+                }
             }
 
             // If the leader's term is outdated
@@ -1327,6 +1331,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
         }
+        // Leader implicitly has all its own log entries replicated
+        matchIndex.set(serverId, log.size() - 1);
     }
 
     public void startElection() {
@@ -1391,6 +1397,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
         // the status changes to follower
         status = ServerCurrentStatus.FOLLOWER;
+        // Reset votedFor to allow voting in new term
+        votedFor = -1;
         // we have to start the election timer because now it is a follower
 
         // cancelling the batch job
@@ -1800,7 +1808,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             System.out.println("Current TPS: " + currentTps + " | WC TPS Map: " + wcTpsMap);
             // Using the new TPS-based heuristic approach with dynamic TPS values
             result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps,
-                    wcTpsMap);
+                    wcTpsMap, backLog);
 
             // Save result for next RL prediction
             previousBatchResult = result;

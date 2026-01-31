@@ -23,6 +23,8 @@ public class BatchProcessor {
         this.NUM_OF_SERVERS = numOfServers;
     }
 
+    // we ideally will want to set a min worst case tps for every writeConcern level
+
     /**
      * Get max TPS for a given write concern level
      */
@@ -60,7 +62,8 @@ public class BatchProcessor {
     public ProcessResult processWithTPSHeuristic(
             List<TransactionOption> batch,
             double currentTPS,
-            HashMap<Integer, Double> wcTpsMap) {
+            HashMap<Integer, Double> wcTpsMap,
+            int backLog) {
 
         int n = batch.size();
         if (n == 0) {
@@ -98,7 +101,7 @@ public class BatchProcessor {
             }
 
             // Step 4: Check if we can upgrade (need 15% headroom)
-            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD) {
+            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLog == 0) {
                 
                 // Build priority queue for upgrades (best profit/tps-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
@@ -169,7 +172,7 @@ public class BatchProcessor {
             for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
 
             // Minimum transactions to process (20% of batch)
-            int minToProcess = Math.max(1, (int) (n * 0.20));
+            int minToProcess = Math.max(1, (int) (n * 0.40));
 
             int processed = 0;
             for (int idx : indices) {
