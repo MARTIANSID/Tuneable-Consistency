@@ -62,12 +62,25 @@ public class RaftLog {
                 synchronized(writeConcernThroughputLock) {
                     ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();
-                    while(!queue.isEmpty() && currentTime - queue.peek() > 1000) {
+                    while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
                         queue.poll();
                     }
                     queue.add(currentTime);
                 }
                 
+            }
+            // incase of majority above if condition will not be satisfied, but we still want to update the tps
+            if(log.get(index).writeConcern == (NUM_OF_SERVERS / 2) + 1) {
+                log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
+                int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
+                synchronized(writeConcernThroughputLock) {
+                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
+                    Long currentTime = System.currentTimeMillis();
+                    while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
+                        queue.poll();
+                    }
+                    queue.add(currentTime);
+                }
             }
         } finally {
             lock.writeLock().unlock();

@@ -15,7 +15,7 @@ public class BatchProcessor {
     final double EPS = 1e-9;
 
     // ========== TPS Constants (Heuristic) ==========
-    private static final double MIN_TPS = 13000.0;      // Minimum TPS to maintain
+    private static final double MIN_TPS = 14000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
 

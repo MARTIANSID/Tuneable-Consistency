@@ -1034,13 +1034,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         System.out.println(commitIndex.get() + "This is the new commit index---");
                         // update the majority committed map
                         for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
-                            ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
-                                    .get((NUM_OF_SERVERS / 2) + 1);
-                            Long currentTime = System.currentTimeMillis();
-                            while (!queue.isEmpty() && currentTime - queue.peek() > 1000) {
-                                queue.poll();
-                            }   
-                            queue.add(currentTime);
+
+                            // this updates the tps of w:majority
+                            synchronized (writeConcernThroughpuLock) {
+                                ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
+                                        .get((NUM_OF_SERVERS / 2) + 1);
+                                Long currentTime = System.currentTimeMillis();
+                                while (!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
+                                    queue.poll();
+                                }
+                                queue.add(currentTime);
+                            }
                             updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                         }
                         // System.out.println("The commit index of leader updated to -- " +
@@ -1517,18 +1521,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private void printAllWriteConernsThroughputAndLatencies() {
-        System.out.println("Printing Throughputs");
-        for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-            System.out.println(getWriteConcernThroughput(i));
-        }
-        synchronized (writeConcernLatency) {
-            System.out.println("Printing Latencies");
-            for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-                System.out.println(writeConcernLatencies.get(i));
-            }
-        }
-    }
+    // private void printAllWriteConernsThroughputAndLatencies() {
+    //     System.out.println("Printing Throughputs");
+    //     for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+    //         System.out.println(getWriteConcernThroughput(i));
+    //     }
+    //     synchronized (writeConcernLatency) {
+    //         System.out.println("Printing Latencies");
+    //         for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+    //             System.out.println(writeConcernLatencies.get(i));
+    //         }
+    //     }
+    // }
     // private void adjustTokenCostsBasedOnLatency() {
     // final int MIN_COST = 1;
     // final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
@@ -1793,9 +1797,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             for (int wc = 1; wc <= majority; wc++) {
                 wcTpsMap.put(wc, getWriteConcernTPS(wc));
             }
-            
+            System.out.println("Current TPS: " + currentTps + " | WC TPS Map: " + wcTpsMap);
             // Using the new TPS-based heuristic approach with dynamic TPS values
-            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps, wcTpsMap);
+            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps,
+                    wcTpsMap);
 
             // Save result for next RL prediction
             previousBatchResult = result;
@@ -1837,26 +1842,26 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private double getWriteConcernThroughput(int writeConcern) {
-        synchronized (writeConcernThroughput) {
-            Long currentTimeStamp = System.currentTimeMillis();
-            ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns
-                    .get(writeConcern);
-            if (writeConcernSpecificTimeStamps != null) {
-                recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
-            }
-            return writeConcernSpecificTimeStamps.size();
-        }
-    }
+    // private double getWriteConcernThroughput(int writeConcern) {
+    //     synchronized (writeConcernThroughput) {
+    //         Long currentTimeStamp = System.currentTimeMillis();
+    //         ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns
+    //                 .get(writeConcern);
+    //         if (writeConcernSpecificTimeStamps != null) {
+    //             recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
+    //         }
+    //         return writeConcernSpecificTimeStamps.size();
+    //     }
+    // }
 
     private double getWriteConcernTPS(int writeConcern) {
-        synchronized (writeConcernThroughput) {
+        synchronized (writeConcernThroughpuLock) {
             Long currentTimeStamp = System.currentTimeMillis();
             ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns
                     .get(writeConcern);
             if (writeConcernSpecificTimeStamps != null) {
                 recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
-                return writeConcernSpecificTimeStamps.size(); // 5-second window
+                return writeConcernSpecificTimeStamps.size() / 5; // 5-second window
             }
             return 0.0;
         }

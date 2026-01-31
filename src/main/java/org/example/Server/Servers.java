@@ -47,7 +47,7 @@ public class Servers{
         PHASES.add(new Phase("WarmUp", 50, 20000, Map.of(1, 1.0, 2, 0.0)));
         
         // Phase 2: Spike - 10% W:1, 90% W:2
-        PHASES.add(new Phase("Spike", 20, 20000, Map.of(1, 0.10, 2, 0.90)));
+        PHASES.add(new Phase("Spike", 20, 20000, Map.of(1, 0.40, 2, 0.60)));
         
         // Phase 3: Stabilize - 50% W:1, 50% W:2
         PHASES.add(new Phase("Stabilize", 100, 20000, Map.of(1, 0.50, 2, 0.50)));
