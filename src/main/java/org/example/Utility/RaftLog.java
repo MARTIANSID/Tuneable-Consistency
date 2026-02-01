@@ -73,6 +73,8 @@ public class RaftLog {
             if(log.get(index).writeConcern == (NUM_OF_SERVERS / 2) + 1) {
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
                 int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
+                // for majority it is done when the entry is comitted
+                if(numberOfServersThisEntryGotReplicatedTo == (NUM_OF_SERVERS / 2) + 1) return;
                 synchronized(writeConcernThroughputLock) {
                     ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();

@@ -663,7 +663,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     public int getLastLogIndex() {
-        if (log.size() == 0) {
+        if (log.isEmpty()) {
             return -1;
         } else {
             return log.getLastLogEntry().index;
@@ -671,7 +671,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     public int getLastLogTerm() {
-        if (log.size() == 0) {
+        if (log.isEmpty()) {
             return -1;
         } else {
             return log.getLastLogEntry().term;
@@ -1331,8 +1331,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
         }
-        // Leader implicitly has all its own log entries replicated
-        matchIndex.set(serverId, log.size() - 1);
     }
 
     public void startElection() {
@@ -1391,15 +1389,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // should be inside write lock
     private void becomeFollower() {
-
-        if (status == ServerCurrentStatus.LEADER) {
+        // Restart election timer when stepping down from LEADER or CANDIDATE
+        if (status == ServerCurrentStatus.LEADER || status == ServerCurrentStatus.CANDIDATE) {
             startTheElectionTimer();
         }
         // the status changes to follower
         status = ServerCurrentStatus.FOLLOWER;
-        // Reset votedFor to allow voting in new term
-        votedFor = -1;
         // we have to start the election timer because now it is a follower
+        votedFor = -1;
 
         // cancelling the batch job
         if (batchProcessingTask != null && !batchProcessingTask.isCancelled()) {
@@ -1797,18 +1794,75 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             List<TransactionOption> currentBatchInTransactionOption = TransactionOption
                     .convertToTransactionOption(currentBatch);
 
-            ProcessResult result;
-
-            // Build dynamic TPS map for all writeConcern levels
+            // Build writeConcern TPS map
             int majority = (NUM_OF_SERVERS / 2) + 1;
             HashMap<Integer, Double> wcTpsMap = new HashMap<>();
             for (int wc = 1; wc <= majority; wc++) {
                 wcTpsMap.put(wc, getWriteConcernTPS(wc));
             }
-            System.out.println("Current TPS: " + currentTps + " | WC TPS Map: " + wcTpsMap);
-            // Using the new TPS-based heuristic approach with dynamic TPS values
-            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps,
-                    wcTpsMap, backLog);
+
+            // Calculate writeConcern frequency in current batch
+            HashMap<Integer, Integer> wcFrequency = new HashMap<>();
+            for (int wc = 1; wc <= majority; wc++) {
+                wcFrequency.put(wc, 0);
+            }
+            for (ClientMessage cm : currentBatch) {
+                int wc = cm.getWriteConcern();
+                wcFrequency.put(wc, wcFrequency.getOrDefault(wc, 0) + 1);
+            }
+
+            // Record writeConcern frequency in CSV (single row per batch)
+            try (FileWriter fw = new FileWriter("writeconcern_frequency.csv", true); PrintWriter out = new PrintWriter(fw)) {
+                File file = new File("writeconcern_frequency.csv");
+                if (file.length() == 0) {
+                    // Write header: Timestamp, WC1, WC2, ..., WC_majority, TotalInBatch
+                    StringBuilder header = new StringBuilder("Timestamp");
+                    for (int wc = 1; wc <= majority; wc++) {
+                        header.append(",WC").append(wc);
+                    }
+                    header.append(",TotalInBatch");
+                    out.println(header);
+                }
+                // Write data row
+                StringBuilder row = new StringBuilder();
+                row.append(System.currentTimeMillis());
+                for (int wc = 1; wc <= majority; wc++) {
+                    row.append(",").append(wcFrequency.get(wc));
+                }
+                row.append(",").append(n);
+                out.println(row);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            // Record writeConcern TPS in CSV (single row per batch)
+            try (FileWriter fw = new FileWriter("writeconcern_tps.csv", true); PrintWriter out = new PrintWriter(fw)) {
+                File file = new File("writeconcern_tps.csv");
+                if (file.length() == 0) {
+                    // Write header: Timestamp, WC1_TPS, WC2_TPS, ..., WC_majority_TPS, SystemTPS
+                    StringBuilder header = new StringBuilder("Timestamp");
+                    for (int wc = 1; wc <= majority; wc++) {
+                        header.append(",WC").append(wc).append("_TPS");
+                    }
+                    header.append(",SystemTPS");
+                    out.println(header);
+                }
+                // Write data row
+                StringBuilder row = new StringBuilder();
+                row.append(System.currentTimeMillis());
+                for (int wc = 1; wc <= majority; wc++) {
+                    row.append(",").append(String.format("%.2f", wcTpsMap.get(wc)));
+                }
+                row.append(",").append(String.format("%.2f", currentTps));
+                out.println(row);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            ProcessResult result;
+
+            // Using the new TPS-based heuristic approach
+            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps, wcTpsMap, backLog);
 
             // Save result for next RL prediction
             previousBatchResult = result;

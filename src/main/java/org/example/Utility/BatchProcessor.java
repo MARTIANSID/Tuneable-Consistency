@@ -15,7 +15,7 @@ public class BatchProcessor {
     final double EPS = 1e-9;
 
     // ========== TPS Constants (Heuristic) ==========
-    private static final double MIN_TPS = 14000.0;      // Minimum TPS to maintain
+    private static final double MIN_TPS = 25000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
 
@@ -23,13 +23,19 @@ public class BatchProcessor {
         this.NUM_OF_SERVERS = numOfServers;
     }
 
-    // we ideally will want to set a min worst case tps for every writeConcern level
+
+    // we ideally will want to set a min worst case tps for every writeConcern level, this is to avoid very low tps during warm up phases also we ideally expect tps to not fall below these levels
+    private static final HashMap<Integer, Double> MIN_HASH_MAP = new HashMap<>() {{
+        put(1, 35000.0);
+        put(2, 12000.0);
+    }};
+
 
     /**
      * Get max TPS for a given write concern level
      */
     private double getMaxTPS(int writeConcern, HashMap<Integer, Double> wcTpsMap) {
-        return wcTpsMap.getOrDefault(writeConcern, 0.0);
+        return Math.max(MIN_HASH_MAP.getOrDefault(writeConcern, 0.0), wcTpsMap.getOrDefault(writeConcern, 0.0));
     }
 
     /**
