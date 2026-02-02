@@ -6,6 +6,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 import org.ds.paxos.ClientMessage;
 
@@ -14,6 +15,10 @@ public class BatchProcessor {
     private final int NUM_OF_SERVERS;
     final double EPS = 1e-9;
 
+    // ========== Warmup Phase Constants ==========
+    private static final long WARMUP_DURATION_MS = 7000;  // 7 seconds warmup
+    private static volatile long systemStartTime = 0;
+
     // ========== TPS Constants (Heuristic) ==========
     private static final double MIN_TPS = 25000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
@@ -21,6 +26,11 @@ public class BatchProcessor {
 
     public BatchProcessor(int numOfServers) {
         this.NUM_OF_SERVERS = numOfServers;
+        // Initialize system start time on first BatchProcessor creation
+        if (systemStartTime == 0) {
+            systemStartTime = System.currentTimeMillis();
+            System.out.println("[BatchProcessor] Warmup phase started - will use MIN_HASH_MAP for 7 seconds");
+        }
     }
 
 
@@ -30,12 +40,26 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
 
+    /**
+     * Check if system is still in warmup phase (first 7 seconds)
+     */
+    private boolean isInWarmupPhase() {
+        return (System.currentTimeMillis() - systemStartTime) < WARMUP_DURATION_MS;
+    }
+
 
     /**
      * Get max TPS for a given write concern level
+     * During warmup phase (first 7 seconds): use only MIN_HASH_MAP values
+     * After warmup: use max of MIN_HASH_MAP and wcTpsMap (measured values)
      */
     private double getMaxTPS(int writeConcern, HashMap<Integer, Double> wcTpsMap) {
-        return Math.max(MIN_HASH_MAP.getOrDefault(writeConcern, 0.0), wcTpsMap.getOrDefault(writeConcern, 0.0));
+        if (isInWarmupPhase()) {
+            // During warmup, only use MIN_HASH_MAP (conservative estimates)
+            return MIN_HASH_MAP.getOrDefault(writeConcern, 0.0);
+        }
+        // After warmup, use the maximum of measured and minimum expected
+        return wcTpsMap.get(writeConcern); 
     }
 
     /**
@@ -69,7 +93,7 @@ public class BatchProcessor {
             List<TransactionOption> batch,
             double currentTPS,
             HashMap<Integer, Double> wcTpsMap,
-            int backLog) {
+            Set<String> backLogTransactions) {
 
         int n = batch.size();
         if (n == 0) {
@@ -106,8 +130,8 @@ public class BatchProcessor {
                 profit += batch.get(i).baseProfit;
             }
 
-            // Step 4: Check if we can upgrade (need 15% headroom)
-            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLog == 0) {
+            // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
+            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLogTransactions.isEmpty()) {
                 
                 // Build priority queue for upgrades (best profit/tps-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
@@ -159,38 +183,54 @@ public class BatchProcessor {
             }
 
             // Build result
-            List<ClientMessage> result = buildResultMessages(batch, consistencyLevels);
+            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
             
             HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
-            System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | FinalAvgTPS=%.0f%n",
-                    wcMix, transactionsUpgraded, calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+            System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
+                    wcMix, transactionsUpgraded, backLogTransactions.size(), calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
 
-            return new ProcessResult(result, n, profit, transactionsUpgraded);
+            return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
         }
         // Step 6: avgTPS < minTPS → process from weakest first
         else {
-            // Sort by weakest consistency first
+            // Sort by: 1) retryCount DESC (prioritize retried transactions)
+            //          2) minRequiredConsistency ASC (weakest first)
             List<Integer> indices = new ArrayList<>();
             for (int i = 0; i < n; i++) indices.add(i);
-            indices.sort(Comparator.comparingInt(i -> batch.get(i).minRequiredConsistency));
+            indices.sort((a, b) -> {
+                TransactionOption txA = batch.get(a);
+                TransactionOption txB = batch.get(b);
+                // First: higher retry count has priority
+                if (txA.retryCount != txB.retryCount) {
+                    return Integer.compare(txB.retryCount, txA.retryCount); // DESC
+                }
+                // Second: lower consistency (W:1 before W:2)
+                return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
+            });
 
             // Reset consistency levels
             for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
 
-            // Minimum transactions to process (20% of batch)
-            int minToProcess = Math.max(1, (int) (n * 0.40));
+            // Minimum transactions to process (80% of batch)
+            int minToProcess = Math.max(1, (int) (n * 1.0));
 
             int processed = 0;
             for (int idx : indices) {
                 TransactionOption tx = batch.get(idx);
                 
+                // Force execute transactions that have been deferred too many times (retryCount >= 2)
+                boolean mustExecute = tx.retryCount >= 2;
+
+                // System.out.printf("[TPS Heuristic] Considering Tx ID=%s | MinWC=%d | RetryCount=%d | MustExecute=%b%n",
+                //         tx.id, tx.minRequiredConsistency, tx.retryCount, mustExecute);
+                
                 // Try adding this transaction
                 consistencyLevels[idx] = tx.minRequiredConsistency;
                 double newAvgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
 
-                // Always process minimum required (20%), then check TPS threshold
-                if (processed < minToProcess || newAvgTPS >= MIN_TPS) {
-                    // Must process (below minimum) or can process (TPS allows)
+                // Execute if: forced (retry >= 2), below minimum threshold, or TPS allows
+                if (mustExecute || processed < minToProcess || newAvgTPS >= MIN_TPS) {
+                    // Must process (retried too many times / below minimum) or can process (TPS allows)
                     profit += tx.baseProfit;
                     processed++;
                 } else {
@@ -199,34 +239,71 @@ public class BatchProcessor {
                 }
             }
 
-            List<ClientMessage> result = buildResultMessages(batch, consistencyLevels);
+            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
             
-            System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | FinalAvgTPS=%.0f%n",
-                    processed, n, calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+            System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
+                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
 
-            return new ProcessResult(result, processed, profit, 0);
+            return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
         }
     }
 
     /**
-     * Build ClientMessage list from consistency levels
+     * Result of building messages - contains both executed and deferred
      */
-    private List<ClientMessage> buildResultMessages(List<TransactionOption> batch, int[] consistencyLevels) {
-        List<ClientMessage> result = new ArrayList<>();
+    public static class BuildResult {
+        public final List<ClientMessage> executed;
+        public final List<TransactionOption> deferred;
+        
+        public BuildResult(List<ClientMessage> executed, List<TransactionOption> deferred) {
+            this.executed = executed;
+            this.deferred = deferred;
+        }
+    }
+
+    /**
+     * Build ClientMessage list from consistency levels, also return deferred transactions
+     */
+    private BuildResult buildResultMessages(List<TransactionOption> batch, int[] consistencyLevels, Set<String> backLogTransactions) {
+        List<ClientMessage> executed = new ArrayList<>();
+        List<TransactionOption> deferred = new ArrayList<>();
+        
         for (int i = 0; i < batch.size(); i++) {
             int wc = consistencyLevels[i];
-            if (wc == 0) continue;
-
             TransactionOption tx = batch.get(i);
+            String txId = tx.clientMessage.getT().getId();
+            
+            if (wc == 0) {
+                // Deferred - increment retry count
+                tx.retryCount++;
+                // Add to backlog set only on FIRST deferral (retryCount just became 1)
+                if (tx.retryCount == 1) {
+                    backLogTransactions.add(txId);
+                }
+                deferred.add(tx);
+                continue;
+            }
+            
+            // Transaction is being executed - remove from backlog if it was there
+            if(tx.retryCount > 0) {
+                backLogTransactions.remove(txId);
+            }
+
             ClientMessage msg = ClientMessage.newBuilder()
                     .setT(tx.clientMessage.getT())
                     .setWriteConcern(wc)
                     .setCallbackHost(tx.clientHost)
                     .setCallbackPort(tx.clientPort)
                     .build();
-            result.add(msg);
+            
+            // Copy timestamp if present
+            if (tx.clientMessage.hasTimeStamp()) {
+                msg = msg.toBuilder().setTimeStamp(tx.clientMessage.getTimeStamp()).build();
+            }
+            
+            executed.add(msg);
         }
-        return result;
+        return new BuildResult(executed, deferred);
     }
 
     /**
@@ -374,8 +451,7 @@ public class BatchProcessor {
                                 double nextProfit = (nextWC == majority)
                                         ? transactions.get(opt.txIndex).extraMajorityProfit
                                         : transactions.get(opt.txIndex).extraIntermediateProfit;
-                                double nextRatio = nextProfit / nextUpgradeCost;
-
+                                double nextRatio = nextProfit / (nextUpgradeCost + EPS);
                                 pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));
                             }
                         }

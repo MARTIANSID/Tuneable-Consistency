@@ -119,7 +119,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     TokenBucketImpl tokenBucket;
 
     // this helps in avoiding race conditions, this will batch transactions for 20ms
-    Queue<ClientMessage> batchOfTransactions;
+    Deque<TransactionOption> batchOfTransactions;
 
     // this will execute the batch in every 20 ms
     ScheduledExecutorService batchProcessor;
@@ -129,6 +129,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns;
     private final Object writeConcernThroughpuLock;
+    ConcurrentHashMap<Integer, Object> writeConcernThroughputLocks;
 
     ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies;
     ConcurrentHashMap<Integer, Long> writeConcernLatencySum;
@@ -144,6 +145,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     BatchProcessor transactionBatchProcessor;
 
+    Set<String> backLogTransactions;
+
     // RL Model Client for budget prediction
     RLModelGrpcClient rlModelClient;
     ProcessResult previousBatchResult;
@@ -152,9 +155,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private ConcurrentLinkedQueue<Long> incomingTransactionTimestamps;
     private final Object incomingTransactionLock;
     private AtomicLong lastPrintTime;
-
-    // backlog transactions
-    HashSet<String> backLogTransactions;
 
     // all the parameters for knapsack
     private static final int BATCH_INTERVAL_MS = 20;
@@ -282,6 +282,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
         this.lastThroughputSentTimeOnFollower = 0;
         this.writeConcernThroughpuLock = new Object();
+        this.writeConcernThroughputLocks = new ConcurrentHashMap<>();
+        this.backLogTransactions = ConcurrentHashMap.newKeySet();
 
         // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
         try {
@@ -301,7 +303,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.causalReadScheduler = Executors.newScheduledThreadPool(1);
         this.lastHeartBeatSent = new AtomicLongArray(NUM_OF_SERVERS);
         this.lastIndexSent = new AtomicIntegerArray(NUM_OF_SERVERS);
-        this.backLogTransactions = new HashSet<>();
         this.followerReadThroughput = new double[NUM_OF_SERVERS];
         this.combinedThroughputOfFollowers = 0;
         this.lastThroughputSentTime = new AtomicLongArray(NUM_OF_SERVERS);
@@ -325,6 +326,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 writeConcernCosts.put(i, 1.0);
                 writeConcernLatencies.put(i, new ArrayDeque<>());
                 writeConcernLatencySum.put(i, (long) 0);
+                writeConcernThroughputLocks.put(i, new Object());
             }
         }
         // setting up the client stub
@@ -564,6 +566,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    private final int MAX_QUEUE_SIZE = 4000;
+
     @Override
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
         // check if the current node is leader or not, if not forward request to leader,
@@ -595,8 +599,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         responseObserver.onNext(Empty.newBuilder().build());
         responseObserver.onCompleted();
 
-        // Track incoming transaction rate
-        trackIncomingTransaction(); // Track incoming transaction rate
         String clientId = getClientId(clientMessage.getCallbackHost(), clientMessage.getCallbackPort());
 
         clientStubs.computeIfAbsent(clientId,
@@ -605,7 +607,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here I add the transactions in batch
         batchLock.lock();
         try {
-            batchOfTransactions.add(clientMessage);
+            if(batchOfTransactions.size() > MAX_QUEUE_SIZE) {
+                return;
+            }
+            batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
             // System.out.println(batchOfTransactions.size() + "This is the batchSize at the
             // leader end");
         } finally {
@@ -629,22 +634,34 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         long currentTime = System.currentTimeMillis();
 
         synchronized (incomingTransactionLock) {
-            // Add current transaction timestamp
-            incomingTransactionTimestamps.add(currentTime);
-
             // Remove timestamps older than 1 second
             while (!incomingTransactionTimestamps.isEmpty()
                     && currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
                 incomingTransactionTimestamps.poll();
             }
+            incomingTransactionTimestamps.add(currentTime);
 
-            // Print every second (with a small buffer to avoid too frequent prints)
+            // Print and log to CSV every second
             long lastPrint = lastPrintTime.get();
             if (currentTime - lastPrint >= 1000L && lastPrintTime.compareAndSet(lastPrint, currentTime)) {
                 int incomingTPS = incomingTransactionTimestamps.size();
                 System.out.printf("📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n", serverId,
                         incomingTPS,
                         new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
+                
+                // Log to CSV file
+                try {
+                    File file = new File("incoming_transaction_rate.csv");
+                    boolean writeHeader = !file.exists() || file.length() == 0;
+                    try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
+                        if (writeHeader) {
+                            out.println("Timestamp,IncomingTransactionCount,IncomingTPS");
+                        }
+                        out.printf("%d,%d,%d%n", currentTime, incomingTPS, incomingTPS);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         }
     }
@@ -1040,7 +1057,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
 
                             // this updates the tps of w:majority
-                            synchronized (writeConcernThroughpuLock) {
+                            synchronized (writeConcernThroughputLocks.get((NUM_OF_SERVERS / 2) + 1)) {
                                 ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
                                         .get((NUM_OF_SERVERS / 2) + 1);
                                 Long currentTime = System.currentTimeMillis();
@@ -1106,7 +1123,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // updateWriteConcern handles all the necessary conditions so that the same node
                 // does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower, ackTransactionTimeStampsForAllWriteConcerns,
-                        writeConcernThroughpuLock);
+                        writeConcernThroughputLocks);
                 if (log.get(i).writeConcern == 0) {
                     entries.add(log.get(i));
                 }
@@ -1378,7 +1395,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             }
             if (batchProcessingTask == null || batchProcessor.isShutdown()) {
-                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatch, 0, BATCH_INTERVAL_MS,
+                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0, BATCH_INTERVAL_MS,
                         TimeUnit.MILLISECONDS);
             }
         } finally {
@@ -1387,6 +1404,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         sendAppendEntries();
     }
 
+    private void processBatchWithErrorHandling() {
+        try {
+            processBatch();
+        } catch (Exception e) {
+            throw new RuntimeException("Error processing batch", e);    
+        }
+    }
     // should be inside write lock
     private void becomeFollower() {
         // Restart election timer when stepping down from LEADER or CANDIDATE
@@ -1414,20 +1438,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private void processBatch() {
         // here the logic to process the current batch of transaction will come
-        List<ClientMessage> currentBatch = new ArrayList<>();
-        // remove and add the current batch of transactions to currentBatch List
-        int backLog = 0;
+        List<TransactionOption> currentBatch = new ArrayList<>();
         double totalFollowerTps = 0;
+
         batchLock.lock();
         try {
-            // Take at most MAX_BATCH_SIZE transactions from the queue
             int count = 0;
+
+            // pick at most MAX_BATCH_SIZE transactions from the queue
             while (!batchOfTransactions.isEmpty() && count < MAX_BATCH_SIZE) {
                 currentBatch.add(batchOfTransactions.poll());
                 count++;
             }
             totalFollowerTps = combinedThroughputOfFollowers;
-            backLog = backLogTransactions.size();
         } finally {
             batchLock.unlock();
         }
@@ -1436,30 +1459,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (currentBatch.isEmpty())
             return;
 
-        List<ClientMessage> transactionsToExecute = handleTokenBucket(currentBatch, backLog, totalFollowerTps);
-        // first I create a hashset of all the transactions id which are going to be
-        // executed
-        // this part can be optimised a bit
-        // // we can add parallelize this stream if needed
-        Set<String> idsOfTransactionsWhichCanBeExecuted = transactionsToExecute.stream().map(cm -> cm.getT().getId())
-                .collect(Collectors.toSet());
+        ProcessResult result = handleTokenBucket(currentBatch, totalFollowerTps);
+        List<ClientMessage> transactionsToExecute = result.messages;
 
-        // // adding back it in the queue
+        // Add deferred transactions to the FRONT of the queue for priority processing
+        // Note: backLogTransactions is already updated inside BatchProcessor.buildResultMessages()
         batchLock.lock();
         try {
-            for (ClientMessage clientMessage : currentBatch) {
-                String transactionId = clientMessage.getT().getId();
-                if (!idsOfTransactionsWhichCanBeExecuted.contains(clientMessage.getT().getId())) {
-                    backLogTransactions.add(transactionId);
-                    batchOfTransactions.add(clientMessage);
-                } else {
-                    // it can be executed
-                    backLogTransactions.remove(transactionId);
-                }
+            // Add in reverse order so the first deferred transaction ends up at the front
+            for (int i = result.deferredTransactions.size() - 1; i >= 0; i--) {
+                TransactionOption deferred = result.deferredTransactions.get(i);
+                batchOfTransactions.addFirst(deferred);
             }
-            backLog = backLogTransactions.size();
+            
+            int backLog = backLogTransactions.size();
+            
             try (FileWriter fw = new FileWriter("backlog.csv", true); PrintWriter out = new PrintWriter(fw)) {
-
                 File file = new File("backlog.csv");
                 if (file.length() == 0) {
                     out.println("Backlog");
@@ -1468,12 +1483,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            System.out.println("The backlog is--" + backLog);
+            System.out.println("The backlog is--" + backLog + " | Deferred this round: " + result.deferredTransactions.size());
         } finally {
             batchLock.unlock();
         }
-        ////
-        // // this list is used to ack transactions with w:1
+        
+        // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
 
         // here append all these transactions in the raft log
@@ -1506,7 +1521,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // since this is in write lock only updated entry will be sent to the followers,
                 // as this entire thing is atomic
                 log.updateWriteConcern(index, serverId, ackTransactionTimeStampsForAllWriteConcerns,
-                        writeConcernThroughpuLock);
+                        writeConcernThroughputLocks);
                 ackSent.put(id, false);
                 timeAtWhichTransactionWasReceived.put(id, System.currentTimeMillis());
                 // if write concern becomes 0 we will send ack to client
@@ -1778,7 +1793,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private List<ClientMessage> handleTokenBucket(List<ClientMessage> currentBatch, int backLog,
+    private ProcessResult handleTokenBucket(List<TransactionOption> currentBatch,
             double totalFollowerTps) {
         // we can use lua scripts instead of using lock at application level
         redisLock.writeLock().lock();
@@ -1789,10 +1804,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             int n = currentBatch.size();
 
-            // I convert the clientMessage protobuf object into java object, so that we can
-            // use java functions directly on it
-            List<TransactionOption> currentBatchInTransactionOption = TransactionOption
-                    .convertToTransactionOption(currentBatch);
+            // currentBatch is already List<TransactionOption>, no conversion needed
 
             // Build writeConcern TPS map
             int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -1806,8 +1818,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             for (int wc = 1; wc <= majority; wc++) {
                 wcFrequency.put(wc, 0);
             }
-            for (ClientMessage cm : currentBatch) {
-                int wc = cm.getWriteConcern();
+            for (TransactionOption tx : currentBatch) {
+                int wc = tx.clientMessage.getWriteConcern();
                 wcFrequency.put(wc, wcFrequency.getOrDefault(wc, 0) + 1);
             }
 
@@ -1861,8 +1873,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             ProcessResult result;
 
-            // Using the new TPS-based heuristic approach
-            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatchInTransactionOption, currentTps, wcTpsMap, backLog);
+            // Using the new TPS-based heuristic approach - pass backLogTransactions directly
+            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatch, currentTps, wcTpsMap, backLogTransactions);
 
             // Save result for next RL prediction
             previousBatchResult = result;
@@ -1886,7 +1898,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 e.printStackTrace();
             }
 
-            return result.messages;
+            return result;
         } finally {
             redisLock.writeLock().unlock();
         }
@@ -1917,7 +1929,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // }
 
     private double getWriteConcernTPS(int writeConcern) {
-        synchronized (writeConcernThroughpuLock) {
+        synchronized (writeConcernThroughputLocks.get(writeConcern)) {
             Long currentTimeStamp = System.currentTimeMillis();
             ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns
                     .get(writeConcern);

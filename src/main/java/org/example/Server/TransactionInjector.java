@@ -2,7 +2,10 @@ package org.example.Server;
 
 import org.ds.paxos.ClientMessage;
 import org.example.Utility.ServerStatus;
+import org.example.Utility.TransactionOption;
+
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Helper class to inject transactions into servers for testing and debugging
@@ -47,9 +50,13 @@ public class TransactionInjector {
         ServerImpl server = getServerById(serverId);
         if (server == null) return;
 
+        List<TransactionOption> transactionOptions = transactions.stream()
+                .map(TransactionOption::fromClientMessage)
+                .collect(Collectors.toList());
+
         server.batchLock.lock();
         try {
-            server.batchOfTransactions.addAll(transactions);
+            server.batchOfTransactions.addAll(transactionOptions);
         } finally {
             server.batchLock.unlock();
         }
@@ -62,9 +69,13 @@ public class TransactionInjector {
         ServerImpl leader = getLeader();
         if (leader == null) return;
 
+        List<TransactionOption> transactionOptions = transactions.stream()
+                .map(TransactionOption::fromClientMessage)
+                .collect(Collectors.toList());
+
         leader.batchLock.lock();
         try {
-            leader.batchOfTransactions.addAll(transactions);
+            leader.batchOfTransactions.addAll(transactionOptions);
         } finally {
             leader.batchLock.unlock();
         }
@@ -79,7 +90,7 @@ public class TransactionInjector {
 
         server.batchLock.lock();
         try {
-            server.batchOfTransactions.add(transaction);
+            server.batchOfTransactions.add(TransactionOption.fromClientMessage(transaction));
             System.out.println("✓ Injected 1 transaction into Server " + serverId);
         } finally {
             server.batchLock.unlock();
@@ -95,7 +106,7 @@ public class TransactionInjector {
 
         leader.batchLock.lock();
         try {
-            leader.batchOfTransactions.add(transaction);
+            leader.batchOfTransactions.add(TransactionOption.fromClientMessage(transaction));
             System.out.println("✓ Injected 1 transaction into Leader (Server " + leader.serverId + ")");
         } finally {
             leader.batchLock.unlock();

@@ -52,14 +52,14 @@ public class RaftLog {
         return count;
     }
 
-    public void updateWriteConcern(int index, int serverId, ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns, Object writeConcernThroughputLock) {
+    public void updateWriteConcern(int index, int serverId, ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns, ConcurrentHashMap<Integer, Object> writeConcernThroughputLocks) {
         lock.writeLock().lock();
         try {
             if(log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
                 int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
-                synchronized(writeConcernThroughputLock) {
+                synchronized(writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
                     ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();
                     while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
@@ -75,7 +75,7 @@ public class RaftLog {
                 int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
                 // for majority it is done when the entry is comitted
                 if(numberOfServersThisEntryGotReplicatedTo == (NUM_OF_SERVERS / 2) + 1) return;
-                synchronized(writeConcernThroughputLock) {
+                synchronized(writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
                     ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();
                     while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {

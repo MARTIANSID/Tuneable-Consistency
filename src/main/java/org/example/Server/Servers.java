@@ -1,20 +1,27 @@
 package org.example.Server;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.ds.paxos.ClientMessage;
 import org.ds.paxos.Transaction;
 import org.ds.paxos.TimeStampProto;
+import org.example.Utility.TransactionOption;
 
 public class Servers{
 
@@ -41,24 +48,24 @@ public class Servers{
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
-        // Light workload (20% probability) - Low TPS, mostly W:1
-        PHASES.add(new Phase("Light", 8, 50000, Map.of(1, 0.80, 2, 0.20)));
+        // Light workload - Low TPS, mostly W:1 (6 seconds)
+        PHASES.add(new Phase("Light", 6, 80000, Map.of(1, 0.60, 2, 0.20)));
         
-        // Mixed workload (60% probability) - Medium TPS, balanced W:1/W:2
-        PHASES.add(new Phase("Mixed", 10, 50000, Map.of(1, 0.50, 2, 0.50)));
+        // Heavy workload - High TPS, mostly W:2 (7 seconds)
+        PHASES.add(new Phase("Heavy", 7, 80000, Map.of(1, 0.30, 2, 0.70)));
         
-        // Heavy workload (20% probability) - High TPS, mostly W:2
-        PHASES.add(new Phase("Heavy", 8, 50000, Map.of(1, 0.30, 2, 0.70)));
+        // Mixed workload - Medium TPS, balanced W:1/W:2 (6 seconds)
+        PHASES.add(new Phase("Mixed", 6, 80000, Map.of(1, 0.50, 2, 0.50)));
     }
     
-    // Probability weights for phase selection (must sum to 1.0)
-    private static final double[] PHASE_PROBABILITIES = {0.20, 0.60, 0.20};
+    // Track current phase index for sequential execution
+    private static final AtomicInteger currentPhaseIndex = new AtomicInteger(0);
 
     private static final int BATCH_SIZE = 1000;  // Transactions per batch (increased to reduce gRPC overhead)
     private static final Random random = new Random();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 30000;  // 30 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 40000;  // 20 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -66,6 +73,11 @@ public class Servers{
     private static volatile Phase currentPhase = PHASES.get(1);  // Start with Mixed
     private static volatile long phaseEndTime = 0;
     private static final Object phaseLock = new Object();
+    
+    // Incoming transaction tracking
+    private static final Queue<Long> incomingTransactionTimestamps = new LinkedList<>();
+    private static final Object incomingTransactionLock = new Object();
+    private static final AtomicLong lastPrintTime = new AtomicLong(0);
 
     public static void main(String[] args) throws IOException{
         // Clear all CSV files at startup
@@ -120,7 +132,7 @@ public class Servers{
             return;
         }
 
-        System.out.println("🚀 Starting 30-second randomized workload experiment...");
+        System.out.println("🚀 Starting 20-second randomized workload experiment...");
         printPhaseConfig();
         
         // Initialize experiment
@@ -135,7 +147,7 @@ public class Servers{
                     // Check if total experiment has ended
                     long currentTime = System.currentTimeMillis();
                     if (currentTime - experimentStartTime >= TOTAL_EXPERIMENT_DURATION_MS) {
-                        System.out.println("\n🏁 30-second experiment completed!");
+                        System.out.println("\n🏁 20-second experiment completed!");
                         experimentRunning = false;
                         break;
                     }
@@ -211,6 +223,10 @@ public class Servers{
             
             System.out.printf("\n🏆 Experiment completed! Total injected: %d transactions%n", 
                     totalInjected.get());
+            
+            // Exit the program after experiment completes
+            System.out.println("\n✅ Shutting down servers...");
+            System.exit(0);
         }, "ContinuousInjector");
         continuousInjector.setDaemon(true);
         continuousInjector.start();
@@ -218,12 +234,12 @@ public class Servers{
     
     /**
      * Select a new phase and update the shared phase parameters atomically
-     * Only creates new phases if experiment is still running
+     * Phases run SEQUENTIALLY to guarantee all are experienced
      */
     private static void selectAndStartNewPhase() {
         if (!experimentRunning) return;
         
-        Phase newPhase = selectRandomPhase();
+        Phase newPhase = selectNextPhase();
         long newEndTime = System.currentTimeMillis() + (newPhase.durationSeconds * 1000L);
         
         // Don't let phase extend beyond total experiment duration
@@ -238,8 +254,10 @@ public class Servers{
         }
         
         long remainingSeconds = (experimentEndTime - System.currentTimeMillis()) / 1000;
+        int phaseNum = currentPhaseIndex.get();
         System.out.println("\n========================================");
-        System.out.printf("📌 Starting Phase: %s (Experiment time remaining: %ds)%n", newPhase.name, remainingSeconds);
+        System.out.printf("📌 Starting Phase %d/%d: %s (Experiment time remaining: %ds)%n", 
+                phaseNum, PHASES.size(), newPhase.name, remainingSeconds);
         System.out.printf("   Duration: %ds | Target TPS: %d%n", newPhase.durationSeconds, newPhase.targetTPS);
         System.out.printf("   WC Distribution: %s%n", newPhase.writeConcernDistribution);
         System.out.println("========================================");
@@ -249,12 +267,20 @@ public class Servers{
      * Robust batch injection - tries multiple servers if needed
      */
     private static boolean injectBatchRobust(List<ClientMessage> batch) {
+        // Convert ClientMessage list to TransactionOption list
+        List<TransactionOption> transactionOptions = batch.stream()
+                .map(TransactionOption::fromClientMessage)
+                .collect(Collectors.toList());
+        
+        // Track incoming transactions BEFORE injection
+        trackIncomingTransactions(batch.size());
+        
         // First try: current leader
         ServerImpl leader = injector.getLeader();
         if (leader != null) {
             leader.batchLock.lock();
             try {
-                leader.batchOfTransactions.addAll(batch);
+                leader.batchOfTransactions.addAll(transactionOptions);
                 return true;
             } finally {
                 leader.batchLock.unlock();
@@ -267,7 +293,7 @@ public class Servers{
             if (server != null) {
                 server.batchLock.lock();
                 try {
-                    server.batchOfTransactions.addAll(batch);
+                    server.batchOfTransactions.addAll(transactionOptions);
                     return true;
                 } finally {
                     server.batchLock.unlock();
@@ -277,38 +303,78 @@ public class Servers{
         
         return false;
     }
-
+    
     /**
-     * Select a random phase based on probability weights
+     * Tracks incoming transactions and logs the rate to CSV
      */
-    private static Phase selectRandomPhase() {
-        double rand = random.nextDouble();
-        double cumulative = 0.0;
+    private static void trackIncomingTransactions(int count) {
+        long currentTime = System.currentTimeMillis();
         
-        for (int i = 0; i < PHASES.size(); i++) {
-            cumulative += PHASE_PROBABILITIES[i];
-            if (rand <= cumulative) {
-                return PHASES.get(i);
+        synchronized (incomingTransactionLock) {
+            // Add timestamps for all transactions in this batch
+            for (int i = 0; i < count; i++) {
+                incomingTransactionTimestamps.add(currentTime);
+            }
+            
+            // Remove timestamps older than 1 second
+            while (!incomingTransactionTimestamps.isEmpty()
+                    && currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
+                incomingTransactionTimestamps.poll();
+            }
+            
+            // Print and log to CSV every second
+            long lastPrint = lastPrintTime.get();
+            if (currentTime - lastPrint >= 1000L && lastPrintTime.compareAndSet(lastPrint, currentTime)) {
+                int incomingTPS = incomingTransactionTimestamps.size();
+                System.out.printf("📥 [Incoming Transactions] TPS: %d | Time: %s%n",
+                        incomingTPS,
+                        new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
+                
+                // Log to CSV file
+                try {
+                    File file = new File("incoming_transaction_rate.csv");
+                    boolean writeHeader = !file.exists() || file.length() == 0;
+                    try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
+                        if (writeHeader) {
+                            out.println("Timestamp,IncomingTransactionCount,IncomingTPS");
+                        }
+                        out.printf("%d,%d,%d%n", currentTime, incomingTPS, incomingTPS);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         }
-        
-        // Fallback to mixed workload (most common)
-        return PHASES.get(1);
     }
 
     /**
-     * Print phase configuration for 30-second experiment
+     * Select the next phase sequentially (cycles through all phases)
+     */
+    private static Phase selectNextPhase() {
+        int index = currentPhaseIndex.getAndIncrement();
+        if (index >= PHASES.size()) {
+            // Cycle back to first phase if needed
+            currentPhaseIndex.set(1);
+            index = 0;
+        }
+        return PHASES.get(index);
+    }
+
+    /**
+     * Print phase configuration for 20-second experiment
      */
     private static void printPhaseConfig() {
-        System.out.println("\n📊 30-Second Experiment Configuration:");
-        System.out.println("   Total Duration: 30 seconds");
-        System.out.println("   Phases selected randomly:");
-        for (int i = 0; i < PHASES.size(); i++) {
-            Phase p = PHASES.get(i);
-            System.out.printf("   %s: %ds | %d TPS | WC: %s | Probability: %.0f%%%n",
-                    p.name, p.durationSeconds, p.targetTPS, p.writeConcernDistribution, 
-                    PHASE_PROBABILITIES[i] * 100);
+        System.out.println("\n📊 20-Second Experiment Configuration:");
+        System.out.println("   Total Duration: 20 seconds");
+        System.out.println("   Phases run sequentially:");
+        int totalDuration = 0;
+        for (Phase p : PHASES) {
+            System.out.printf("   %d. %s: %ds | %d TPS | WC: %s%n",
+                    PHASES.indexOf(p) + 1, p.name, p.durationSeconds, p.targetTPS, p.writeConcernDistribution);
+            totalDuration += p.durationSeconds;
         }
+        System.out.printf("   Total phase duration: %ds (buffer: %ds)%n", totalDuration, 
+                (int)(TOTAL_EXPERIMENT_DURATION_MS/1000) - totalDuration);
         System.out.println();
     }
 
@@ -389,7 +455,8 @@ public class Servers{
             "backlog.csv",
             "avg_latencies.csv",
             "token_costs.csv",
-            "lab1_Test.csv"
+            "lab1_Test.csv",
+            "incoming_transaction_rate.csv"
         };
         
         for (String filename : csvFiles) {
