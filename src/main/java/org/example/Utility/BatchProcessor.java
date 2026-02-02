@@ -20,7 +20,7 @@ public class BatchProcessor {
     private static volatile long systemStartTime = 0;
 
     // ========== TPS Constants (Heuristic) ==========
-    private static final double MIN_TPS = 25000.0;      // Minimum TPS to maintain
+    private static final double MIN_TPS = 15000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
 
@@ -96,6 +96,8 @@ public class BatchProcessor {
             Set<String> backLogTransactions) {
 
         int n = batch.size();
+        double finalBatchAvgTps;
+
         if (n == 0) {
             return new ProcessResult(new ArrayList<>(), 0, 0, 0);
         }
@@ -182,8 +184,11 @@ public class BatchProcessor {
                 }
             }
 
+            finalBatchAvgTps = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+            logFinalBatchAvgTps(finalBatchAvgTps);
             // Build result
             BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+
             
             HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
             System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
@@ -239,12 +244,26 @@ public class BatchProcessor {
                 }
             }
 
+            finalBatchAvgTps = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+
             BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
-            
+
+            logFinalBatchAvgTps(finalBatchAvgTps);
             System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
                     processed, n, buildResult.deferred.size(), backLogTransactions.size(), calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
 
             return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+        }
+    }
+
+    // create method to log the finalBatchAvgTps in csv
+    private void logFinalBatchAvgTps(double finalBatchAvgTps) {
+        // Append to CSV file
+        String logEntry = System.currentTimeMillis() + "," + finalBatchAvgTps + "\n";
+        try (java.io.FileWriter fw = new java.io.FileWriter("final_batch_avg_tps_log.csv", true)) {
+            fw.write(logEntry);
+        } catch (java.io.IOException e) {
+            System.err.println("Error logging final batch avg TPS: " + e.getMessage());
         }
     }
 
@@ -267,6 +286,8 @@ public class BatchProcessor {
     private BuildResult buildResultMessages(List<TransactionOption> batch, int[] consistencyLevels, Set<String> backLogTransactions) {
         List<ClientMessage> executed = new ArrayList<>();
         List<TransactionOption> deferred = new ArrayList<>();
+
+
         
         for (int i = 0; i < batch.size(); i++) {
             int wc = consistencyLevels[i];
@@ -288,6 +309,7 @@ public class BatchProcessor {
             if(tx.retryCount > 0) {
                 backLogTransactions.remove(txId);
             }
+
 
             ClientMessage msg = ClientMessage.newBuilder()
                     .setT(tx.clientMessage.getT())

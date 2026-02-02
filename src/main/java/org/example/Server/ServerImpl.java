@@ -157,7 +157,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private AtomicLong lastPrintTime;
 
     // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 20;
+    private static final int BATCH_INTERVAL_MS = 50;
 
     // private static final double COST_W1 = 1;
     // private static final double COST_MAJORITY = 2.0;

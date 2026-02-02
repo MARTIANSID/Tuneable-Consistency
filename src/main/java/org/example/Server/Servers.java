@@ -48,14 +48,17 @@ public class Servers{
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
-        // Light workload - Low TPS, mostly W:1 (6 seconds)
-        PHASES.add(new Phase("Light", 6, 80000, Map.of(1, 0.60, 2, 0.20)));
+        // Light workload - mostly W:1 (5 seconds)
+        PHASES.add(new Phase("Light", 5, 80000, Map.of(1, 0.60, 2, 0.20)));
         
-        // Heavy workload - High TPS, mostly W:2 (7 seconds)
-        PHASES.add(new Phase("Heavy", 7, 80000, Map.of(1, 0.30, 2, 0.70)));
+        // Heavy workload - mostly W:2 (5 seconds)
+        PHASES.add(new Phase("Heavy", 5, 80000, Map.of(1, 0.30, 2, 0.70)));
         
-        // Mixed workload - Medium TPS, balanced W:1/W:2 (6 seconds)
-        PHASES.add(new Phase("Mixed", 6, 80000, Map.of(1, 0.50, 2, 0.50)));
+        // Mixed workload - balanced W:1/W:2 (5 seconds)
+        PHASES.add(new Phase("Mixed", 5, 80000, Map.of(1, 0.50, 2, 0.50)));
+        
+        // Light workload again (5 seconds)
+        PHASES.add(new Phase("Light", 5, 80000, Map.of(1, 0.60, 2, 0.20)));
     }
     
     // Track current phase index for sequential execution
@@ -65,7 +68,7 @@ public class Servers{
     private static final Random random = new Random();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 40000;  // 20 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 20000;  // 20 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -456,7 +459,8 @@ public class Servers{
             "avg_latencies.csv",
             "token_costs.csv",
             "lab1_Test.csv",
-            "incoming_transaction_rate.csv"
+            "incoming_transaction_rate.csv",
+            "final_batch_avg_tps_log.csv"
         };
         
         for (String filename : csvFiles) {
