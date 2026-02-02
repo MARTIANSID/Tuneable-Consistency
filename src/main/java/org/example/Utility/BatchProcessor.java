@@ -160,11 +160,14 @@ public class BatchProcessor {
                     if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
 
                     // Simulate upgrade
-                    int[] tempLevels = consistencyLevels.clone();
-                    tempLevels[opt.txIndex] = opt.toWC;
-                    double newAvgTPS = calculateAvgTPS(currentTPS, tempLevels, wcTpsMap);
 
-                    if (newAvgTPS >= MIN_TPS * UPGRADE_FLOOR) {
+                    // we want to upgrade the transactions consistency level to opt.toWC
+                    avgTPS = (avgTPS * (n + 1) - getMaxTPS(opt.fromWC, wcTpsMap) + getMaxTPS(opt.toWC, wcTpsMap)) / (n + 1);
+                    // int[] tempLevels = consistencyLevels.clone();
+                    // tempLevels[opt.txIndex] = opt.toWC;
+                    // double newAvgTPS = calculateAvgTPS(currentTPS, tempLevels, wcTpsMap);
+
+                    if (avgTPS >= MIN_TPS * UPGRADE_FLOOR) {
                         // Safe to upgrade
                         consistencyLevels[opt.txIndex] = opt.toWC;
                         profit += opt.additionalProfit;
@@ -183,16 +186,14 @@ public class BatchProcessor {
                     }
                 }
             }
-
-            finalBatchAvgTps = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
-            logFinalBatchAvgTps(finalBatchAvgTps);
+            logFinalBatchAvgTps(avgTPS);
             // Build result
             BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
             
             HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
             System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
-                    wcMix, transactionsUpgraded, backLogTransactions.size(), calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+                    wcMix, transactionsUpgraded, backLogTransactions.size(), avgTPS);
 
             return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
         }
@@ -220,6 +221,7 @@ public class BatchProcessor {
             int minToProcess = Math.max(1, (int) (n * 1.0));
 
             int processed = 0;
+            double tpsSum = currentTPS;
             for (int idx : indices) {
                 TransactionOption tx = batch.get(idx);
                 
@@ -231,7 +233,8 @@ public class BatchProcessor {
                 
                 // Try adding this transaction
                 consistencyLevels[idx] = tx.minRequiredConsistency;
-                double newAvgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+                tpsSum += getMaxTPS(tx.minRequiredConsistency, wcTpsMap);
+                double newAvgTPS = tpsSum / (processed + 1);
 
                 // Execute if: forced (retry >= 2), below minimum threshold, or TPS allows
                 if (mustExecute || processed < minToProcess || newAvgTPS >= MIN_TPS) {
@@ -244,13 +247,13 @@ public class BatchProcessor {
                 }
             }
 
-            finalBatchAvgTps = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+            finalBatchAvgTps = tpsSum / (processed + 1);
 
             BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
             logFinalBatchAvgTps(finalBatchAvgTps);
             System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
-                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap));
+                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgTps);
 
             return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
         }
