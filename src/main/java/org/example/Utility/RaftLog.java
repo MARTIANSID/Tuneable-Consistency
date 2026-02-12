@@ -41,9 +41,9 @@ public class RaftLog {
         int count = 0;
         lock.readLock().lock();
         try {
-            for(boolean isReplicated : log.get(index).serversThatReplicatedThisEntry) {
-                if(isReplicated) {
-                count++;
+            for (boolean isReplicated : log.get(index).serversThatReplicatedThisEntry) {
+                if (isReplicated) {
+                    count++;
                 }
             }
         } finally {
@@ -52,45 +52,82 @@ public class RaftLog {
         return count;
     }
 
-    public void updateWriteConcern(int index, int serverId, ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns, ConcurrentHashMap<Integer, Object> writeConcernThroughputLocks) {
+    public void updateWriteConcern(int index, int serverId,
+            ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns,
+            ConcurrentHashMap<Integer, Object> writeConcernThroughputLocks,
+            ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks,
+            ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies,
+            ConcurrentHashMap<Integer, Long> writeConcernLatencySum) {
         lock.writeLock().lock();
         try {
-            if(log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
+            if (log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0
+                    && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
                 log.get(index).writeConcern = log.get(index).writeConcern - 1;
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
                 int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
-                synchronized(writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
-                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
+                synchronized (writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
+                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
+                            .get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();
-                    while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
+                    while (!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
                         queue.poll();
                     }
                     queue.add(currentTime);
                 }
-                
+                calculateLatencyForWriteConcern(numberOfServersThisEntryGotReplicatedTo, index, writeConcernLatencies,
+                        writeConcernLatencySum, writeConcernLatencyLocks);
+
             }
-            // incase of majority above if condition will not be satisfied, but we still want to update the tps
-            if(log.get(index).writeConcern == (NUM_OF_SERVERS / 2) + 1) {
+            // incase of majority above if condition will not be satisfied, but we still
+            // want to update the tps
+            if (log.get(index).writeConcern == (NUM_OF_SERVERS / 2) + 1) {
                 log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
                 int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
                 // for majority it is done when the entry is comitted
-                if(numberOfServersThisEntryGotReplicatedTo == (NUM_OF_SERVERS / 2) + 1) return;
-                synchronized(writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
-                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns.get(numberOfServersThisEntryGotReplicatedTo);
+                if (numberOfServersThisEntryGotReplicatedTo == (NUM_OF_SERVERS / 2) + 1)
+                    return;
+                synchronized (writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
+                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
+                            .get(numberOfServersThisEntryGotReplicatedTo);
                     Long currentTime = System.currentTimeMillis();
-                    while(!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
+                    while (!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
                         queue.poll();
                     }
                     queue.add(currentTime);
                 }
+                calculateLatencyForWriteConcern(numberOfServersThisEntryGotReplicatedTo, index, writeConcernLatencies,
+                        writeConcernLatencySum, writeConcernLatencyLocks);
             }
         } finally {
             lock.writeLock().unlock();
         }
     }
+
+    private void calculateLatencyForWriteConcern(int numberOfServersThisEntryGotReplicatedTo, int index,
+            ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies,
+            ConcurrentHashMap<Integer, Long> writeConcernLatencySum,
+            ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks) {
+        synchronized (writeConcernLatencyLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
+            int writeConcernOfThisTransaction = numberOfServersThisEntryGotReplicatedTo;
+            Long timeStampOfTransaction = System.currentTimeMillis();
+            Long arrivalTimeOfThisEntryOnLeader = log.get(index).timeOfArrivalAtLeader;
+
+            Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
+            Deque<Latency> latencies = writeConcernLatencies.get(writeConcernOfThisTransaction);
+            while (!latencies.isEmpty() && (timeStampOfTransaction - latencies.peek().timestamp) >= 5000L) {
+                Latency latency = latencies.poll();
+                writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                        writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
+            }
+            latencies.add(new Latency(timeStampOfTransaction, currentLatency));
+            writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                    writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
+        }
+    }
+
     public LogEntry get(int index) {
         if (index < 0) {
-            return new LogEntry(-1, -1, null, -1,new HybridClock.TimeStamp(0L,0L), new ArrayList<>(), 0,"",-1, -1);
+            return new LogEntry(-1, -1, null, -1, new HybridClock.TimeStamp(0L, 0L), new ArrayList<>(), 0, "", -1, -1);
         }
         lock.readLock().lock();
         try {
@@ -103,7 +140,7 @@ public class RaftLog {
     public List<LogEntry> getEntries(int start, int end) {
         lock.readLock().lock();
         try {
-           return log.subList(start, end + 1);
+            return log.subList(start, end + 1);
         } finally {
             lock.readLock().unlock();
         }
@@ -153,6 +190,7 @@ public class RaftLog {
             lock.readLock().unlock();
         }
     }
+
     public boolean checkIfPrevLogIndexHasPrevLogTerm(int prevLogIndex, int prevLogTerm) {
         lock.readLock().lock();
 
@@ -167,7 +205,8 @@ public class RaftLog {
         }
     }
 
-    // we expect a serverId because we want which server has replicated these entries
+    // we expect a serverId because we want which server has replicated these
+    // entries
     public void appendEntries(Log leadersEntries, int serverId) {
 
         lock.writeLock().lock();
@@ -175,20 +214,26 @@ public class RaftLog {
         try {
             List<LogEntryProto> entries = leadersEntries.getLogList();
 
-            for(LogEntryProto entry : entries) {
+            for (LogEntryProto entry : entries) {
 
-                // I use new ArrayList here because for some reason the list returned from protobuf is immutable
+                // I use new ArrayList here because for some reason the list returned from
+                // protobuf is immutable
                 log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(),
                         HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),
-                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()), entry.getCopyOfWriteConcern(), entry.getCallbackHost(), entry.getCallbackPort(), entry.getTimeOfArrivalAtLeader())); // Ensure it's mutable
+                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()), entry.getCopyOfWriteConcern(),
+                        entry.getCallbackHost(), entry.getCallbackPort(), entry.getTimeOfArrivalAtLeader())); // Ensure
+                                                                                                              // it's
+                                                                                                              // mutable
 
-                // here I update the writeConcern as well, but this method does not acquire lock and is private, this when followers add the entries sent from the leader
+                // here I update the writeConcern as well, but this method does not acquire lock
+                // and is private, this when followers add the entries sent from the leader
                 updateWriteConcernInternal(log.size() - 1, serverId);
             }
         } finally {
             lock.writeLock().unlock();
         }
     }
+
     private void updateWriteConcernInternal(int index, int serverId) {
         if (log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 &&
                 !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
@@ -205,6 +250,7 @@ public class RaftLog {
             lock.writeLock().unlock();
         }
     }
+
     public void printLog() {
         lock.readLock().lock();
 

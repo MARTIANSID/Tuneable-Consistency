@@ -94,6 +94,8 @@ message Transaction {
   string readRequestedId = 13;
   string accNameToRead = 14;
   ReadConcern readConcern = 15;
+  int32 applicationId = 16;
+  int64 transactionArrivalTimeOnLeader = 17;
 }
 message LogEntryProto {
   int32 logIndex = 1;

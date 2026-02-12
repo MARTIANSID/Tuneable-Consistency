@@ -3,6 +3,8 @@ package org.example.Server;
 import io.grpc.*;
 import io.grpc.stub.AbstractStub;
 import io.grpc.stub.StreamObserver;
+
+import org.checkerframework.checker.units.qual.A;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 
@@ -27,6 +29,8 @@ import org.example.Utility.ServerStatus.*;
 import org.example.TokenBucket.TokenBucketImpl.TokenBucketData;
 
 import java.lang.management.ManagementFactory;
+
+// import com.google.protobuf.Empty;
 
 import com.sun.management.OperatingSystemMXBean;
 
@@ -111,6 +115,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private final Object peerData;
 
+    private final Object systemWideLatency;
+
+    ConcurrentLinkedQueue<Latency> systemWideLatencies;
+
+    AtomicLong totalSystemWideLatency;
+    AtomicLong countOfSystemWideLatencies;
+
+    private
+
     ReadWriteLock redisLock;
 
     ReentrantLock batchLock;
@@ -134,6 +147,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies;
     ConcurrentHashMap<Integer, Long> writeConcernLatencySum;
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
+    ConcurrentHashMap<Integer, Double> prevLatencies;
+    ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks;
 
     ScheduledExecutorService sendAppendEntriesScheduler;
     ScheduledExecutorService causalReadScheduler;
@@ -284,6 +299,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernThroughpuLock = new Object();
         this.writeConcernThroughputLocks = new ConcurrentHashMap<>();
         this.backLogTransactions = ConcurrentHashMap.newKeySet();
+        this.systemWideLatency = new Object();
+        this.systemWideLatencies = new ConcurrentLinkedQueue<>();
+        this.totalSystemWideLatency = new AtomicLong(0);
+        this.countOfSystemWideLatencies = new AtomicLong(0);
+        this.prevLatencies = new ConcurrentHashMap<>();
+        this.writeConcernLatencyLocks = new ConcurrentHashMap<>();
 
         // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
         try {
@@ -327,6 +348,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 writeConcernLatencies.put(i, new ArrayDeque<>());
                 writeConcernLatencySum.put(i, (long) 0);
                 writeConcernThroughputLocks.put(i, new Object());
+                writeConcernLatencyLocks.put(i, new Object());
             }
         }
         // setting up the client stub
@@ -386,7 +408,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             if (leadersTerm == currentTerm.get()) {
                 currentLeader = leaderId;
-                // If we're CANDIDATE or LEADER and receive AppendEntries from valid leader, step down
+                // If we're CANDIDATE or LEADER and receive AppendEntries from valid leader,
+                // step down
                 if (status != ServerCurrentStatus.FOLLOWER) {
                     becomeFollower();
                 }
@@ -607,7 +630,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // here I add the transactions in batch
         batchLock.lock();
         try {
-            if(batchOfTransactions.size() > MAX_QUEUE_SIZE) {
+            if (batchOfTransactions.size() > MAX_QUEUE_SIZE) {
                 return;
             }
             batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
@@ -648,7 +671,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 System.out.printf("📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n", serverId,
                         incomingTPS,
                         new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
-                
+
                 // Log to CSV file
                 try {
                     File file = new File("incoming_transaction_rate.csv");
@@ -855,6 +878,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // it is not in log
     private CompletableFuture<Void> sendAckForEntries(List<LogEntry> entriesToBeAck) {
+
+        System.out.println(entriesToBeAck.size() + "This is the number of entries for which ack is being sent");
         Map<String, List<AckMessage>> ackMessagesPerClient = new HashMap<>();
 
         // maybe we can acquire a read lock (but to optimise it we can keep this lock
@@ -862,111 +887,137 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // this is just about minimising repeated acks, not compulsory to add it, now
         // for the calculation of the metrics this is strictly required
 
-        Long timeStampOfTransaction = System.currentTimeMillis();
+        try {
+            Long timeStampOfTransaction = System.currentTimeMillis();
 
-        for (LogEntry entry : entriesToBeAck) {
-            String id = entry.t.getId();
-            String clientHost = entry.clientHost;
-            int clientPort = entry.clientPort;
-            String clientId = getClientId(clientHost, clientPort);
+            for (LogEntry entry : entriesToBeAck) {
 
-            clientStubs.computeIfAbsent(clientId, k -> createClientStub(clientHost, clientPort));
+                String id = entry.t.getId();
+                String clientHost = entry.clientHost;
+                int clientPort = entry.clientPort;
+                String clientId = getClientId(clientHost, clientPort);
 
-            // this field is seperate for each thread, so there will be no race conditions
-            // for this
-            boolean firstAck = false;
+                clientStubs.computeIfAbsent(clientId, k -> createClientStub(clientHost, clientPort));
 
-            // need to add lock because lot of shared variables are being accessed here
-            synchronized (ackUpdateLock) {
-                if (ackSent.containsKey(id) && !ackSent.get(id)) {
-                    firstAck = true;
-                    // marking it as sent, if it fails the client can retry from its end
-                    ackSent.put(id, true);
-                    // send ack for this entry
-                    ackTransactionCount.incrementAndGet();
-                    AckMessage.Builder ackBuilder = AckMessage.newBuilder().setT(entry.t)
-                            .setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp))
-                            .setCurrentLeader(serverId);
+                // this field is seperate for each thread, so there will be no race conditions
+                // for this
+                boolean firstAck = false;
 
-                    if (entry.t.getIsReadOnly()) {
-                        ackBuilder.setId(id).setBalance(
-                                clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
+                // need to add lock because lot of shared variables are being accessed here
+                synchronized (ackUpdateLock) {
+                    if (ackSent.containsKey(id) && !ackSent.get(id)) {
+                        firstAck = true;
+                        // marking it as sent, if it fails the client can retry from its end
+                        ackSent.put(id, true);
+                        // send ack for this entry
+                        ackTransactionCount.incrementAndGet();
+                        AckMessage.Builder ackBuilder = AckMessage.newBuilder().setT(entry.t)
+                                .setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp))
+                                .setCurrentLeader(serverId);
+
+                        if (entry.t.getIsReadOnly()) {
+                            ackBuilder.setId(id).setBalance(
+                                    clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
+                        }
+
+                        AckMessage ackMessage = ackBuilder.build();
+
+                        // grouping the ack messages based on the clientId
+                        ackMessagesPerClient.putIfAbsent(clientId, new ArrayList<>());
+                        ackMessagesPerClient.get(clientId).add(ackMessage);
+                    }
+                }
+                // if we are sending the ack of this transaction again we do not want to process
+                // the writeConcernThroughput
+                if (!firstAck)
+                    continue;
+
+                synchronized (systemWideLatency) {
+                    long latencyOfThisTransaction = timeStampOfTransaction - entry.timeOfArrivalAtLeader;
+                    // removing old latencies
+                    while (!systemWideLatencies.isEmpty()
+                            && (timeStampOfTransaction - systemWideLatencies.peek().timestamp) >= 1000L) {
+                        Latency latency = systemWideLatencies.poll();
+                        Long systemLatency = totalSystemWideLatency.get();
+                        totalSystemWideLatency.set(systemLatency - latency.latency);
+                        countOfSystemWideLatencies.decrementAndGet();
+                    }
+                    systemWideLatencies.add(new Latency(timeStampOfTransaction, latencyOfThisTransaction));
+                    Long systemLatency = totalSystemWideLatency.get();
+                    totalSystemWideLatency.set(systemLatency + latencyOfThisTransaction);
+                    countOfSystemWideLatencies.incrementAndGet();
+                }
+                synchronized (systemWideThroughput) {
+                    recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
+                }
+                // *** this is the calculation of writeConcernLatency ***
+                // synchronized (writeConcernLatency) {
+                // // System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern
+                // +"
+                // // replication---" + entry.serversThatReplicatedThisEntry);
+                // int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
+                // Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
+                // // this timeStampOfTransaction is the current time taken at the time of
+                // sending
+                // // ack
+                // Long currentLatency = (timeStampOfTransaction -
+                // arrivalTimeOfThisEntryOnLeader);
+                // Deque<Latency> latencies =
+                // writeConcernLatencies.get(writeConcernOfThisTransaction);
+                // while (!latencies.isEmpty() && (timeStampOfTransaction -
+                // latencies.peek().timestamp) >= 5000L) {
+                // Latency latency = latencies.poll();
+                // writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                // writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
+                // }
+                // latencies.add(new Latency(timeStampOfTransaction, currentLatency));
+                // writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                // writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
+                // }
+            }
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (Map.Entry<String, List<AckMessage>> clientEntry : ackMessagesPerClient.entrySet()) {
+                String clientId = clientEntry.getKey();
+                List<AckMessage> messages = clientEntry.getValue();
+
+                RaftGrpc.RaftStub stub = clientStubs.get(clientId);
+
+                CompletableFuture<Void> future = new CompletableFuture<>();
+                futures.add(future);
+
+                stub.sendAckToClient(Ack.newBuilder().addAllAckMessage(messages).build(), new StreamObserver<Empty>() {
+                    @Override
+                    public void onNext(Empty empty) {
                     }
 
-                    AckMessage ackMessage = ackBuilder.build();
+                    @Override
+                    public void onError(Throwable t) {
+                        future.completeExceptionally(t);
+                    }
 
-                    // grouping the ack messages based on the clientId
-                    ackMessagesPerClient.putIfAbsent(clientId, new ArrayList<>());
-                    ackMessagesPerClient.get(clientId).add(ackMessage);
-                }
+                    @Override
+                    public void onCompleted() {
+                        future.complete(null);
+                    }
+                });
             }
 
-            // if we are sending the ack of this transaction again we do not want to process
-            // the writeConcernThroughput
-            if (!firstAck)
-                continue;
-            synchronized (systemWideThroughput) {
-                recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
-            }
-            // *** this is the calculation of writeConcernLatency ***
-            synchronized (writeConcernLatency) {
-                // System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern +"
-                // replication---" + entry.serversThatReplicatedThisEntry);
-                int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
-                Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
-                // this timeStampOfTransaction is the current time taken at the time of sending
-                // ack
-                Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
-                Deque<Latency> latencies = writeConcernLatencies.get(writeConcernOfThisTransaction);
-                while (!latencies.isEmpty() && (timeStampOfTransaction - latencies.peek().timestamp) >= 1000L) {
-                    Latency latency = latencies.poll();
-                    writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                            writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
-                }
-                latencies.add(new Latency(timeStampOfTransaction, currentLatency));
-                writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                        writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
-
-            }
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        } catch (Exception e) {
+            System.out.println("Exception occurred while sending acks to clients: " + e.getMessage());
+            e.printStackTrace();
+            return CompletableFuture.completedFuture(null);
         }
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (Map.Entry<String, List<AckMessage>> clientEntry : ackMessagesPerClient.entrySet()) {
-            String clientId = clientEntry.getKey();
-            List<AckMessage> messages = clientEntry.getValue();
-
-            RaftGrpc.RaftStub stub = clientStubs.get(clientId);
-
-            CompletableFuture<Void> future = new CompletableFuture<>();
-            futures.add(future);
-
-            stub.sendAckToClient(Ack.newBuilder().addAllAckMessage(messages).build(), new StreamObserver<Empty>() {
-                @Override
-                public void onNext(Empty empty) {
-                }
-
-                @Override
-                public void onError(Throwable t) {
-                    future.completeExceptionally(t);
-                }
-
-                @Override
-                public void onCompleted() {
-                    future.complete(null);
-                }
-            });
-        }
-
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
     }
 
     public long getAverageLatency(int writeConcern) {
-        synchronized (writeConcernLatency) {
+        synchronized (writeConcernLatencyLocks.get(writeConcern)) {
             long val = writeConcernLatencySum.get(writeConcern)
                     / Math.max(writeConcernLatencies.get(writeConcern).size(), 1);
-            try (FileWriter fw = new FileWriter("avg_latencies.csv", true); PrintWriter out = new PrintWriter(fw)) {
-                out.printf("%d,%d%n", writeConcern, val);
-            } catch (IOException e) {
-                e.printStackTrace();
+            if (val == 0) {
+                return prevLatencies.getOrDefault(writeConcern, 0.0).longValue();
+            } else {
+                prevLatencies.put(writeConcern, (double) val);
             }
             return val;
         }
@@ -975,7 +1026,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     @Override
     public void sendAckToAllServers(Ack ack, StreamObserver<Empty> responseObserver) {
         List<AckMessage> ackMessages = ack.getAckMessageList();
-
     }
 
     // inside lock
@@ -1066,6 +1116,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 }
                                 queue.add(currentTime);
                             }
+                            synchronized (writeConcernLatencyLocks.get((NUM_OF_SERVERS / 2) + 1)) {
+                                int writeConcernOfThisTransaction = (NUM_OF_SERVERS / 2) + 1;
+                                Long timeStampOfTransaction = System.currentTimeMillis();
+                                Long arrivalTimeOfThisEntryOnLeader = log.get(i).timeOfArrivalAtLeader;
+
+                                Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
+                                Deque<Latency> latencies = writeConcernLatencies.get(writeConcernOfThisTransaction);
+                                while (!latencies.isEmpty()
+                                        && (timeStampOfTransaction - latencies.peek().timestamp) >= 5000L) {
+                                    Latency latency = latencies.poll();
+                                    writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                                            writeConcernLatencySum.get(writeConcernOfThisTransaction)
+                                                    - latency.latency);
+                                }
+                                latencies.add(new Latency(timeStampOfTransaction, currentLatency));
+                                writeConcernLatencySum.put(writeConcernOfThisTransaction,
+                                        writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
+                            }
+
                             updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
                         }
                         // System.out.println("The commit index of leader updated to -- " +
@@ -1073,7 +1142,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         // System.out.println("Log size of leader is---" + log.size());
 
                         // Send acknowledgements from [(prevCommitIndex + 1), commitIndex] if needed
-                        committedEntriesAck = log.getEntries(prevCommitIndex + 1, commitIndex.get());
+                        committedEntriesAck = new ArrayList<>(log.getEntries(prevCommitIndex + 1, commitIndex.get()));
                     }
                     // the leader see what all entries have been replicated by the replica, and
                     // decrements the appendEntries for those
@@ -1081,6 +1150,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             idOfFollower);
                 }
             }
+        } catch (Exception e) {
+            System.out.println("Exception occurred while handling AppendEntriesResult: " + e.getMessage());
+            e.printStackTrace();
+            return false;
         } finally {
             lock.writeLock().unlock(); // Unlock after modifying shared state
 
@@ -1089,8 +1162,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // after releasing the lock maybe I can wait for a certain time till all the
                 // acks are sent?
                 if (!committedEntriesAck.isEmpty()) {
+                    System.out.println(committedEntriesAck.size()
+                            + "This is the number of committed entries for which ack is being sent");
                     sendAckForEntries(committedEntriesAck).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally((ex -> {
-                        // System.out.println("Ack failed reason: " + ex);
+                        System.out.println("Ack failed reason: " + ex);
                         return null;
                     }));
                 }
@@ -1123,7 +1198,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // updateWriteConcern handles all the necessary conditions so that the same node
                 // does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower, ackTransactionTimeStampsForAllWriteConcerns,
-                        writeConcernThroughputLocks);
+                        writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
+                        writeConcernLatencySum);
                 if (log.get(i).writeConcern == 0) {
                     entries.add(log.get(i));
                 }
@@ -1395,7 +1471,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             }
             if (batchProcessingTask == null || batchProcessor.isShutdown()) {
-                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0, BATCH_INTERVAL_MS,
+                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
+                        BATCH_INTERVAL_MS,
                         TimeUnit.MILLISECONDS);
             }
         } finally {
@@ -1408,9 +1485,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             processBatch();
         } catch (Exception e) {
-            throw new RuntimeException("Error processing batch", e);    
+            throw new RuntimeException("Error processing batch", e);
         }
     }
+
     // should be inside write lock
     private void becomeFollower() {
         // Restart election timer when stepping down from LEADER or CANDIDATE
@@ -1434,7 +1512,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private static final int MAX_BATCH_SIZE = 1000;
+    private static final int MAX_BATCH_SIZE = 5000;
 
     private void processBatch() {
         // here the logic to process the current batch of transaction will come
@@ -1463,7 +1541,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         List<ClientMessage> transactionsToExecute = result.messages;
 
         // Add deferred transactions to the FRONT of the queue for priority processing
-        // Note: backLogTransactions is already updated inside BatchProcessor.buildResultMessages()
+        // Note: backLogTransactions is already updated inside
+        // BatchProcessor.buildResultMessages()
         batchLock.lock();
         try {
             // Add in reverse order so the first deferred transaction ends up at the front
@@ -1471,9 +1550,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 TransactionOption deferred = result.deferredTransactions.get(i);
                 batchOfTransactions.addFirst(deferred);
             }
-            
+
             int backLog = backLogTransactions.size();
-            
+
             try (FileWriter fw = new FileWriter("backlog.csv", true); PrintWriter out = new PrintWriter(fw)) {
                 File file = new File("backlog.csv");
                 if (file.length() == 0) {
@@ -1483,11 +1562,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            System.out.println("The backlog is--" + backLog + " | Deferred this round: " + result.deferredTransactions.size());
+            System.out.println(
+                    "The backlog is--" + backLog + " | Deferred this round: " + result.deferredTransactions.size());
         } finally {
             batchLock.unlock();
         }
-        
+
         // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
 
@@ -1514,14 +1594,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 HybridClock.TimeStamp currentTimeStamp = hybridClock.now();
                 // appending the entry in log
                 log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS,
-                        System.currentTimeMillis(), host, port));
+                        t.getTransactionArrivalTimeOnLeader(), host, port));
+
                 updateBalances(t, clientBalancesLatest);
                 // we need this to implement causal consistency
                 timeStampsInLog.put(currentTimeStamp, index);
                 // since this is in write lock only updated entry will be sent to the followers,
                 // as this entire thing is atomic
                 log.updateWriteConcern(index, serverId, ackTransactionTimeStampsForAllWriteConcerns,
-                        writeConcernThroughputLocks);
+                        writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
+                        writeConcernLatencySum);
                 ackSent.put(id, false);
                 timeAtWhichTransactionWasReceived.put(id, System.currentTimeMillis());
                 // if write concern becomes 0 we will send ack to client
@@ -1529,12 +1611,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     entry.add(log.get(index));
                 }
             }
+        } catch (Exception e) {
+            System.out.println("Exception occurred while processing batch: " + e.getMessage());
+            e.printStackTrace();
         } finally {
             lock.writeLock().unlock();
             if (!entry.isEmpty()) {
                 // this sends Ack for all transactions together
+                System.out.println("Sending ack for transactions with w:1, batch size: " + entry.size());
                 sendAckForEntries(entry).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally(ex -> {
                     // System.out.println("Ack failed reason : " + ex);
+
                     return null;
                 });
             }
@@ -1542,16 +1629,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // private void printAllWriteConernsThroughputAndLatencies() {
-    //     System.out.println("Printing Throughputs");
-    //     for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-    //         System.out.println(getWriteConcernThroughput(i));
-    //     }
-    //     synchronized (writeConcernLatency) {
-    //         System.out.println("Printing Latencies");
-    //         for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-    //             System.out.println(writeConcernLatencies.get(i));
-    //         }
-    //     }
+    // System.out.println("Printing Throughputs");
+    // for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+    // System.out.println(getWriteConcernThroughput(i));
+    // }
+    // synchronized (writeConcernLatency) {
+    // System.out.println("Printing Latencies");
+    // for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
+    // System.out.println(writeConcernLatencies.get(i));
+    // }
+    // }
     // }
     // private void adjustTokenCostsBasedOnLatency() {
     // final int MIN_COST = 1;
@@ -1684,7 +1771,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     //
     // }
     private double blendedLatencyForWC(int wc) {
-        // it is a 1 second window based latency so it works well directly
+        // it is a 5 second window based latency so it works well directly
         return getAverageLatency(wc);
     }
 
@@ -1813,6 +1900,21 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 wcTpsMap.put(wc, getWriteConcernTPS(wc));
             }
 
+            HashMap<Integer, Double> wcLatencyMap = new HashMap<>();
+            for (int wc = 1; wc <= majority; wc++) {
+                wcLatencyMap.put(wc, blendedLatencyForWC(wc));
+                System.out.printf("Current blended latency for WC=%d is %.2f ms%n", wc, wcLatencyMap.get(wc));
+            }
+            // Store writeConcern latency data in avg_latencies.csv
+            try (FileWriter csvWriter = new FileWriter("avg_latencies.csv", true)) {
+                for (int wc = 1; wc <= majority; wc++) {
+                    double avgLatency = wcLatencyMap.get(wc);
+                    csvWriter.write(String.format("%d,%.2f\n", wc, avgLatency));
+                }
+                csvWriter.flush();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
             // Calculate writeConcern frequency in current batch
             HashMap<Integer, Integer> wcFrequency = new HashMap<>();
             for (int wc = 1; wc <= majority; wc++) {
@@ -1824,7 +1926,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             // Record writeConcern frequency in CSV (single row per batch)
-            try (FileWriter fw = new FileWriter("writeconcern_frequency.csv", true); PrintWriter out = new PrintWriter(fw)) {
+            try (FileWriter fw = new FileWriter("writeconcern_frequency.csv", true);
+                    PrintWriter out = new PrintWriter(fw)) {
                 File file = new File("writeconcern_frequency.csv");
                 if (file.length() == 0) {
                     // Write header: Timestamp, WC1, WC2, ..., WC_majority, TotalInBatch
@@ -1873,8 +1976,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             ProcessResult result;
 
-            // Using the new TPS-based heuristic approach - pass backLogTransactions directly
-            result = transactionBatchProcessor.processWithTPSHeuristic(currentBatch, currentTps, wcTpsMap, backLogTransactions);
+            // Using the new TPS-based heuristic approach - pass backLogTransactions
+            // directly
+            // result = transactionBatchProcessor.processWithTPSHeuristic(currentBatch,
+            // currentTps, wcTpsMap,
+            // backLogTransactions);
+
+            result = transactionBatchProcessor.processWithLatencyHeuristic(currentBatch,
+                    (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get())), wcLatencyMap,
+                    backLogTransactions);
 
             // Save result for next RL prediction
             previousBatchResult = result;
@@ -1899,6 +2009,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             return result;
+        } catch (Exception e) {
+            System.out.println("Error in handleTokenBucket: " + e.getMessage());
+            e.printStackTrace();
+            return null;
         } finally {
             redisLock.writeLock().unlock();
         }
@@ -1917,15 +2031,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     // private double getWriteConcernThroughput(int writeConcern) {
-    //     synchronized (writeConcernThroughput) {
-    //         Long currentTimeStamp = System.currentTimeMillis();
-    //         ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps = ackTransactionTimeStampsForAllWriteConcerns
-    //                 .get(writeConcern);
-    //         if (writeConcernSpecificTimeStamps != null) {
-    //             recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
-    //         }
-    //         return writeConcernSpecificTimeStamps.size();
-    //     }
+    // synchronized (writeConcernThroughput) {
+    // Long currentTimeStamp = System.currentTimeMillis();
+    // ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps =
+    // ackTransactionTimeStampsForAllWriteConcerns
+    // .get(writeConcern);
+    // if (writeConcernSpecificTimeStamps != null) {
+    // recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
+    // }
+    // return writeConcernSpecificTimeStamps.size();
+    // }
     // }
 
     private double getWriteConcernTPS(int writeConcern) {
@@ -2054,23 +2169,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } finally {
                 lock.readLock().unlock();
             }
-            // batchLock.lock();
-            // try {
-            // batchOfTransactions.add(ClientMessage.newBuilder().setWriteConcern(majority).setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority).setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build()).setCallbackHost(host).setCallbackPort(port).build());
-            // System.out.println(batchOfTransactions);
-            // } finally {
-            // batchLock.unlock();
-            // }
-
+            batchLock.lock();
+            try {
+                ClientMessage clientMessage = ClientMessage.newBuilder().setWriteConcern(majority)
+                        .setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority)
+                                .setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build())
+                        .setCallbackHost(host).setCallbackPort(port).build();
+                batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
+            } finally {
+                batchLock.unlock();
+            }
             // responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
             // responseObserver.onCompleted();
-            if (!canServeLinearizableRead()) {
-                responseObserver.onNext(Ack.newBuilder()
-                        .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-                        .build());
-                responseObserver.onCompleted();
-                return;
-            }
+            // if (!canServeLinearizableRead()) {
+            // responseObserver.onNext(Ack.newBuilder()
+            // .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+            // .build());
+            // responseObserver.onCompleted();
+            // return;
+            // }
             synchronized (systemWideThroughput) {
                 recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
             }

@@ -48,17 +48,14 @@ public class Servers{
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
-        // Light workload - mostly W:1 (5 seconds)
-        PHASES.add(new Phase("Light", 5, 80000, Map.of(1, 0.60, 2, 0.20)));
+        // Light workload - mostly W:1 (2 seconds)
+        PHASES.add(new Phase("Light", 50, 80000, Map.of(1, 0.60, 2, 0.20)));
         
-        // Heavy workload - mostly W:2 (5 seconds)
-        PHASES.add(new Phase("Heavy", 5, 80000, Map.of(1, 0.30, 2, 0.70)));
+        // Heavy workload - mostly W:2 (2 seconds)
+        PHASES.add(new Phase("Heavy", 50, 80000, Map.of(1, 0.30, 2, 0.70)));
         
-        // Mixed workload - balanced W:1/W:2 (5 seconds)
-        PHASES.add(new Phase("Mixed", 5, 80000, Map.of(1, 0.50, 2, 0.50)));
-        
-        // Light workload again (5 seconds)
-        PHASES.add(new Phase("Light", 5, 80000, Map.of(1, 0.60, 2, 0.20)));
+        // Mixed workload - balanced W:1/W:2 (2 seconds)
+        PHASES.add(new Phase("Mixed", 50, 80000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution
@@ -68,7 +65,7 @@ public class Servers{
     private static final Random random = new Random();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 20000;  // 20 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 150000;  // 150 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -303,7 +300,7 @@ public class Servers{
                 }
             }
         }
-        
+    
         return false;
     }
     

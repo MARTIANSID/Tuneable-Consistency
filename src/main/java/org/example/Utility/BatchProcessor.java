@@ -1,3 +1,4 @@
+ 
 package org.example.Utility;
 
 import java.util.ArrayList;
@@ -20,7 +21,7 @@ public class BatchProcessor {
     private static volatile long systemStartTime = 0;
 
     // ========== TPS Constants (Heuristic) ==========
-    private static final double MIN_TPS = 15000.0;      // Minimum TPS to maintain
+    private static final double MIN_TPS = 30000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
 
@@ -36,9 +37,18 @@ public class BatchProcessor {
 
     // we ideally will want to set a min worst case tps for every writeConcern level, this is to avoid very low tps during warm up phases also we ideally expect tps to not fall below these levels
     private static final HashMap<Integer, Double> MIN_HASH_MAP = new HashMap<>() {{
-        put(1, 35000.0);
+        put(1, 50000.0);
         put(2, 12000.0);
     }};
+
+    private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
+        put(1, 80.0);  // 50 ms for W:1
+        put(2, 3000.0); // 150 ms for W:2
+     }};
+
+     private static final double MAX_LATENCY = 70.0; // Max average latency in ms
+     private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
+     private static final double UPGRADE_LATENCY_FLOOR = 1.10; // Stop upgrading at 10% above max latency
 
     /**
      * Check if system is still in warmup phase (first 7 seconds)
@@ -62,6 +72,13 @@ public class BatchProcessor {
         return wcTpsMap.get(writeConcern); 
     }
 
+    private double getMaxLatency(int writeConcern, HashMap<Integer, Double> wcLatencyMap) {
+        if(isInWarmupPhase()) {
+            return MIN_LATENCY_MAP.getOrDefault(writeConcern, 0.0);
+        }
+        return wcLatencyMap.get(writeConcern);
+    }
+
     /**
      * Calculate average TPS after adding batch
      * Formula: (currentTPS + sum of maxTPS[wc_i]) / (1 + batchSize)
@@ -76,6 +93,21 @@ public class BatchProcessor {
             }
         }
         return (count == 0) ? currentTPS : sum / (1 + count);
+    }
+   /**
+     * Calculate average Latency after adding batch
+     * Formula: (currentLatency + sum of maxLatency[wc_i]) / (1 + batchSize)
+     */
+    private double calculateAvgLatency(double currentLatency, int[] consistencyLevels, HashMap<Integer, Double> wcLatencyMap) {
+        double sum = currentLatency;
+        int count = 0;
+        for (int wc : consistencyLevels) {
+            if (wc > 0) {
+                sum += getMaxLatency(wc, wcLatencyMap);
+                count++;
+            }
+        }
+        return (count == 0) ? currentLatency : sum / (1 + count);
     }
 
     /**
@@ -133,7 +165,7 @@ public class BatchProcessor {
             }
 
             // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
-            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLogTransactions.isEmpty()) {
+            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLogTransactions.isEmpty() && currentTPS > MIN_TPS) {
                 
                 // Build priority queue for upgrades (best profit/tps-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
@@ -218,7 +250,7 @@ public class BatchProcessor {
             for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
 
             // Minimum transactions to process (80% of batch)
-            int minToProcess = Math.max(1, (int) (n * 1.0));
+            int minToProcess = Math.max(1, (int) (n * 0.7));
 
             int processed = 0;
             double tpsSum = currentTPS;
@@ -258,6 +290,166 @@ public class BatchProcessor {
             return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
         }
     }
+
+    public ProcessResult processWithLatencyHeuristic(
+        List<TransactionOption> batch,
+        double currentLatency,
+        HashMap<Integer, Double> wcLatencyMap,
+        Set<String> backLogTransactions) {
+
+        int n = batch.size();
+        double finalBatchAvgLatency;
+
+        if (n == 0) {
+            return new ProcessResult(new ArrayList<>(), 0, 0, 0);
+        }
+
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        int[] consistencyLevels = new int[n];
+        double profit = 0;
+        int transactionsUpgraded = 0;
+
+        // Step 1: Initialize all at minimum consistency
+        for (int i = 0; i < n; i++) {
+            consistencyLevels[i] = batch.get(i).minRequiredConsistency;
+        }
+
+        // Step 2: Calculate avgLatency with all transactions at min consistency
+        double avgLatency = calculateAvgLatency(currentLatency, consistencyLevels, wcLatencyMap);
+
+        System.out.printf("[LATENCY Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
+                currentLatency, avgLatency, MAX_LATENCY);
+
+        // Print individual writeConcern latencies
+        System.out.print("[WriteConcern Latency] ");
+        for (int wc = 1; wc <= majority; wc++) {
+            System.out.printf("W:%d=%.2f ms | ", wc, wcLatencyMap.get(wc));
+        }
+        System.out.println();
+
+        // Step 3: Check if we can execute all
+        if (avgLatency <= MAX_LATENCY) {
+            // Execute all transactions
+            for (int i = 0; i < n; i++) {
+                profit += batch.get(i).baseProfit;
+            }
+
+            // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
+            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY) {
+                // Build priority queue for upgrades (best profit/latency-cost ratio first)
+                PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+                        (a, b) -> Double.compare(b.ratio, a.ratio)
+                );
+
+                for (int i = 0; i < n; i++) {
+                    int currentWC = consistencyLevels[i];
+                    if (currentWC < majority) {
+                        TransactionOption tx = batch.get(i);
+                        double latencyInc = getMaxLatency(currentWC + 1, wcLatencyMap) - getMaxLatency(currentWC, wcLatencyMap);
+                        double nextProfit = (currentWC + 1 == majority)
+                                ? tx.extraMajorityProfit
+                                : tx.extraIntermediateProfit;
+                        double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
+                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, latencyInc, nextProfit, ratio));
+                    }
+                }
+
+                // Step 5: Upgrade while avgLatency stays <= maxLatency * 1.10
+                while (!pq.isEmpty()) {
+                    UpgradeOption opt = pq.poll();
+
+                    if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
+
+                    // Simulate upgrade
+                    avgLatency = (avgLatency * (n + 1) - getMaxLatency(opt.fromWC, wcLatencyMap) + getMaxLatency(opt.toWC, wcLatencyMap)) / (n + 1);
+
+                    if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_FLOOR) {
+                        // Safe to upgrade
+                        consistencyLevels[opt.txIndex] = opt.toWC;
+                        profit += opt.additionalProfit;
+                        transactionsUpgraded++;
+
+                        // Add next upgrade level if possible
+                        if (opt.toWC < majority) {
+                            TransactionOption tx = batch.get(opt.txIndex);
+                            double latencyInc = getMaxLatency(opt.toWC + 1, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
+                            double nextProfit = (opt.toWC + 1 == majority)
+                                    ? tx.extraMajorityProfit
+                                    : tx.extraIntermediateProfit;
+                            double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
+                            pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, latencyInc, nextProfit, ratio));
+                        }
+                    }
+                }
+            }
+            // logFinalBatchAvgLatency(avgLatency);
+            // Build result
+            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+
+            HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
+            System.out.printf("[LATENCY Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
+                    wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency);
+
+            return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
+        }
+        // Step 6: avgLatency > maxLatency → process from weakest first
+        else {
+            // Sort by: 1) retryCount DESC (prioritize retried transactions)
+            //          2) minRequiredConsistency ASC (weakest first)
+            List<Integer> indices = new ArrayList<>();
+            for (int i = 0; i < n; i++) indices.add(i);
+            indices.sort((a, b) -> {
+                TransactionOption txA = batch.get(a);
+                TransactionOption txB = batch.get(b);
+                // First: higher retry count has priority
+                if (txA.retryCount != txB.retryCount) {
+                    return Integer.compare(txB.retryCount, txA.retryCount); // DESC
+                }
+                // Second: lower consistency (W:1 before W:2)
+                return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
+            });
+
+            // Reset consistency levels
+            for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
+
+            // Minimum transactions to process (70% of batch)
+            int minToProcess = Math.max(1, (int) (n * 0.7));
+
+            int processed = 0;
+            double latencySum = currentLatency;
+            for (int idx : indices) {
+                TransactionOption tx = batch.get(idx);
+
+                // Force execute transactions that have been deferred too many times (retryCount >= 2)
+                boolean mustExecute = tx.retryCount >= 2;
+
+                // Try adding this transaction
+                consistencyLevels[idx] = tx.minRequiredConsistency;
+                latencySum += getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
+                double newAvgLatency = latencySum / (processed + 1);
+
+                // Execute if: forced (retry >= 2), below minimum threshold, or latency allows
+                if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY) {
+                    profit += tx.baseProfit;
+                    processed++;
+                } else {
+                    consistencyLevels[idx] = 0;
+                }
+            }
+
+            finalBatchAvgLatency = latencySum / (processed + 1);
+
+            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+
+            // logFinalBatchAvgLatency(finalBatchAvgLatency);
+            System.out.printf("[LATENCY Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
+                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgLatency);
+
+            return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+        }
+    }
+
+
 
     // create method to log the finalBatchAvgTps in csv
     private void logFinalBatchAvgTps(double finalBatchAvgTps) {

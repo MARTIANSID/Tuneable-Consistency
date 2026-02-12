@@ -25,7 +25,9 @@ public class TransactionOption {
     // Track how many times this transaction has been deferred
     public int retryCount = 0;
 
-    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit, String clientHost, int clientPort) {
+    public int applicationId;
+
+    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit, String clientHost, int clientPort, int applicationId) {
         this.minRequiredConsistency = minRequiredConsistency;
         this.baseProfit = baseProfit;
         this.extraMajorityProfit = extraMajorityProfit;
@@ -34,6 +36,7 @@ public class TransactionOption {
         this.clientHost = clientHost;
         this.clientPort = clientPort;
         this.retryCount = 0;
+
     }
 
     /**
@@ -41,6 +44,11 @@ public class TransactionOption {
      */
     public static TransactionOption fromClientMessage(ClientMessage cm) {
         Transaction t = cm.getT();
+        t = t.toBuilder().setTransactionArrivalTimeOnLeader(System.currentTimeMillis()).build();
+        cm = cm.toBuilder().setT(t).build();
+        // t = t.newBuilder().setTransactionArrivalTimeOnLeader(System.currentTimeMillis()).build();
+        // cm = cm.newBuilder().setT(t).build();
+
         TransactionOption txOption = new TransactionOption(
             cm,
             t.getMinRequiredConsistency(),
@@ -48,7 +56,8 @@ public class TransactionOption {
             t.getExtraProfitMajority(),
             t.getExtraIntermediateProfit(),
             cm.getCallbackHost(),
-            cm.getCallbackPort()
+            cm.getCallbackPort(),
+            t.getApplicationId()
         );
         txOption.id = t.getId();  // Set the transaction ID
         return txOption;
@@ -60,7 +69,7 @@ public class TransactionOption {
 
         for(ClientMessage cm : clientMessageList) {
             Transaction t = cm.getT();
-            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit(),cm.getCallbackHost(), cm.getCallbackPort() ));
+            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit(),cm.getCallbackHost(), cm.getCallbackPort(), t.getApplicationId()));
         }
         return transactionOptionList;
     }
