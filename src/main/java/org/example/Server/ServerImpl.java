@@ -4,7 +4,6 @@ import io.grpc.*;
 import io.grpc.stub.AbstractStub;
 import io.grpc.stub.StreamObserver;
 
-import org.checkerframework.checker.units.qual.A;
 import org.ds.paxos.*;
 import org.example.Timer.CustomTimer;
 
@@ -686,6 +685,19 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     e.printStackTrace();
                 }
             }
+        }
+    }
+
+    private int getIncomingTransactionsRate() {
+        long currentTime = System.currentTimeMillis();
+
+        synchronized (incomingTransactionLock) {
+            // Remove timestamps older than 1 second
+            while (!incomingTransactionTimestamps.isEmpty()
+                    && currentTime - incomingTransactionTimestamps.peek() >= 1000L) {
+                incomingTransactionTimestamps.poll();
+            }
+            return incomingTransactionTimestamps.size();
         }
     }
 
@@ -1889,7 +1901,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // current metrics
             double currentTps = getSystemWideThroughput() + totalFollowerTps;
 
-            int n = currentBatch.size();
+            // Store system TPS (timestamp, tps) in a separate CSV row for each batch
+                      int n = currentBatch.size();
 
             // currentBatch is already List<TransactionOption>, no conversion needed
 
@@ -1982,8 +1995,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // currentTps, wcTpsMap,
             // backLogTransactions);
 
+             double currentLatency = (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
+  try (FileWriter sysTpsWriter = new FileWriter("system_latency.csv", true); PrintWriter sysTpsOut = new PrintWriter(sysTpsWriter)) {
+                File file = new File("system_latency.csv");
+                if (file.length() == 0) {
+                    sysTpsOut.println("Timestamp,SystemLatency");
+                }
+                sysTpsOut.printf("%d,%.4f\n", System.currentTimeMillis(), currentLatency);
+            } catch (IOException e) {
+                System.err.println("Failed to write system TPS to system_latency.csv: " + e.getMessage());
+            }
+
+
+
             result = transactionBatchProcessor.processWithLatencyHeuristic(currentBatch,
-                    (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get())), wcLatencyMap,
+                   currentLatency, wcLatencyMap, wcTpsMap,
+                    getIncomingTransactionsRate(),
                     backLogTransactions);
 
             // Save result for next RL prediction
@@ -2126,7 +2153,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             };
             causalReadScheduler.execute(checkLogTask);
-
+            
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
             // this readRequest should go to leader
             // here we check if election is happening or not

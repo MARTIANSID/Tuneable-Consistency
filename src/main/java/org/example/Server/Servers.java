@@ -49,13 +49,13 @@ public class Servers{
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
         // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 50, 80000, Map.of(1, 0.60, 2, 0.20)));
+        PHASES.add(new Phase("Light", 50, 11000, Map.of(1, 0.60, 2, 0.20)));
         
         // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 50, 80000, Map.of(1, 0.30, 2, 0.70)));
+        PHASES.add(new Phase("Heavy", 50, 11000, Map.of(1, 0.30, 2, 0.70)));
         
         // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed", 50, 80000, Map.of(1, 0.50, 2, 0.50)));
+        PHASES.add(new Phase("Mixed", 50, 11000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution
@@ -457,7 +457,8 @@ public class Servers{
             "token_costs.csv",
             "lab1_Test.csv",
             "incoming_transaction_rate.csv",
-            "final_batch_avg_tps_log.csv"
+            "final_batch_avg_tps_log.csv",
+            "system_latency.csv"
         };
         
         for (String filename : csvFiles) {

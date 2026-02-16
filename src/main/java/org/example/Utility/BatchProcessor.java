@@ -24,6 +24,7 @@ public class BatchProcessor {
     private static final double MIN_TPS = 30000.0;      // Minimum TPS to maintain
     private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
+    private static final double MIN_TPS_OF_MAJORITY = 10500.0; // Minimum TPS expected from majority writes
 
     public BatchProcessor(int numOfServers) {
         this.NUM_OF_SERVERS = numOfServers;
@@ -46,7 +47,7 @@ public class BatchProcessor {
         put(2, 3000.0); // 150 ms for W:2
      }};
 
-     private static final double MAX_LATENCY = 70.0; // Max average latency in ms
+     private static final double MAX_LATENCY = 90.0; // Max average latency in ms
      private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 1.10; // Stop upgrading at 10% above max latency
 
@@ -121,6 +122,7 @@ public class BatchProcessor {
      * 5. Upgrade greedily while avgTPS stays >= minTPS * 1.10
      * 6. If avgTPS < minTPS → process from weakest first until avgTPS >= minTPS
      */
+
     public ProcessResult processWithTPSHeuristic(
             List<TransactionOption> batch,
             double currentTPS,
@@ -291,10 +293,13 @@ public class BatchProcessor {
         }
     }
 
+
     public ProcessResult processWithLatencyHeuristic(
         List<TransactionOption> batch,
         double currentLatency,
         HashMap<Integer, Double> wcLatencyMap,
+        HashMap<Integer, Double> wcTpsMap,
+        int incomingRateOfTransactions,
         Set<String> backLogTransactions) {
 
         int n = batch.size();
@@ -335,7 +340,9 @@ public class BatchProcessor {
             }
 
             // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
-            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY) {
+            // ** very important **
+            // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
+            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY && wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
                 // Build priority queue for upgrades (best profit/latency-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
                         (a, b) -> Double.compare(b.ratio, a.ratio)
@@ -429,7 +436,7 @@ public class BatchProcessor {
                 double newAvgLatency = latencySum / (processed + 1);
 
                 // Execute if: forced (retry >= 2), below minimum threshold, or latency allows
-                if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY) {
+                if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY || wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
                     profit += tx.baseProfit;
                     processed++;
                 } else {
