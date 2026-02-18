@@ -36,6 +36,7 @@ public class TransactionOption {
         this.clientHost = clientHost;
         this.clientPort = clientPort;
         this.retryCount = 0;
+        this.applicationId = applicationId;
 
     }
 
