@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.Map;
 
 import org.ds.paxos.ClientMessage;
 
@@ -49,7 +50,7 @@ public class BatchProcessor {
 
      private static final double MAX_LATENCY = 80.0; // Max average latency in ms
      private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
-     private static final double UPGRADE_LATENCY_FLOOR = 1.10; // Stop upgrading at 10% above max latency
+     private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
 
     /**
@@ -377,7 +378,6 @@ public class BatchProcessor {
                         consistencyLevels[opt.txIndex] = opt.toWC;
                         profit += opt.additionalProfit;
                         transactionsUpgraded++;
-
                         // Add next upgrade level if possible
                         if (opt.toWC < majority) {
                             TransactionOption tx = batch.get(opt.txIndex);
@@ -456,20 +456,6 @@ public class BatchProcessor {
 
             return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
         }
-    }
-
-    public ProcessResult processWithLatencyApplicationBasedHeuristic(
-        List<TransactionOption> batch,
-        double currentLatency,
-        HashMap<Integer, Double> wcLatencyMap,
-        HashMap<Integer, Double> wcTpsMap,
-        int incomingRateOfTransactions,
-        Set<String> backLogTransactions) {
-
-        if (n == 0) {
-            return new ProcessResult(new ArrayList<>(), 0, 0, 0);
-        }
-
     }
 
 

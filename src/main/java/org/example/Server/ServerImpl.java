@@ -2007,8 +2007,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
 
-
-            result = transactionBatchProcessor.processWithLatencyHeuristic(currentBatch,
+            result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(currentBatch,
                    currentLatency, wcLatencyMap, wcTpsMap,
                     getIncomingTransactionsRate(),
                     backLogTransactions);
