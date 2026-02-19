@@ -459,7 +459,7 @@ public class BatchProcessor {
     }
 
 
-    public ProcessResult processWithLatencyApplicationBasedHeuristic(
+   public ProcessResult processWithLatencyApplicationBasedHeuristic(
     List<TransactionOption> batch,
     double currentLatency,
     HashMap<Integer, Double> wcLatencyMap,
@@ -485,14 +485,16 @@ public class BatchProcessor {
     }
 
     // Step 2: Single pass — build count map, profit lookup maps, and batch index
-    // appWcCount:            appId -> (wc -> count)
-    // appIntermediateProfitMap: appId -> (wc -> extraIntermediateProfit)
-    // appMajorityProfitMap:     appId -> (wc -> extraMajorityProfit)
+    // appWcCount:              appId -> (wc -> count)
+    // appIntermediateProfitMap: appId -> extraIntermediateProfit  (uniform per appId)
+    // appMajorityProfitMap:     appId -> extraMajorityProfit      (uniform per appId)
     // appWcBatchIndex:          appId -> (wc -> list of batch indices)
     HashMap<Integer, HashMap<Integer, Integer>> appWcCount = new HashMap<>();
-    HashMap<Integer, HashMap<Integer, Double>> appIntermediateProfitMap = new HashMap<>();
-    HashMap<Integer, HashMap<Integer, Double>> appMajorityProfitMap = new HashMap<>();
+    HashMap<Integer, Double> appIntermediateProfitMap = new HashMap<>();
+    HashMap<Integer, Double> appMajorityProfitMap = new HashMap<>();
     HashMap<Integer, HashMap<Integer, List<Integer>>> appWcBatchIndex = new HashMap<>();
+    HashMap<Integer, Double> appBaseProfitMap = new HashMap<>();
+
 
     for (int i = 0; i < n; i++) {
         TransactionOption tx = batch.get(i);
@@ -503,19 +505,18 @@ public class BatchProcessor {
             .computeIfAbsent(appId, k -> new HashMap<>())
             .merge(wc, 1, Integer::sum);
 
-        appIntermediateProfitMap
-            .computeIfAbsent(appId, k -> new HashMap<>())
-            .putIfAbsent(wc, tx.extraIntermediateProfit);
-
-        appMajorityProfitMap
-            .computeIfAbsent(appId, k -> new HashMap<>())
-            .putIfAbsent(wc, tx.extraMajorityProfit);
+        appIntermediateProfitMap.putIfAbsent(appId, tx.extraIntermediateProfit);
+        appMajorityProfitMap.putIfAbsent(appId, tx.extraMajorityProfit);
 
         appWcBatchIndex
             .computeIfAbsent(appId, k -> new HashMap<>())
             .computeIfAbsent(wc, k -> new ArrayList<>())
             .add(i);
+        appBaseProfitMap.putIfAbsent(appId, tx.baseProfit);
     }
+
+    System.out.println("App-WC Count Map:");
+    System.out.println(appWcCount);
 
     // Step 3: Calculate avgLatency with all transactions at min consistency
     double avgLatency = calculateAvgLatency(currentLatency, consistencyLevels, wcLatencyMap);
@@ -558,10 +559,10 @@ public class BatchProcessor {
                     int toWC = fromWC + 1;
                     double latencyIncPerTx = getMaxLatency(toWC, wcLatencyMap) - getMaxLatency(fromWC, wcLatencyMap);
 
-                    // O(1) profit lookup
+                    // O(1) profit lookup — keyed by appId only
                     double perTxProfit = (toWC == majority)
-                            ? appMajorityProfitMap.get(appId).get(fromWC)
-                            : appIntermediateProfitMap.get(appId).get(fromWC);
+                            ? appMajorityProfitMap.get(appId)
+                            : appIntermediateProfitMap.get(appId);
 
                     double ratio = (latencyIncPerTx > EPS) ? perTxProfit / latencyIncPerTx : Double.MAX_VALUE;
                     pq.add(new AppUpgradeOption(appId, fromWC, toWC, count, ratio));
@@ -591,6 +592,11 @@ public class BatchProcessor {
                 appWcCount.get(opt.appId).merge(opt.toWC, toUpgrade, Integer::sum);
                 transactionsUpgraded += toUpgrade;
 
+                // O(1) profit lookup — keyed by appId only
+                profit += toUpgrade * ((opt.toWC == majority)
+                        ? appMajorityProfitMap.get(opt.appId)
+                        : appIntermediateProfitMap.get(opt.appId));
+
                 // Seed next level if still below majority
                 if (opt.toWC < majority) {
                     int nowAtToWC = appWcCount.get(opt.appId).getOrDefault(opt.toWC, 0);
@@ -598,10 +604,10 @@ public class BatchProcessor {
                         int nextWC = opt.toWC + 1;
                         double nextLatencyIncPerTx = getMaxLatency(nextWC, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
 
-                        // O(1) profit lookup
+                        // O(1) profit lookup — keyed by appId only
                         double nextPerTxProfit = (nextWC == majority)
-                                ? appMajorityProfitMap.get(opt.appId).get(opt.toWC)
-                                : appIntermediateProfitMap.get(opt.appId).get(opt.toWC);
+                                ? appMajorityProfitMap.get(opt.appId)
+                                : appIntermediateProfitMap.get(opt.appId);
 
                         double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
                         pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC, nextRatio));
@@ -615,6 +621,9 @@ public class BatchProcessor {
             for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appWcCount.entrySet()) {
                 appWcRemaining.put(appEntry.getKey(), new HashMap<>(appEntry.getValue()));
             }
+
+            System.out.println("Final App-WC Count After Upgrades:");
+            System.out.println(appWcRemaining);
 
             for (int i = 0; i < n; i++) {
                 TransactionOption tx = batch.get(i);
@@ -634,13 +643,6 @@ public class BatchProcessor {
                 }
 
                 consistencyLevels[i] = assignedWC;
-
-                // Accumulate upgrade profit if WC was raised
-                if (assignedWC > minWC) {
-                    profit += (assignedWC == majority)
-                            ? tx.extraMajorityProfit
-                            : tx.extraIntermediateProfit;
-                }
             }
         }
 
@@ -661,30 +663,34 @@ public class BatchProcessor {
         double latencySum = currentLatency;
 
         // Iterate app IDs descending (highest appId = highest profit first)
+        // Sort app IDs by base profit descending
         List<Integer> sortedAppIds = new ArrayList<>(appWcCount.keySet());
-        sortedAppIds.sort(Collections.reverseOrder());
+        sortedAppIds.sort((a, b) -> Double.compare(appBaseProfitMap.get(b), appBaseProfitMap.get(a)));
 
         outer:
         for (int appId : sortedAppIds) {
-            // Within each app, process lowest WC first (cheapest latency cost first)
-            List<Integer> sortedWCs = new ArrayList<>(appWcBatchIndex.get(appId).keySet());
-            Collections.sort(sortedWCs);
 
-            for (int wc : sortedWCs) {
+            for (int wc = 1; wc <= majority; wc++) {
+                if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
+
                 // Use batch index directly — no scanning
                 for (int idx : appWcBatchIndex.get(appId).get(wc)) {
                     TransactionOption tx = batch.get(idx);
                     boolean mustExecute = tx.retryCount >= 2;
 
                     consistencyLevels[idx] = tx.minRequiredConsistency;
-                    latencySum += getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
-                    double newAvgLatency = latencySum / (processed + 1);
+                    int minLatency = getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
+                    latencySum += minLatency;
+
+                    // processed + 1 for current tx being considered + 1 for currentLatency slot
+                    double newAvgLatency = latencySum / (processed + 2);
 
                     if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY
                             || wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
                         profit += tx.baseProfit;
                         processed++;
                     } else {
+                        latencySum -= minLatency;  // undo latency addition
                         consistencyLevels[idx] = 0;
                         break outer;
                     }
@@ -699,6 +705,22 @@ public class BatchProcessor {
                 processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgLatency);
 
         return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+    }
+}
+
+static class AppUpgradeOption {
+    int appId;
+    int fromWC;
+    int toWC;
+    int count;
+    double ratio; // per single transaction — not total
+
+    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio) {
+        this.appId = appId;
+        this.fromWC = fromWC;
+        this.toWC = toWC;
+        this.count = count;
+        this.ratio = ratio;
     }
 }
 
