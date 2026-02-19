@@ -494,6 +494,7 @@ public class BatchProcessor {
     HashMap<Integer, Double> appMajorityProfitMap = new HashMap<>();
     HashMap<Integer, HashMap<Integer, List<Integer>>> appWcBatchIndex = new HashMap<>();
     HashMap<Integer, Double> appBaseProfitMap = new HashMap<>();
+    HashMap<Integer, HashMap<Integer,HashMap<Integer,Integer>>> wcUpgradesMap = new HashMap<>();
 
 
     for (int i = 0; i < n; i++) {
@@ -513,6 +514,11 @@ public class BatchProcessor {
             .computeIfAbsent(wc, k -> new ArrayList<>())
             .add(i);
         appBaseProfitMap.putIfAbsent(appId, tx.baseProfit);
+
+        // this stores {appId : {wc : {upgrades od this wc to higher level}}}
+        wcUpgradesMap
+            .computeIfAbsent(appId, k -> new HashMap<>())
+            .computeIfAbsent(wc, k -> new HashMap<>());
     }
 
     System.out.println("App-WC Count Map:");
@@ -565,7 +571,7 @@ public class BatchProcessor {
                             : appIntermediateProfitMap.get(appId);
 
                     double ratio = (latencyIncPerTx > EPS) ? perTxProfit / latencyIncPerTx : Double.MAX_VALUE;
-                    pq.add(new AppUpgradeOption(appId, fromWC, toWC, count, ratio));
+                    pq.add(new AppUpgradeOption(appId, fromWC, toWC, count, ratio, fromWC));
                 }
             }
 
@@ -597,6 +603,16 @@ public class BatchProcessor {
                         ? appMajorityProfitMap.get(opt.appId)
                         : appIntermediateProfitMap.get(opt.appId));
 
+                // now we update the wcUpgradesMap to reflect the upgrades that we just did
+                // first we increase the number of upgrades of toWc
+                int originalWc = opt.originalWc;
+                wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.toWC, wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.toWC, 0) + toUpgrade);
+
+                // decrease the number of upgrades of fromWc 
+                if(opt.fromWC != originalWc) {
+                    wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.fromWC, wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.fromWC, 0) - toUpgrade);
+                }
+
                 // Seed next level if still below majority
                 if (opt.toWC < majority) {
                     int nowAtToWC = appWcCount.get(opt.appId).getOrDefault(opt.toWC, 0);
@@ -610,34 +626,28 @@ public class BatchProcessor {
                                 : appIntermediateProfitMap.get(opt.appId);
 
                         double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
-                        pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC, nextRatio));
+                        pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC, nextRatio, originalWc));
                     }
                 }
             }
 
-            // Step 7: Single final pass — assign consistencyLevels based on final appWcCount
-            // Copy counts so we can consume quotas
-            HashMap<Integer, HashMap<Integer, Integer>> appWcRemaining = new HashMap<>();
-            for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appWcCount.entrySet()) {
-                appWcRemaining.put(appEntry.getKey(), new HashMap<>(appEntry.getValue()));
-            }
-
-            System.out.println("Final App-WC Count After Upgrades:");
-            System.out.println(appWcRemaining);
+            System.out.println("Final App-WC Count Map After Upgrades:");
+            System.out.println(appWcCount);
 
             for (int i = 0; i < n; i++) {
                 TransactionOption tx = batch.get(i);
                 int appId = tx.applicationId;
                 int minWC = tx.minRequiredConsistency;
-                HashMap<Integer, Integer> wcRemaining = appWcRemaining.get(appId);
+                HashMap<Integer, HashMap<Integer, Integer>> wcUpgrades = wcUpgradesMap.get(appId);
 
                 // Assign highest available WC >= minWC that still has quota
                 int assignedWC = minWC;
+                HashMap<Integer, Integer> upgrades = wcUpgrades.get(minWC);
                 for (int wc = majority; wc >= minWC; wc--) {
-                    int remaining = wcRemaining.getOrDefault(wc, 0);
+                    int remaining = upgrades.getOrDefault(wc, 0);
                     if (remaining > 0) {
                         assignedWC = wc;
-                        wcRemaining.put(wc, remaining - 1);
+                        upgrades.put(wc, remaining - 1);
                         break;
                     }
                 }
@@ -679,7 +689,7 @@ public class BatchProcessor {
                     boolean mustExecute = tx.retryCount >= 2;
 
                     consistencyLevels[idx] = tx.minRequiredConsistency;
-                    int minLatency = getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
+                    double minLatency = getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
                     latencySum += minLatency;
 
                     // processed + 1 for current tx being considered + 1 for currentLatency slot
@@ -713,37 +723,18 @@ static class AppUpgradeOption {
     int fromWC;
     int toWC;
     int count;
+    int originalWc;
     double ratio; // per single transaction — not total
 
-    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio) {
+    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio, int originalWc) {
         this.appId = appId;
         this.fromWC = fromWC;
         this.toWC = toWC;
         this.count = count;
         this.ratio = ratio;
+        this.originalWc = originalWc;
     }
 }
-
-static class AppUpgradeOption {
-    int appId;
-    int fromWC;
-    int toWC;
-    int count;
-    double ratio; // per single transaction — not total
-
-    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio) {
-        this.appId = appId;
-        this.fromWC = fromWC;
-        this.toWC = toWC;
-        this.count = count;
-        this.ratio = ratio;
-    }
-}
-
-
-    
-    
-
 
 
     // create method to log the finalBatchAvgTps in csv
@@ -776,8 +767,6 @@ static class AppUpgradeOption {
     private BuildResult buildResultMessages(List<TransactionOption> batch, int[] consistencyLevels, Set<String> backLogTransactions) {
         List<ClientMessage> executed = new ArrayList<>();
         List<TransactionOption> deferred = new ArrayList<>();
-
-
         
         for (int i = 0; i < batch.size(); i++) {
             int wc = consistencyLevels[i];
