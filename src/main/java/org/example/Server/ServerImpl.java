@@ -1158,6 +1158,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
                     // the leader see what all entries have been replicated by the replica, and
                     // decrements the appendEntries for those
+                    System.out.println("This is the prevMatchIndex of follower --" + prevMatchIndex + " and this is the new match index of follower --" + matchIndex.get(idOfFollower));
                     eventualEntriesAck = checkIfWriteConcernsAreSatisfied(prevMatchIndex, matchIndex.get(idOfFollower),
                             idOfFollower);
                 }
@@ -1204,18 +1205,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         for (int i = Math.max(commitIndex.get() + 1, prevMatchIndexOfFollower + 1); i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
-            if (log.get(i).writeConcern != 0) {
-                // System.out.println("This follower --" + idOfFollower + "is updating the
-                // writeConcern of" + log.get(i).t);
+            boolean canBeAdded = log.get(i).writeConcern != 0;
                 // updateWriteConcern handles all the necessary conditions so that the same node
                 // does update the write concern of the same log entry again
                 log.updateWriteConcern(i, idOfFollower, ackTransactionTimeStampsForAllWriteConcerns,
                         writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
                         writeConcernLatencySum);
-                if (log.get(i).writeConcern == 0) {
+                if (log.get(i).writeConcern == 0 && canBeAdded) {
                     entries.add(log.get(i));
                 }
-            }
         }
         return entries;
     }
