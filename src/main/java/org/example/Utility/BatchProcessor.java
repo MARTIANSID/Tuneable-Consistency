@@ -48,7 +48,7 @@ public class BatchProcessor {
         put(2, 3000.0); // 150 ms for W:2
      }};
 
-     private static final double MAX_LATENCY = 80.0; // Max average latency in ms
+     private static final double MAX_LATENCY = 100.0; // Max average latency in ms
      private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
@@ -302,7 +302,7 @@ public class BatchProcessor {
         HashMap<Integer, Double> wcLatencyMap,
         HashMap<Integer, Double> wcTpsMap,
         int incomingRateOfTransactions,
-        Set<String> backLogTransactions) {
+        Set<String> backLogTransactions, boolean isBackLogIncreasing) {
 
         int n = batch.size();
         double finalBatchAvgLatency;
@@ -345,7 +345,7 @@ public class BatchProcessor {
             // ** very important **
             // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
             boolean canUpgrade = false;
-            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY && incomingRateOfTransactions < MAX_LOAD) {
+            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY && !isBackLogIncreasing) {
                 // Build priority queue for upgrades (best profit/latency-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
                         (a, b) -> Double.compare(b.ratio, a.ratio)
@@ -465,7 +465,7 @@ public class BatchProcessor {
     HashMap<Integer, Double> wcLatencyMap,
     HashMap<Integer, Double> wcTpsMap,
     int incomingRateOfTransactions,
-    Set<String> backLogTransactions) {
+    Set<String> backLogTransactions, boolean isBackLogIncreasing) {
 
     int n = batch.size();
     double finalBatchAvgLatency;
@@ -547,9 +547,9 @@ public class BatchProcessor {
         if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
                 && backLogTransactions.isEmpty()
                 && currentLatency < MAX_LATENCY
-                && incomingRateOfTransactions < MAX_LOAD) {
+                && isBackLogIncreasing == false) {
 
-            // PQ: ranked by per-transaction ratio (profit per unit latency cost)
+            // PQ: ranked by per-t ransaction ratio (profit per unit latency cost)
             PriorityQueue<AppUpgradeOption> pq = new PriorityQueue<>(
                     (a, b) -> Double.compare(b.ratio, a.ratio)
             );

@@ -26,7 +26,7 @@ import org.example.Utility.TransactionOption;
 public class Servers{
 
     // set the number of servers from here
-    public static final int NUM_OF_SERVERS =  3;
+    public static final int NUM_OF_SERVERS = 3;
     
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
@@ -49,13 +49,13 @@ public class Servers{
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
         // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 50, 11000, Map.of(1, 0.60, 2, 0.20)));
+        PHASES.add(new Phase("Light", 10, 7000, Map.of(1, 0.60, 2, 0.20)));
         
         // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 50, 11000, Map.of(1, 0.30, 2, 0.70)));
+        PHASES.add(new Phase("Heavy", 10, 7000, Map.of(1, 0.30, 2, 0.70)));
         
         // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed", 50, 11000, Map.of(1, 0.50, 2, 0.50)));
+        PHASES.add(new Phase("Mixed", 10, 7000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution
@@ -65,7 +65,7 @@ public class Servers{
     private static final Random random = new Random();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 150000;  // 150 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 40000;  // 150 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -392,18 +392,22 @@ public class Servers{
             String txId = UUID.randomUUID().toString();
             String sender = "user" + (i % 100);
             String receiver = "user" + ((i + 50) % 100);
-            double amount = 1.0 + (i % 10);
+                double amount = 1.0 + (i % 10);
 
-            Transaction transaction = Transaction.newBuilder()
+                // Assign an applicationId in {1,2,3} and use it as the profit values
+                int applicationId = 1 + random.nextInt(3); // 1..3
+
+                Transaction transaction = Transaction.newBuilder()
                     .setId(txId)
                     .setSender(sender)
                     .setReceiver(receiver)
                     .setAmount(amount)
                     .setTransactionSendTimeInMs(now)
                     .setMinRequiredConsistency(minConsistency)
-                    .setBaseProfit(1.0)
-                    .setExtraProfitMajority(0.5)
-                    .setExtraIntermediateProfit(0.25)
+                    .setApplicationId(applicationId)
+                    .setBaseProfit((double) applicationId)
+                    .setExtraProfitMajority((double) applicationId)
+                    .setExtraIntermediateProfit((double) applicationId)
                     .setWriteConcern(minConsistency)
                     .setIsReadOnly(false)
                     .build();
@@ -458,7 +462,8 @@ public class Servers{
             "lab1_Test.csv",
             "incoming_transaction_rate.csv",
             "final_batch_avg_tps_log.csv",
-            "system_latency.csv"
+            "system_latency.csv",
+            "backlog_samples.csv"
         };
         
         for (String filename : csvFiles) {

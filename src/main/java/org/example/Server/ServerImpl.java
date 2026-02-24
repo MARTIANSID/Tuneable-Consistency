@@ -237,6 +237,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private ExecutorService executorService;
     private static final Logger LOG = LoggerFactory.getLogger(ServerImpl.class);
 
+    BacklogTracker backlogTracker;
+    ScheduledExecutorService backLogScheuler;
+
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = -1;
@@ -304,16 +307,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.countOfSystemWideLatencies = new AtomicLong(0);
         this.prevLatencies = new ConcurrentHashMap<>();
         this.writeConcernLatencyLocks = new ConcurrentHashMap<>();
-
-        // Initialize RL Model Client (with fallback to DEFAULT_BUDGET)
-        try {
-            this.rlModelClient = new RLModelGrpcClient("localhost", 50051, true, DEFAULT_BUDGET);
-            System.out.println("✓ RL Model Client initialized successfully");
-        } catch (Exception e) {
-            System.out.println("⚠ RL Model Client initialization failed, using default budget: " + e.getMessage());
-            this.rlModelClient = null;
-        }
-        this.previousBatchResult = null;
+        this.backlogTracker = new BacklogTracker(0.2, 100.0);
 
         // Initialize incoming transaction tracking
         this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
@@ -1158,7 +1152,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     }
                     // the leader see what all entries have been replicated by the replica, and
                     // decrements the appendEntries for those
-                    System.out.println("This is the prevMatchIndex of follower --" + prevMatchIndex + " and this is the new match index of follower --" + matchIndex.get(idOfFollower));
+                    System.out.println("This is the prevMatchIndex of follower --" + prevMatchIndex
+                            + " and this is the new match index of follower --" + matchIndex.get(idOfFollower));
                     eventualEntriesAck = checkIfWriteConcernsAreSatisfied(prevMatchIndex, matchIndex.get(idOfFollower),
                             idOfFollower);
                 }
@@ -1206,14 +1201,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = Math.max(commitIndex.get() + 1, prevMatchIndexOfFollower + 1); i <= newMatchIndexOfFollower; i++) {
             String id = log.get(i).t.getId();
             boolean canBeAdded = log.get(i).writeConcern != 0;
-                // updateWriteConcern handles all the necessary conditions so that the same node
-                // does update the write concern of the same log entry again
-                log.updateWriteConcern(i, idOfFollower, ackTransactionTimeStampsForAllWriteConcerns,
-                        writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
-                        writeConcernLatencySum);
-                if (log.get(i).writeConcern == 0 && canBeAdded) {
-                    entries.add(log.get(i));
-                }
+            // updateWriteConcern handles all the necessary conditions so that the same node
+            // does update the write concern of the same log entry again
+            log.updateWriteConcern(i, idOfFollower, ackTransactionTimeStampsForAllWriteConcerns,
+                    writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
+                    writeConcernLatencySum);
+            if (log.get(i).writeConcern == 0 && canBeAdded) {
+                entries.add(log.get(i));
+            }
         }
         return entries;
     }
@@ -1485,6 +1480,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         BATCH_INTERVAL_MS,
                         TimeUnit.MILLISECONDS);
             }
+
+            if (backLogScheuler == null || backLogScheuler.isShutdown()) {
+                
+                if(backLogScheuler == null) {
+                    this.backLogScheuler = Executors.newScheduledThreadPool(1);
+                }
+                
+                backLogScheuler.scheduleAtFixedRate(() -> {
+                    int currentBacklog;
+
+                    // Read backlog under lock
+                    batchLock.lock();
+                    try {
+                        currentBacklog = batchOfTransactions.size();
+                    } finally {
+                        batchLock.unlock();
+                    }
+
+                    backlogTracker.addSample(currentBacklog);
+
+                    if (backlogTracker.isIncreasing()) {
+                        System.out.println("Backlog trending up! Holding upgrades.");
+                    }
+                }, 0, 100, TimeUnit.MILLISECONDS);
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -1520,6 +1540,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             sendAppendEntriesScheduler.shutdownNow();
             sendAppendEntriesScheduler = null;
         }
+        // stop backlog tracking task
+        if (backLogScheuler != null && !backLogScheuler.isShutdown()) {
+            backLogScheuler.shutdownNow();
+            backLogScheuler = null;
+        }
     }
 
     private static final int MAX_BATCH_SIZE = 5000;
@@ -1538,6 +1563,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 currentBatch.add(batchOfTransactions.poll());
                 count++;
             }
+            // here we record the nmumber of transactions in the backlog
+            int currentNumberOfTransactionsInQueue = batchOfTransactions.size();
+            // we need to verify if the above quantity is growing over time
+
             totalFollowerTps = combinedThroughputOfFollowers;
         } finally {
             batchLock.unlock();
@@ -1787,108 +1816,112 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // Map a smoothed latency to an integer cost via convex anchor curve and
     // guardrails
-    private double latencyToCost(double ewmaMs) {
-        double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
+    // private double latencyToCost(double ewmaMs) {
+    // double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
 
-        double costHealthy = 10;
+    // double costHealthy = 10;
 
-        double costBad = 300;
+    // double costBad = 300;
 
-        double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
-        if (ewmaMs <= L_HEALTHY_MS) {
-            double denom = Math.max(1e-9, L_HEALTHY_MS - Lmin);
-            double z = (ewmaMs - Lmin) / denom;
-            z = Math.max(0.0, Math.min(1.0, z));
-            double y = 1.0 * (1.0 - Math.pow(z, CONVEX_P)) + costHealthy * Math.pow(z, CONVEX_P);
-            return Math.max(MIN_COST, y);
-        }
+    // double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
+    // if (ewmaMs <= L_HEALTHY_MS) {
+    // double denom = Math.max(1e-9, L_HEALTHY_MS - Lmin);
+    // double z = (ewmaMs - Lmin) / denom;
+    // z = Math.max(0.0, Math.min(1.0, z));
+    // double y = 1.0 * (1.0 - Math.pow(z, CONVEX_P)) + costHealthy * Math.pow(z,
+    // CONVEX_P);
+    // return Math.max(MIN_COST, y);
+    // }
 
-        double x = ewmaMs >= L_BAD_MS ? 1.0 : (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS - L_HEALTHY_MS);
-        double blendedCost = costHealthy * (1.0 - Math.pow(x, CONVEX_P)) + costBad * Math.pow(x, CONVEX_P);
+    // double x = ewmaMs >= L_BAD_MS ? 1.0 : (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS -
+    // L_HEALTHY_MS);
+    // double blendedCost = costHealthy * (1.0 - Math.pow(x, CONVEX_P)) + costBad *
+    // Math.pow(x, CONVEX_P);
 
-        return Math.max(MIN_COST, blendedCost);
-    }
+    // return Math.max(MIN_COST, blendedCost);
+    // }
 
-    // Main adjustment; currentTps provided by caller's sliding window
-    private void adjustTokenCostsBasedOnLatency(double currentTps) {
-        final double MIN_STEP_EPS = 0.05;
+    // // Main adjustment; currentTps provided by caller's sliding window
+    // private void adjustTokenCostsBasedOnLatency(double currentTps) {
+    // final double MIN_STEP_EPS = 0.05;
 
-        long now = System.currentTimeMillis();
+    // long now = System.currentTimeMillis();
 
-        synchronized (writeConcernLatency) {
-            Long lastAny = lastUpdateAt.values().stream().findAny().orElse(0L);
-            if (now - lastAny < MIN_UPDATE_PERIOD_MS)
-                return;
-            Map<Integer, Double> smoothed = new HashMap<>();
-            double minSmoothed = Double.POSITIVE_INFINITY;
+    // synchronized (writeConcernLatency) {
+    // Long lastAny = lastUpdateAt.values().stream().findAny().orElse(0L);
+    // if (now - lastAny < MIN_UPDATE_PERIOD_MS)
+    // return;
+    // Map<Integer, Double> smoothed = new HashMap<>();
+    // double minSmoothed = Double.POSITIVE_INFINITY;
 
-            double prevWriteConcernCost = 1;
-            for (int i = 1; i <= (NUM_OF_SERVERS / 2 + 1); i++) {
-                int wc = i;
-                double blended = Math.max(1.0, blendedLatencyForWC(wc));
-                double prev = ewmaLatency.getOrDefault(wc, blended);
-                double ewma = ALPHA * blended + (1.0 - ALPHA) * prev;
-                ewmaLatency.put(wc, ewma);
-                smoothed.put(wc, ewma);
-                if (ewma < minSmoothed)
-                    minSmoothed = ewma;
-            }
-            if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0)
-                minSmoothed = 1.0;
+    // double prevWriteConcernCost = 1;
+    // for (int i = 1; i <= (NUM_OF_SERVERS / 2 + 1); i++) {
+    // int wc = i;
+    // double blended = Math.max(1.0, blendedLatencyForWC(wc));
+    // double prev = ewmaLatency.getOrDefault(wc, blended);
+    // double ewma = ALPHA * blended + (1.0 - ALPHA) * prev;
+    // ewmaLatency.put(wc, ewma);
+    // smoothed.put(wc, ewma);
+    // if (ewma < minSmoothed)
+    // minSmoothed = ewma;
+    // }
+    // if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0)
+    // minSmoothed = 1.0;
 
-            System.out.println(writeConcernCosts);
-            System.out.println(ewmaLatency);
+    // System.out.println(writeConcernCosts);
+    // System.out.println(ewmaLatency);
 
-            try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
-                for (var e : smoothed.entrySet()) {
-                    int wc = e.getKey();
-                    double ewmaMs = e.getValue();
+    // try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
+    // for (var e : smoothed.entrySet()) {
+    // int wc = e.getKey();
+    // double ewmaMs = e.getValue();
 
-                    double oldCost = writeConcernCosts.getOrDefault(wc, (double) MIN_COST);
-                    double proposed = latencyToCost(ewmaMs);
+    // double oldCost = writeConcernCosts.getOrDefault(wc, (double) MIN_COST);
+    // double proposed = latencyToCost(ewmaMs);
 
-                    try (FileWriter fw = new FileWriter("writeconcern.csv", true);
-                            PrintWriter out = new PrintWriter(fw)) {
-                        File file = new File("writeconcern.csv");
-                        if (file.length() == 0) {
-                            out.println("WriteConcern,Cost,Latency");
-                        }
-                        for (Integer level : writeConcernCosts.keySet()) {
-                            double cost = writeConcernCosts.get(level);
-                            double latency = smoothed.getOrDefault(level, Double.NaN);
-                            out.printf("%d,%.4f,%.2f%n", level, cost, latency);
-                        }
-                    } catch (IOException ex) {
-                        ex.printStackTrace();
-                    }
+    // try (FileWriter fw = new FileWriter("writeconcern.csv", true);
+    // PrintWriter out = new PrintWriter(fw)) {
+    // File file = new File("writeconcern.csv");
+    // if (file.length() == 0) {
+    // out.println("WriteConcern,Cost,Latency");
+    // }
+    // for (Integer level : writeConcernCosts.keySet()) {
+    // double cost = writeConcernCosts.get(level);
+    // double latency = smoothed.getOrDefault(level, Double.NaN);
+    // out.printf("%d,%.4f,%.2f%n", level, cost, latency);
+    // }
+    // } catch (IOException ex) {
+    // ex.printStackTrace();
+    // }
 
-                    double upCap = oldCost * (1.0 + MAX_STEP_UP);
-                    double downCap = oldCost * (1.0 - MAX_STEP_DOWN);
-                    double capped = proposed;
+    // double upCap = oldCost * (1.0 + MAX_STEP_UP);
+    // double downCap = oldCost * (1.0 - MAX_STEP_DOWN);
+    // double capped = proposed;
 
-                    if (proposed > oldCost) {
-                        double minUp = oldCost + MIN_STEP_EPS;
-                        capped = Math.min(proposed, Math.max(minUp, upCap));
-                    } else if (proposed < oldCost) {
-                        double maxDownAbs = oldCost - MIN_STEP_EPS;
-                        capped = Math.max(proposed, Math.min(maxDownAbs, downCap));
-                    }
+    // if (proposed > oldCost) {
+    // double minUp = oldCost + MIN_STEP_EPS;
+    // capped = Math.min(proposed, Math.max(minUp, upCap));
+    // } else if (proposed < oldCost) {
+    // double maxDownAbs = oldCost - MIN_STEP_EPS;
+    // capped = Math.max(proposed, Math.min(maxDownAbs, downCap));
+    // }
 
-                    capped = Math.max(MIN_COST, capped);
-                    capped = Math.max(prevWriteConcernCost, capped);
-                    prevWriteConcernCost = capped;
-                    writeConcernCosts.put(wc, capped);
+    // capped = Math.max(MIN_COST, capped);
+    // capped = Math.max(prevWriteConcernCost, capped);
+    // prevWriteConcernCost = capped;
+    // writeConcernCosts.put(wc, capped);
 
-                    csv.write(String.format("%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n", wc, ewmaMs, minSmoothed, oldCost,
-                            proposed, capped, now));
-                    lastUpdateAt.put(wc, now);
-                }
-                csv.flush();
-            } catch (IOException ex) {
-                ex.printStackTrace();
-            }
-        }
-    }
+    // csv.write(String.format("%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n", wc, ewmaMs,
+    // minSmoothed, oldCost,
+    // proposed, capped, now));
+    // lastUpdateAt.put(wc, now);
+    // }
+    // csv.flush();
+    // } catch (IOException ex) {
+    // ex.printStackTrace();
+    // }
+    // }
+    // }
 
     private ProcessResult handleTokenBucket(List<TransactionOption> currentBatch,
             double totalFollowerTps) {
@@ -1900,7 +1933,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             double currentTps = getSystemWideThroughput() + totalFollowerTps;
 
             // Store system TPS (timestamp, tps) in a separate CSV row for each batch
-                      int n = currentBatch.size();
+            int n = currentBatch.size();
 
             // currentBatch is already List<TransactionOption>, no conversion needed
 
@@ -1993,8 +2026,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // currentTps, wcTpsMap,
             // backLogTransactions);
 
-             double currentLatency = (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
-  try (FileWriter sysTpsWriter = new FileWriter("system_latency.csv", true); PrintWriter sysTpsOut = new PrintWriter(sysTpsWriter)) {
+            double currentLatency = (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
+            try (FileWriter sysTpsWriter = new FileWriter("system_latency.csv", true);
+                    PrintWriter sysTpsOut = new PrintWriter(sysTpsWriter)) {
                 File file = new File("system_latency.csv");
                 if (file.length() == 0) {
                     sysTpsOut.println("Timestamp,SystemLatency");
@@ -2004,11 +2038,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 System.err.println("Failed to write system TPS to system_latency.csv: " + e.getMessage());
             }
 
-
             result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(currentBatch,
-                   currentLatency, wcLatencyMap, wcTpsMap,
+                    currentLatency, wcLatencyMap, wcTpsMap,
                     getIncomingTransactionsRate(),
-                    backLogTransactions);
+                    backLogTransactions, backlogTracker.isIncreasing());
 
             // Save result for next RL prediction
             previousBatchResult = result;
@@ -2150,7 +2183,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             };
             causalReadScheduler.execute(checkLogTask);
-            
+
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
             // this readRequest should go to leader
             // here we check if election is happening or not
