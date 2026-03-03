@@ -379,17 +379,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         lock.writeLock().lock();
 
         try {
-            // if(serverId == (leaderId + 1) % NUM_OF_SERVERS || serverId == (leaderId - 1 +
-            // NUM_OF_SERVERS) % NUM_OF_SERVERS || serverId == (leaderId + 2) %
-            // NUM_OF_SERVERS){
-            // if(log.size() >= 60000 && log.size() < 120000){
-            // Thread.sleep(40);
-            // }
-            // }
-            // this is added to replicate network call behaviour
-            // Thread.sleep(new Random().nextInt(10) + 5);
-            // update clock of follower using leaders clock, if the follower is behind it
-            // can catchup
+         
             hybridClock.update(HybridClock.TimeStamp.convertToTimeStamp(leadersTimeStamp));
 
             // Check if the leader's term is valid
@@ -1934,6 +1924,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             // Store system TPS (timestamp, tps) in a separate CSV row for each batch
             int n = currentBatch.size();
+            TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
 
             // currentBatch is already List<TransactionOption>, no conversion needed
 

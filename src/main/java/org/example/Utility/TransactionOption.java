@@ -1,6 +1,8 @@
 package org.example.Utility;
 
 import org.ds.paxos.ClientMessage;
+import org.ds.paxos.ReadConcern;
+import org.ds.paxos.ReadLevel;
 import org.ds.paxos.Transaction;
 
 import java.util.ArrayList;
@@ -27,7 +29,14 @@ public class TransactionOption {
 
     public int applicationId;
 
-    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit, String clientHost, int clientPort, int applicationId) {
+    public boolean isReadOnly;
+
+    // Read transaction fields
+    public ReadConcern readConcern;
+    public ReadLevel readLevel;
+    public String accNameToRead;
+
+    public TransactionOption(ClientMessage clientMessage, int minRequiredConsistency, double baseProfit, double extraMajorityProfit, double extraIntermediateProfit, String clientHost, int clientPort, int applicationId, boolean isReadOnly) {
         this.minRequiredConsistency = minRequiredConsistency;
         this.baseProfit = baseProfit;
         this.extraMajorityProfit = extraMajorityProfit;
@@ -37,9 +46,9 @@ public class TransactionOption {
         this.clientPort = clientPort;
         this.retryCount = 0;
         this.applicationId = applicationId;
-
+        this.isReadOnly = isReadOnly;
     }
-
+    
     /**
      * Create a TransactionOption from a ClientMessage (for adding to queue)
      */
@@ -58,21 +67,15 @@ public class TransactionOption {
             t.getExtraIntermediateProfit(),
             cm.getCallbackHost(),
             cm.getCallbackPort(),
-            t.getApplicationId()
+            t.getApplicationId(),
+            t.getIsReadOnly()
         );
         txOption.id = t.getId();  // Set the transaction ID
+        // Populate read transaction fields
+        txOption.readConcern = t.getReadConcern();
+        txOption.readLevel = t.getReadLevel();
+        txOption.accNameToRead = t.getAccNameToRead();
         return txOption;
-    }
-
-    public static List<TransactionOption> convertToTransactionOption(List<ClientMessage> clientMessageList) {
-
-        List<TransactionOption> transactionOptionList = new ArrayList<>();
-
-        for(ClientMessage cm : clientMessageList) {
-            Transaction t = cm.getT();
-            transactionOptionList.add(new TransactionOption(cm,t.getMinRequiredConsistency(), t.getBaseProfit(), t.getExtraProfitMajority(), t.getExtraIntermediateProfit(),cm.getCallbackHost(), cm.getCallbackPort(), t.getApplicationId()));
-        }
-        return transactionOptionList;
     }
 }
 
