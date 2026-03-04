@@ -535,12 +535,18 @@ public class Servers{
 
         int applicationId = 1 + random.nextInt(3);
 
+        // LINEARIZABLE reads must go through Raft with majority writeConcern
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        int writeConcern = (readConcernOrdinal == 0) ? majority : 0;
+
         Transaction transaction = Transaction.newBuilder()
                 .setId(txId)
                 .setIsReadOnly(true)
                 .setAccNameToRead(accName)
                 .setReadConcern(readConcern)
                 .setReadLevel(readLevel)
+                .setMinRequiredConsistency(writeConcern)
+                .setWriteConcern(writeConcern)
                 .setApplicationId(applicationId)
                 .setBaseProfit((double) applicationId)
                 .setTransactionSendTimeInMs(now)
@@ -548,7 +554,7 @@ public class Servers{
 
         return ClientMessage.newBuilder()
                 .setT(transaction)
-                .setWriteConcern(0)
+                .setWriteConcern(writeConcern)
                 .setTimeStamp(lastWriteTs)
                 .setCallbackHost("localhost")
                 .setCallbackPort(9000)
