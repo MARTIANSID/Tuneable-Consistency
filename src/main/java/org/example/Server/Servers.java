@@ -52,13 +52,13 @@ public class Servers{
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
         // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 10, 7000, Map.of(1, 0.60, 2, 0.20)));
+        PHASES.add(new Phase("Light", 200, 5000, Map.of(1, 0.60, 2, 0.20)));
         
         // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 10, 7000, Map.of(1, 0.30, 2, 0.70)));
+        PHASES.add(new Phase("Heavy", 200, 5000, Map.of(1, 0.30, 2, 0.70)));
         
         // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed", 10, 7000, Map.of(1, 0.50, 2, 0.50)));
+        PHASES.add(new Phase("Mixed",200, 5000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution
@@ -68,7 +68,7 @@ public class Servers{
     private static final Random random = new Random();
 
     // Read transaction configuration
-    private static final double READ_RATIO = 0.50; // 50% of batch are reads
+    private static final double READ_RATIO = 0.60; // 60% reads, 40% writes (for leader)
     // Leader reads: mix of EVENTUAL + LINEARIZABLE
     private static final Map<Integer, Double> LEADER_READ_CONCERN_DIST = Map.of(
             0, 0.50,  // LINEARIZABLE
@@ -187,48 +187,52 @@ public class Servers{
         phaseManager.setDaemon(true);
         phaseManager.start();
         
-        // Thread 2: Continuous Injector - runs until experiment ends
-        Thread continuousInjector = new Thread(() -> {
+        // Thread 2: Leader Injector — targetTPS into leader (40% writes + 60% reads EVENTUAL/LINEARIZABLE)
+        Thread leaderInjector = new Thread(() -> {
             AtomicInteger totalInjected = new AtomicInteger(0);
             long lastReportTime = System.currentTimeMillis();
-            
+
             while (!Thread.currentThread().isInterrupted() && experimentRunning) {
                 try {
-                    // Check if experiment is still running
-                    if (!experimentRunning) {
-                        break;
-                    }
-                    
-                    // Read current phase parameters (volatile read - thread safe)
+                    if (!experimentRunning) break;
+
                     Phase phase = currentPhase;
-                    
-                    // Calculate timing for current phase
+
+                    // Full targetTPS goes to leader (40% writes + 60% reads)
                     int batchesPerSecond = Math.max(1, phase.targetTPS / BATCH_SIZE);
                     long intervalMs = 1000 / batchesPerSecond;
-                    int actualBatchSize = phase.targetTPS / batchesPerSecond;
-                    
+                    int actualBatchSize = Math.max(1, phase.targetTPS / batchesPerSecond);
+
                     long batchStart = System.currentTimeMillis();
-                    
-                    // Generate batch with current phase's distribution
-                    List<ClientMessage> batch = generateTransactionBatch(actualBatchSize, phase.writeConcernDistribution);
-                    
-                    // Inject into any available server (they will forward to leader)
-                    boolean injected = injectBatchRobust(batch);
-                    
-                    if (injected) {
+
+                    // Generate mixed batch (writes + leader reads)
+                    List<ClientMessage> batch = generateLeaderBatch(actualBatchSize, phase.writeConcernDistribution);
+
+                    // Inject directly into leader
+                    ServerImpl currentLeader = injector.getLeader();
+                    if (currentLeader != null) {
+                        List<TransactionOption> txOptions = batch.stream()
+                                .map(TransactionOption::fromClientMessage)
+                                .collect(Collectors.toList());
+                        currentLeader.batchLock.lock();
+                        try {
+                            currentLeader.batchOfTransactions.addAll(txOptions);
+                        } finally {
+                            currentLeader.batchLock.unlock();
+                        }
+                        trackIncomingTransactions(batch.size());
                         totalInjected.addAndGet(batch.size());
                     }
-                    
-                    // Report every 3 seconds (reduced for 30-second experiment)
+
+                    // Report every 3 seconds
                     long currentTime = System.currentTimeMillis();
                     long elapsedSeconds = (currentTime - experimentStartTime) / 1000;
                     if (currentTime - lastReportTime >= 3000) {
-                        System.out.printf("📊 [%02ds] Total=%d | Phase=%s | TPS=%d%n",
+                        System.out.printf("📊 [%02ds] LeaderInjected=%d | Phase=%s | TPS=%d%n",
                                 elapsedSeconds, totalInjected.get(), phase.name, phase.targetTPS);
                         lastReportTime = currentTime;
                     }
-                    
-                    // Sleep to maintain target rate
+
                     long elapsed = System.currentTimeMillis() - batchStart;
                     long sleepTime = intervalMs - elapsed;
                     if (sleepTime > 0) {
@@ -239,57 +243,49 @@ public class Servers{
                     break;
                 }
             }
-            
-            System.out.printf("\n🏆 Experiment completed! Total injected: %d transactions%n", 
+
+            System.out.printf("\n🏆 Experiment completed! Leader injected: %d transactions%n",
                     totalInjected.get());
-            
-            // Exit the program after experiment completes
             System.out.println("\n✅ Shutting down servers...");
             System.exit(0);
-        }, "ContinuousInjector");
-        continuousInjector.setDaemon(true);
-        continuousInjector.start();
+        }, "LeaderInjector");
+        leaderInjector.setDaemon(true);
+        leaderInjector.start();
 
-        // Thread 3: Replica Read Injector - sends EVENTUAL + CAUSAL reads to followers
-        Thread replicaReadInjector = new Thread(() -> {
+        // Thread 3: Follower Injector — targetTPS reads per follower (CAUSAL + EVENTUAL)
+        Thread followerInjector = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted() && experimentRunning) {
                 try {
                     if (!experimentRunning) break;
 
                     Phase phase = currentPhase;
-                    int readTPS = (int) (phase.targetTPS * READ_RATIO);
-                    int batchesPerSecond = Math.max(1, readTPS / BATCH_SIZE);
+
+                    // Each follower gets targetTPS reads
+                    int batchesPerSecond = Math.max(1, phase.targetTPS / BATCH_SIZE);
                     long intervalMs = 1000 / batchesPerSecond;
-                    int actualBatchSize = readTPS / batchesPerSecond;
+                    int batchSize = Math.max(1, phase.targetTPS / batchesPerSecond);
 
                     long batchStart = System.currentTimeMillis();
                     TimeStampProto lastWriteTs = lastWriteTimestamp;
 
-                    // Pick a random follower (not the leader)
                     ServerImpl currentLeader = injector.getLeader();
-                    List<ServerImpl> followers = new ArrayList<>();
-                    for (int i = 0; i < NUM_OF_SERVERS; i++) {
-                        ServerImpl s = injector.getServerById(i);
-                        if (s != null && s != currentLeader) {
-                            followers.add(s);
-                        }
-                    }
 
-                    if (!followers.isEmpty()) {
-                        ServerImpl follower = followers.get(random.nextInt(followers.size()));
-                        List<TransactionOption> readBatch = new ArrayList<>();
-                        TimeStampProto lastWriteTs2 = lastWriteTs;
-                        for (int i = 0; i < actualBatchSize; i++) {
-                            ClientMessage readMsg = generateReadTransaction(lastWriteTs2, REPLICA_READ_CONCERN_DIST);
+                    for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                        ServerImpl server = injector.getServerById(i);
+                        if (server == null || server == currentLeader) continue; // skip leader
+
+                        List<TransactionOption> readBatch = new ArrayList<>(batchSize);
+                        for (int j = 0; j < batchSize; j++) {
+                            ClientMessage readMsg = generateReadTransaction(lastWriteTs, REPLICA_READ_CONCERN_DIST);
                             readBatch.add(TransactionOption.fromClientMessage(readMsg));
                         }
-                        follower.batchLock.lock();
+                        server.batchLock.lock();
                         try {
-                            follower.batchOfTransactions.addAll(readBatch);
+                            server.batchOfTransactions.addAll(readBatch);
                         } finally {
-                            follower.batchLock.unlock();
+                            server.batchLock.unlock();
                         }
-                        trackIncomingTransactions(actualBatchSize);
+                        trackIncomingTransactions(batchSize);
                     }
 
                     long elapsed = System.currentTimeMillis() - batchStart;
@@ -301,17 +297,16 @@ public class Servers{
                     Thread.currentThread().interrupt();
                     break;
                 } catch (Exception e) {
-                    // Log but don't crash — follower may not be ready yet
-                    System.err.println("Replica read injection error: " + e.getMessage());
+                    System.err.println("Follower read injection error: " + e.getMessage());
                     try { Thread.sleep(500); } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         break;
                     }
                 }
             }
-        }, "ReplicaReadInjector");
-        replicaReadInjector.setDaemon(true);
-        replicaReadInjector.start();
+        }, "FollowerInjector");
+        followerInjector.setDaemon(true);
+        followerInjector.start();
     }
     
     /**
@@ -461,16 +456,16 @@ public class Servers{
     }
 
     /**
-     * Generate a batch of transactions with specified write concern distribution
+     * Generate a mixed batch for the leader: 40% writes + 60% reads (EVENTUAL + LINEARIZABLE)
      */
-    private static List<ClientMessage> generateTransactionBatch(int size, Map<Integer, Double> wcDistribution) {
+    private static List<ClientMessage> generateLeaderBatch(int size, Map<Integer, Double> wcDistribution) {
         List<ClientMessage> batch = new ArrayList<>(size);
         long now = System.currentTimeMillis();
 
-        int readCount = (int) (size * READ_RATIO);
-        int writeCount = size - readCount;
+        int writeCount = (int) (size * (1.0 - READ_RATIO));  // 40%
+        int readCount = size - writeCount;                     // 60%
 
-        // Generate write transactions first
+        // Generate write transactions
         for (int i = 0; i < writeCount; i++) {
             int minConsistency = selectWriteConcern(wcDistribution);
 
@@ -514,7 +509,7 @@ public class Servers{
             lastWriteTimestamp = ts;
         }
 
-        // Generate read transactions for leader (EVENTUAL + LINEARIZABLE)
+        // Generate leader reads (EVENTUAL + LINEARIZABLE)
         TimeStampProto lastWriteTs = lastWriteTimestamp;
         for (int i = 0; i < readCount; i++) {
             batch.add(generateReadTransaction(lastWriteTs, LEADER_READ_CONCERN_DIST));
