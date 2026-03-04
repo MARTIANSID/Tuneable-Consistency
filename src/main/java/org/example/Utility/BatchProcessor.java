@@ -50,8 +50,8 @@ public class BatchProcessor {
     private static final double writeCost = 1.0;
 
     private static final HashMap<ReadConcern, Double> token_costs = new HashMap<>(){{
-            put(ReadConcern.CAUSAL, 1.5);
-            put(ReadConcern.LINEARIZABLE, 2.0);
+            put(ReadConcern.CAUSAL, 0.5);
+            put(ReadConcern.LINEARIZABLE, 1.0);
             put(ReadConcern.EVENTUAL, 0.1);
     }};
 
@@ -639,6 +639,9 @@ public class BatchProcessor {
             double tokensUsedSoFar = calculateTotalTokenCost(batch, assignments);
 
             if (targetRCLatency <= MAX_LATENCY) {
+                double eventualLatency = readConcernLatencyMap.getOrDefault(ReadConcern.EVENTUAL, 0.0);
+                double readLatencyIncPerTx = targetRCLatency - eventualLatency;
+
                 for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appReadConcernCount.entrySet()) {
                     int appId = appEntry.getKey();
                     int eventualCount = appEntry.getValue().getOrDefault(eventualRCNum, 0);
@@ -647,9 +650,9 @@ public class BatchProcessor {
                     double perTxProfit = (targetRC == ReadConcern.LINEARIZABLE)
                             ? appMajorityProfitMap.getOrDefault(appId, 0.0)
                             : appIntermediateProfitMap.getOrDefault(appId, 0.0);
-                    // Use tokenCostIncrease as the "cost" dimension for ratio
-                    double ratio = (tokenCostIncrease > EPS)
-                            ? perTxProfit / tokenCostIncrease : Double.MAX_VALUE;
+                    // Use latency increase as cost dimension (same unit as write upgrades) for fair PQ ranking
+                    double ratio = (readLatencyIncPerTx > EPS)
+                            ? perTxProfit / readLatencyIncPerTx : Double.MAX_VALUE;
                     pq.add(new AppUpgradeOption(appId, eventualRCNum, targetRCNum, eventualCount,
                             ratio, eventualRCNum, true, tokenCostIncrease));
                 }
@@ -668,13 +671,23 @@ public class BatchProcessor {
 
                     // Check token budget
                     double remainingTokenBudget = currentTokens - tokensUsedSoFar;
-                    int maxAffordable = (opt.tokenCostPerTx > EPS)
+                    int maxByTokens = (opt.tokenCostPerTx > EPS)
                             ? (int) Math.floor(remainingTokenBudget / opt.tokenCostPerTx)
                             : currentCount;
-                    int toUpgrade = Math.min(currentCount, maxAffordable);
+
+                    // Check latency headroom (same constraint as write upgrades)
+                    double readLatencyInc = readConcernLatencyMap.getOrDefault(targetRC, 0.0)
+                            - readConcernLatencyMap.getOrDefault(ReadConcern.forNumber(opt.fromWC), 0.0);
+                    double remainingHeadroom = (MAX_LATENCY * UPGRADE_LATENCY_FLOOR - avgLatency) * (n + 1);
+                    int maxByLatency = (readLatencyInc > EPS)
+                            ? (int) Math.floor(remainingHeadroom / readLatencyInc)
+                            : currentCount;
+
+                    int toUpgrade = Math.min(currentCount, Math.min(maxByTokens, maxByLatency));
                     if (toUpgrade <= 0) continue;
 
                     tokensUsedSoFar += opt.tokenCostPerTx * toUpgrade;
+                    avgLatency += (readLatencyInc * toUpgrade) / (n + 1);
                     appReadConcernCount.get(opt.appId).put(opt.fromWC, currentCount - toUpgrade);
                     appReadConcernCount.get(opt.appId).merge(opt.toWC, toUpgrade, Integer::sum);
                     transactionsUpgraded += toUpgrade;
@@ -769,6 +782,8 @@ public class BatchProcessor {
                 if (!tx.isReadOnly) continue;
                 int appId = tx.applicationId;
                 int originalRC = tx.readConcern.getNumber();
+                // Already at or stronger than target — nothing to upgrade
+                if (originalRC <= targetRCNum) continue;
                 HashMap<Integer, Integer> upgrades = readConcernUpgradesMap
                         .getOrDefault(appId, new HashMap<>())
                         .getOrDefault(originalRC, new HashMap<>());

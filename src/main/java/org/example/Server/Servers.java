@@ -18,7 +18,10 @@ import java.util.stream.Collectors;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import org.ds.paxos.Ack;
 import org.ds.paxos.ClientMessage;
+import org.ds.paxos.ReadConcern;
+import org.ds.paxos.ReadLevel;
 import org.ds.paxos.Transaction;
 import org.ds.paxos.TimeStampProto;
 import org.example.Utility.TransactionOption;
@@ -63,6 +66,22 @@ public class Servers{
 
     private static final int BATCH_SIZE = 1000;  // Transactions per batch (increased to reduce gRPC overhead)
     private static final Random random = new Random();
+
+    // Read transaction configuration
+    private static final double READ_RATIO = 0.50; // 50% of batch are reads
+    // Leader reads: mix of EVENTUAL + LINEARIZABLE
+    private static final Map<Integer, Double> LEADER_READ_CONCERN_DIST = Map.of(
+            0, 0.50,  // LINEARIZABLE
+            2, 0.50   // EVENTUAL
+    );
+    // Replica reads: mix of EVENTUAL + CAUSAL (50/50)
+    private static final Map<Integer, Double> REPLICA_READ_CONCERN_DIST = Map.of(
+            1, 0.50,  // CAUSAL
+            2, 0.50   // EVENTUAL
+    );
+    // Track last write timestamp for causal/linearizable reads
+    private static volatile TimeStampProto lastWriteTimestamp = TimeStampProto.newBuilder()
+            .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
     private static final long TOTAL_EXPERIMENT_DURATION_MS = 40000;  // 150 seconds total
@@ -230,6 +249,69 @@ public class Servers{
         }, "ContinuousInjector");
         continuousInjector.setDaemon(true);
         continuousInjector.start();
+
+        // Thread 3: Replica Read Injector - sends EVENTUAL + CAUSAL reads to followers
+        Thread replicaReadInjector = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted() && experimentRunning) {
+                try {
+                    if (!experimentRunning) break;
+
+                    Phase phase = currentPhase;
+                    int readTPS = (int) (phase.targetTPS * READ_RATIO);
+                    int batchesPerSecond = Math.max(1, readTPS / BATCH_SIZE);
+                    long intervalMs = 1000 / batchesPerSecond;
+                    int actualBatchSize = readTPS / batchesPerSecond;
+
+                    long batchStart = System.currentTimeMillis();
+                    TimeStampProto lastWriteTs = lastWriteTimestamp;
+
+                    // Pick a random follower (not the leader)
+                    ServerImpl currentLeader = injector.getLeader();
+                    List<ServerImpl> followers = new ArrayList<>();
+                    for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                        ServerImpl s = injector.getServerById(i);
+                        if (s != null && s != currentLeader) {
+                            followers.add(s);
+                        }
+                    }
+
+                    if (!followers.isEmpty()) {
+                        ServerImpl follower = followers.get(random.nextInt(followers.size()));
+                        List<TransactionOption> readBatch = new ArrayList<>();
+                        TimeStampProto lastWriteTs2 = lastWriteTs;
+                        for (int i = 0; i < actualBatchSize; i++) {
+                            ClientMessage readMsg = generateReadTransaction(lastWriteTs2, REPLICA_READ_CONCERN_DIST);
+                            readBatch.add(TransactionOption.fromClientMessage(readMsg));
+                        }
+                        follower.batchLock.lock();
+                        try {
+                            follower.batchOfTransactions.addAll(readBatch);
+                        } finally {
+                            follower.batchLock.unlock();
+                        }
+                        trackIncomingTransactions(actualBatchSize);
+                    }
+
+                    long elapsed = System.currentTimeMillis() - batchStart;
+                    long sleepTime = intervalMs - elapsed;
+                    if (sleepTime > 0) {
+                        Thread.sleep(sleepTime);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    // Log but don't crash — follower may not be ready yet
+                    System.err.println("Replica read injection error: " + e.getMessage());
+                    try { Thread.sleep(500); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }, "ReplicaReadInjector");
+        replicaReadInjector.setDaemon(true);
+        replicaReadInjector.start();
     }
     
     /**
@@ -332,7 +414,7 @@ public class Servers{
                 
                 // Log to CSV file
                 try {
-                    File file = new File("incoming_transaction_rate.csv");
+                    File file = new File("incoming_transaction_rate_global.csv");
                     boolean writeHeader = !file.exists() || file.length() == 0;
                     try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
                         if (writeHeader) {
@@ -385,19 +467,21 @@ public class Servers{
         List<ClientMessage> batch = new ArrayList<>(size);
         long now = System.currentTimeMillis();
 
-        for (int i = 0; i < size; i++) {
-            // Select write concern based on distribution
+        int readCount = (int) (size * READ_RATIO);
+        int writeCount = size - readCount;
+
+        // Generate write transactions first
+        for (int i = 0; i < writeCount; i++) {
             int minConsistency = selectWriteConcern(wcDistribution);
 
             String txId = UUID.randomUUID().toString();
             String sender = "user" + (i % 100);
             String receiver = "user" + ((i + 50) % 100);
-                double amount = 1.0 + (i % 10);
+            double amount = 1.0 + (i % 10);
 
-                // Assign an applicationId in {1,2,3} and use it as the profit values
-                int applicationId = 1 + random.nextInt(3); // 1..3
+            int applicationId = 1 + random.nextInt(3);
 
-                Transaction transaction = Transaction.newBuilder()
+            Transaction transaction = Transaction.newBuilder()
                     .setId(txId)
                     .setSender(sender)
                     .setReceiver(receiver)
@@ -412,21 +496,83 @@ public class Servers{
                     .setIsReadOnly(false)
                     .build();
 
+            TimeStampProto ts = TimeStampProto.newBuilder()
+                    .setP(now)
+                    .setL(i)
+                    .build();
+
             ClientMessage message = ClientMessage.newBuilder()
                     .setT(transaction)
                     .setWriteConcern(minConsistency)
-                    .setTimeStamp(TimeStampProto.newBuilder()
-                            .setP(now)
-                            .setL(i)
-                            .build())
+                    .setTimeStamp(ts)
                     .setCallbackHost("localhost")
                     .setCallbackPort(9000)
                     .build();
 
             batch.add(message);
+            // Track last write timestamp for read transactions
+            lastWriteTimestamp = ts;
+        }
+
+        // Generate read transactions for leader (EVENTUAL + LINEARIZABLE)
+        TimeStampProto lastWriteTs = lastWriteTimestamp;
+        for (int i = 0; i < readCount; i++) {
+            batch.add(generateReadTransaction(lastWriteTs, LEADER_READ_CONCERN_DIST));
         }
 
         return batch;
+    }
+
+    /**
+     * Generate a single read transaction with the given read concern distribution
+     * and the timestamp of the last write (for causal ordering).
+     */
+    private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs,
+                                                          Map<Integer, Double> rcDistribution) {
+        String txId = UUID.randomUUID().toString();
+        String accName = "user" + random.nextInt(100);
+        long now = System.currentTimeMillis();
+
+        int readConcernOrdinal = selectReadConcern(rcDistribution);
+        ReadConcern readConcern = ReadConcern.forNumber(readConcernOrdinal);
+        // LINEARIZABLE -> MAJORITY level, others -> LOCAL
+        ReadLevel readLevel = (readConcernOrdinal == 0) ? ReadLevel.MAJORITY : ReadLevel.LOCAL;
+
+        int applicationId = 1 + random.nextInt(3);
+
+        Transaction transaction = Transaction.newBuilder()
+                .setId(txId)
+                .setIsReadOnly(true)
+                .setAccNameToRead(accName)
+                .setReadConcern(readConcern)
+                .setReadLevel(readLevel)
+                .setApplicationId(applicationId)
+                .setBaseProfit((double) applicationId)
+                .setTransactionSendTimeInMs(now)
+                .build();
+
+        return ClientMessage.newBuilder()
+                .setT(transaction)
+                .setWriteConcern(0)
+                .setTimeStamp(lastWriteTs)
+                .setCallbackHost("localhost")
+                .setCallbackPort(9000)
+                .build();
+    }
+
+    /**
+     * Select read concern based on probability distribution
+     */
+    private static int selectReadConcern(Map<Integer, Double> distribution) {
+        double rand = random.nextDouble();
+        double cumulative = 0.0;
+        for (Map.Entry<Integer, Double> entry : distribution.entrySet()) {
+            cumulative += entry.getValue();
+            if (rand <= cumulative) {
+                return entry.getKey();
+            }
+        }
+        return 2; // default EVENTUAL
     }
 
     /**
@@ -451,22 +597,43 @@ public class Servers{
      * Clear all CSV files at startup to ensure clean data collection
      */
     private static void clearCSVFiles() {
-        String[] csvFiles = {
-            "tps.csv",
-            "writeconcern_frequency.csv", 
-            "writeconcern_tps.csv",
+        // Per-server CSV files (one file per server ID)
+        String[] perServerFiles = {
+            "tps_%d.csv",
+            "writeconcern_frequency_%d.csv",
+            "writeconcern_tps_%d.csv",
+            "backlog_%d.csv",
+            "avg_latencies_%d.csv",
+            "incoming_transaction_rate_%d.csv",
+            "system_latency_%d.csv",
+            "backlog_samples_%d.csv",
+            "read_latencies_%d.csv"
+        };
+
+        // Global (non-server-specific) CSV files
+        String[] globalFiles = {
             "writeconcern.csv",
-            "backlog.csv",
-            "avg_latencies.csv",
             "token_costs.csv",
             "lab1_Test.csv",
-            "incoming_transaction_rate.csv",
             "final_batch_avg_tps_log.csv",
-            "system_latency.csv",
-            "backlog_samples.csv"
+            "incoming_transaction_rate_global.csv"
         };
-        
-        for (String filename : csvFiles) {
+
+        for (int sid = 0; sid < NUM_OF_SERVERS; sid++) {
+            for (String pattern : perServerFiles) {
+                String filename = String.format(pattern, sid);
+                File file = new File(filename);
+                if (file.exists()) {
+                    if (file.delete()) {
+                        System.out.println("Cleared CSV file: " + filename);
+                    } else {
+                        System.out.println("Warning: Could not delete " + filename);
+                    }
+                }
+            }
+        }
+
+        for (String filename : globalFiles) {
             File file = new File(filename);
             if (file.exists()) {
                 if (file.delete()) {

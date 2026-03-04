@@ -155,6 +155,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<Integer, Deque<Latency>> readConcernLatencies;
     ConcurrentHashMap<Integer, Long> readConcernLatencySum;
     ConcurrentHashMap<Integer, Object> readConcernLatencyLocks;
+    ConcurrentHashMap<Integer, Double> prevReadConcernLatencies;
 
     ScheduledExecutorService sendAppendEntriesScheduler;
     ScheduledExecutorService causalReadScheduler;
@@ -307,6 +308,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.readConcernLatencies = new ConcurrentHashMap<>();
         this.readConcernLatencySum = new ConcurrentHashMap<>();
         this.readConcernLatencyLocks = new ConcurrentHashMap<>();
+        this.prevReadConcernLatencies = new ConcurrentHashMap<>();
         for (ReadConcern rc : ReadConcern.values()) {
             if (rc == ReadConcern.UNRECOGNIZED) continue;
             readConcernLatencies.put(rc.getNumber(), new ArrayDeque<>());
@@ -325,7 +327,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.countOfSystemWideLatencies = new AtomicLong(0);
         this.prevLatencies = new ConcurrentHashMap<>();
         this.writeConcernLatencyLocks = new ConcurrentHashMap<>();
-        this.backlogTracker = new BacklogTracker(0.2, 100.0);
+        this.backlogTracker = new BacklogTracker(0.2, 100.0, serverId);
 
         // Initialize incoming transaction tracking
         this.incomingTransactionTimestamps = new ConcurrentLinkedQueue<>();
@@ -340,6 +342,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.lastThroughputSentTime = new AtomicLongArray(NUM_OF_SERVERS);
         this.clientStubs = new ConcurrentHashMap<>();
         this.lastHeartBeatReceived = new AtomicLong[NUM_OF_SERVERS];
+        
+
         // setting the peers list
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the nextIndex and matchIndex
@@ -365,6 +369,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // setting up the client stub
         ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
         clientStub = RaftGrpc.newStub(channel);
+
+        batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
+                        BATCH_INTERVAL_MS,
+                        TimeUnit.MILLISECONDS);
 
         // starting the election timer
         this.electionTimer.start();
@@ -675,7 +683,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 // Log to CSV file
                 try {
-                    File file = new File("incoming_transaction_rate.csv");
+                    File file = new File("incoming_transaction_rate_" + serverId + ".csv");
                     boolean writeHeader = !file.exists() || file.length() == 0;
                     try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
                         if (writeHeader) {
@@ -1484,11 +1492,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (sendAppendEntriesScheduler == null || sendAppendEntriesScheduler.isShutdown()) {
                 sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             }
-            if (batchProcessingTask == null || batchProcessor.isShutdown()) {
-                batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
-                        BATCH_INTERVAL_MS,
-                        TimeUnit.MILLISECONDS);
-            }
+            // if (batchProcessingTask == null || batchProcessor.isShutdown()) {
+            //     batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
+            //             BATCH_INTERVAL_MS,
+            //             TimeUnit.MILLISECONDS);
+            // }
 
             if (backLogScheuler == null || backLogScheuler.isShutdown()) {
                 
@@ -1540,10 +1548,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         votedFor = -1;
 
         // cancelling the batch job
-        if (batchProcessingTask != null && !batchProcessingTask.isCancelled()) {
-            batchProcessingTask.cancel(false); // false = don't interrupt if running
-            batchProcessingTask = null;
-        }
+        // if (batchProcessingTask != null && !batchProcessingTask.isCancelled()) {
+        //     batchProcessingTask.cancel(false); // false = don't interrupt if running
+        //     batchProcessingTask = null;
+        // }
         // stop leader’s heartbeat task immediately
         if (sendAppendEntriesScheduler != null && !sendAppendEntriesScheduler.isShutdown()) {
             sendAppendEntriesScheduler.shutdownNow();
@@ -1601,8 +1609,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
             int backLog = backLogTransactions.size();
 
-            try (FileWriter fw = new FileWriter("backlog.csv", true); PrintWriter out = new PrintWriter(fw)) {
-                File file = new File("backlog.csv");
+            try (FileWriter fw = new FileWriter("backlog_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
+                File file = new File("backlog_" + serverId + ".csv");
                 if (file.length() == 0) {
                     out.println("Backlog");
                 }
@@ -1996,10 +2004,33 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 System.out.printf("Current blended latency for WC=%d is %.2f ms%n", wc, wcLatencyMap.get(wc));
             }
             // Store writeConcern latency data in avg_latencies.csv
-            try (FileWriter csvWriter = new FileWriter("avg_latencies.csv", true)) {
+            try (FileWriter csvWriter = new FileWriter("avg_latencies_" + serverId + ".csv", true)) {
                 for (int wc = 1; wc <= majority; wc++) {
                     double avgLatency = wcLatencyMap.get(wc);
                     csvWriter.write(String.format("%d,%.2f\n", wc, avgLatency));
+                }
+                csvWriter.flush();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            // Print and log read concern latencies
+            HashMap<Integer, Long> rcLatencyMap = new HashMap<>();
+            for (ReadConcern rc : ReadConcern.values()) {
+                if (rc == ReadConcern.UNRECOGNIZED) continue;
+                long avgRcLatency = getAverageReadConcernLatency(rc);
+                rcLatencyMap.put(rc.getNumber(), avgRcLatency);
+                System.out.printf("Current avg latency for RC=%s is %d ms%n", rc.name(), avgRcLatency);
+            }
+            try (FileWriter csvWriter = new FileWriter("read_latencies_" + serverId + ".csv", true)) {
+                File file = new File("read_latencies_" + serverId + ".csv");
+                if (file.length() == 0) {
+                    csvWriter.write("Timestamp,ReadConcern,AvgLatencyMs\n");
+                }
+                long ts = System.currentTimeMillis();
+                for (ReadConcern rc : ReadConcern.values()) {
+                    if (rc == ReadConcern.UNRECOGNIZED) continue;
+                    csvWriter.write(String.format("%d,%s,%d\n", ts, rc.name(), rcLatencyMap.get(rc.getNumber())));
                 }
                 csvWriter.flush();
             } catch (IOException e) {
@@ -2016,9 +2047,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             // Record writeConcern frequency in CSV (single row per batch)
-            try (FileWriter fw = new FileWriter("writeconcern_frequency.csv", true);
+            try (FileWriter fw = new FileWriter("writeconcern_frequency_" + serverId + ".csv", true);
                     PrintWriter out = new PrintWriter(fw)) {
-                File file = new File("writeconcern_frequency.csv");
+                File file = new File("writeconcern_frequency_" + serverId + ".csv");
                 if (file.length() == 0) {
                     // Write header: Timestamp, WC1, WC2, ..., WC_majority, TotalInBatch
                     StringBuilder header = new StringBuilder("Timestamp");
@@ -2041,8 +2072,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
 
             // Record writeConcern TPS in CSV (single row per batch)
-            try (FileWriter fw = new FileWriter("writeconcern_tps.csv", true); PrintWriter out = new PrintWriter(fw)) {
-                File file = new File("writeconcern_tps.csv");
+            try (FileWriter fw = new FileWriter("writeconcern_tps_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
+                File file = new File("writeconcern_tps_" + serverId + ".csv");
                 if (file.length() == 0) {
                     // Write header: Timestamp, WC1_TPS, WC2_TPS, ..., WC_majority_TPS, SystemTPS
                     StringBuilder header = new StringBuilder("Timestamp");
@@ -2073,9 +2104,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // backLogTransactions);
 
             double currentLatency = (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
-            try (FileWriter sysTpsWriter = new FileWriter("system_latency.csv", true);
+            try (FileWriter sysTpsWriter = new FileWriter("system_latency_" + serverId + ".csv", true);
                     PrintWriter sysTpsOut = new PrintWriter(sysTpsWriter)) {
-                File file = new File("system_latency.csv");
+                File file = new File("system_latency_" + serverId + ".csv");
                 if (file.length() == 0) {
                     sysTpsOut.println("Timestamp,SystemLatency");
                 }
@@ -2109,10 +2140,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             System.out.printf(
                     "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Remaining Tokens: %.2f | Transactions Upgraded : %d%n",
                     result.profit, currentTps, currentTokens, result.tokensUsed, remainingTokens, result.transactionsUpgraded);
-            try (FileWriter fw = new FileWriter("tps.csv", true); PrintWriter out = new PrintWriter(fw)) {
+            try (FileWriter fw = new FileWriter("tps_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
 
                 // Write header only if file is empty
-                File file = new File("tps.csv");
+                File file = new File("tps_" + serverId + ".csv");
                 if (file.length() == 0) {
                     out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
@@ -2207,8 +2238,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public long getAverageReadConcernLatency(ReadConcern readConcern) {
         int key = readConcern.getNumber();
         synchronized (readConcernLatencyLocks.get(key)) {
-            return readConcernLatencySum.get(key)
+            long val = readConcernLatencySum.get(key)
                     / Math.max(readConcernLatencies.get(key).size(), 1);
+            if (val == 0) {
+                return prevReadConcernLatencies.getOrDefault(key, 0.0).longValue();
+            } else {
+                prevReadConcernLatencies.put(key, (double) val);
+            }
+            return val;
         }
     }
 

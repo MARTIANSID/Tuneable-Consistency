@@ -17,15 +17,17 @@ public class BacklogTracker {
     private final double delta;   // threshold for detecting “increasing” backlog
     private double ema = -1;      // smoothed backlog
     private double lastEma = -1;  // previous EMA for trend comparison
-    private static final Path CSV_PATH = Paths.get("backlog_samples.csv");
+    private final Path csvPath;
 
     /**
      * @param alpha smoothing factor: smaller = smoother, larger = more responsive
      * @param delta threshold for detecting increasing backlog
+     * @param serverId server ID used to name the per-server CSV file
      */
-    public BacklogTracker(double alpha, double delta) {
+    public BacklogTracker(double alpha, double delta, int serverId) {
         this.alpha = alpha;
         this.delta = delta;
+        this.csvPath = Paths.get("backlog_samples_" + serverId + ".csv");
     }
 
     /**
@@ -44,8 +46,8 @@ public class BacklogTracker {
     // Append a CSV line with timestamp (ms), backlog sample and current EMA.
     private void appendCsv(int backlog, double ema) {
         try {
-            boolean exists = Files.exists(CSV_PATH);
-            try (BufferedWriter bw = Files.newBufferedWriter(CSV_PATH,
+            boolean exists = Files.exists(csvPath);
+            try (BufferedWriter bw = Files.newBufferedWriter(csvPath,
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
                  PrintWriter pw = new PrintWriter(bw)) {
                 if (!exists) {
