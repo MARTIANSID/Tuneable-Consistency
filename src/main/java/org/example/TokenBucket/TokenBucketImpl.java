@@ -8,21 +8,22 @@ public class TokenBucketImpl {
     // jedis for connecting to the master replica of redis
     private Jedis masterJedis;
 
-    // this key holds the token count for that particular timestamp
-    private static final String TOKEN_BUCKET_KEY = "token_bucket_count";
-
-    // this key holds the timestamp at which the tokens were updated during the last usage
-    private static final String LAST_UPDATE_KEY = "last_update_time";
-    private static final String CURRENT_TERM_KEY = "current_term";
-
+    // Redis keys — prefixed with server_id to avoid collisions across Raft nodes
+    private final String TOKEN_BUCKET_KEY;
+    private final String LAST_UPDATE_KEY;
+    private final String CURRENT_TERM_KEY;
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 70000;
-    private static final double REFILL_RATE = 70000; // tokens per second
+    private static final double MAX_TOKENS = 7000;
+    private static final double REFILL_RATE = 7000; // tokens per second
 
-    public TokenBucketImpl(String redisHost, int redisPort) {
+    public TokenBucketImpl(String redisHost, int redisPort, int serverId) {
         // here first I connect to redis master
         masterJedis = new Jedis(redisHost, redisPort);
+        String prefix = "server_" + serverId + "_";
+        TOKEN_BUCKET_KEY = prefix + "token_bucket_count";
+        LAST_UPDATE_KEY = prefix + "last_update_time";
+        CURRENT_TERM_KEY = prefix + "current_term";
     }
 
 
@@ -116,17 +117,17 @@ public class TokenBucketImpl {
         }
     }
 
-    public static void main(String[] args) {
-        TokenBucketImpl tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
+//     public static void main(String[] args) {
+//         TokenBucketImpl tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
 
-        // Update the token bucket every second
-        while (true) {
-//            tokenBucket.updateTokens(20);
-            try {
-                Thread.sleep(1000);  // Sleep for 1 second
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
-    }
+//         // Update the token bucket every second
+//         while (true) {
+// //            tokenBucket.updateTokens(20);
+//             try {
+//                 Thread.sleep(1000);  // Sleep for 1 second
+//             } catch (InterruptedException e) {
+//                 e.printStackTrace();
+//             }
+//         }
+//     }
 }

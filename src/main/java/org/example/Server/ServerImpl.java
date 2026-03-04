@@ -29,6 +29,8 @@ import org.example.TokenBucket.TokenBucketImpl.TokenBucketData;
 
 import java.lang.management.ManagementFactory;
 
+import com.mysql.cj.x.protobuf.Mysqlx.ClientMessages;
+
 // import com.google.protobuf.Empty;
 
 import com.sun.management.OperatingSystemMXBean;
@@ -148,6 +150,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<Integer, Double> smoothedLatencies;
     ConcurrentHashMap<Integer, Double> prevLatencies;
     ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks;
+
+    // Read concern latency tracking (keyed by ReadConcern enum ordinal)
+    ConcurrentHashMap<Integer, Deque<Latency>> readConcernLatencies;
+    ConcurrentHashMap<Integer, Long> readConcernLatencySum;
+    ConcurrentHashMap<Integer, Object> readConcernLatencyLocks;
 
     ScheduledExecutorService sendAppendEntriesScheduler;
     ScheduledExecutorService causalReadScheduler;
@@ -282,7 +289,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.ackUpdateLock = new Object();
         this.peerData = new Object();
         this.redisLock = new ReentrantReadWriteLock();
-        this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379);
+        this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379, serverId);
         this.batchOfTransactions = new LinkedList<>();
         this.writeConcernCosts = new ConcurrentHashMap<>();
         // only one thread is required because I run a periodic batch job every 20ms
@@ -295,6 +302,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.writeConcernLatencies = new ConcurrentHashMap<>();
         this.writeConcernLatencySum = new ConcurrentHashMap<>();
         this.smoothedLatencies = new ConcurrentHashMap<>();
+
+        // Initialize read concern latency tracking
+        this.readConcernLatencies = new ConcurrentHashMap<>();
+        this.readConcernLatencySum = new ConcurrentHashMap<>();
+        this.readConcernLatencyLocks = new ConcurrentHashMap<>();
+        for (ReadConcern rc : ReadConcern.values()) {
+            if (rc == ReadConcern.UNRECOGNIZED) continue;
+            readConcernLatencies.put(rc.getNumber(), new ArrayDeque<>());
+            readConcernLatencySum.put(rc.getNumber(), 0L);
+            readConcernLatencyLocks.put(rc.getNumber(), new Object());
+        }
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
         this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
         this.lastThroughputSentTimeOnFollower = 0;
@@ -914,6 +932,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         if (entry.t.getIsReadOnly()) {
                             ackBuilder.setId(id).setBalance(
                                     clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
+                            recordReadConcernLatency(ReadConcern.LINEARIZABLE,entry.timeOfArrivalAtLeader);
                         }
 
                         AckMessage ackMessage = ackBuilder.build();
@@ -1597,16 +1616,36 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             batchLock.unlock();
         }
 
+        // Separate read and write transactions, collect read acks per client
+        List<ClientMessage> writeTransactions = new ArrayList<>();
+        Map<String, List<AckMessage>> readAcksPerClient = new HashMap<>();
+        for (ClientMessage cm : transactionsToExecute) {
+            if (cm.getT().getIsReadOnly()) {
+                // Process read transaction — returns Ack for EVENTUAL, null for CAUSAL/LINEARIZABLE (async)
+                Ack readAck = processReadRequest(cm);
+                if (readAck != null) {
+                    // EVENTUAL read — collect ack messages to send later
+                    String clientId = getClientId(cm.getCallbackHost(), cm.getCallbackPort());
+                    clientStubs.computeIfAbsent(clientId,
+                            k -> createClientStub(cm.getCallbackHost(), cm.getCallbackPort()));
+                    readAcksPerClient.computeIfAbsent(clientId, k -> new ArrayList<>())
+                            .addAll(readAck.getAckMessageList());
+                }
+            } else {
+                writeTransactions.add(cm);
+            }
+        }
+
         // this list is used to ack transactions with w:1
         List<LogEntry> entry = new ArrayList<>();
 
-        // here append all these transactions in the raft log
+        // here append all write transactions in the raft log
         lock.writeLock().lock();
         try {
             if (status != ServerCurrentStatus.LEADER)
                 return;
 
-            for (ClientMessage clientMessage : transactionsToExecute) {
+            for (ClientMessage clientMessage : writeTransactions) {
                 int index = log.size();
 
                 if (clientMessage.hasTimeStamp()) {
@@ -1645,15 +1684,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             e.printStackTrace();
         } finally {
             lock.writeLock().unlock();
-            if (!entry.isEmpty()) {
-                // this sends Ack for all transactions together
-                System.out.println("Sending ack for transactions with w:1, batch size: " + entry.size());
-                sendAckForEntries(entry).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally(ex -> {
-                    // System.out.println("Ack failed reason : " + ex);
 
-                    return null;
-                });
-            }
+            // Send all acks (write w:1 + read EVENTUAL) together on a separate thread
+            executorService.submit(() -> {
+                // Send write w:1 acks
+                if (!entry.isEmpty()) {
+                    System.out.println("Sending ack for transactions with w:1, batch size: " + entry.size());
+                    sendAckForEntries(entry).orTimeout(100, TimeUnit.MILLISECONDS).exceptionally(ex -> {
+                        return null;
+                    });
+                }
+                // Send batched read EVENTUAL acks
+                for (Map.Entry<String, List<AckMessage>> readEntry : readAcksPerClient.entrySet()) {
+                    String clientId = readEntry.getKey();
+                    List<AckMessage> ackMessages = readEntry.getValue();
+                    RaftStub stub = clientStubs.get(clientId);
+                    if (stub != null && !ackMessages.isEmpty()) {
+                        stub.sendAckToClient(Ack.newBuilder().addAllAckMessage(ackMessages).build(),
+                                new StreamObserver<Empty>() {
+                                    @Override public void onNext(Empty value) {}
+                                    @Override public void onError(Throwable t) {}
+                                    @Override public void onCompleted() {}
+                                });
+                    }
+                }
+            });
         }
     }
 
@@ -1925,8 +1980,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             // Store system TPS (timestamp, tps) in a separate CSV row for each batch
             int n = currentBatch.size();
             TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
-
-            // currentBatch is already List<TransactionOption>, no conversion needed
+            double currentTokens = tokenBucketData.getTokenCount();
+            long lastUpdate = tokenBucketData.getLastUpdateTime();
 
             // Build writeConcern TPS map
             int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -2029,19 +2084,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 System.err.println("Failed to write system TPS to system_latency.csv: " + e.getMessage());
             }
 
+            // Build readConcern latency map
+            HashMap<ReadConcern, Double> readConcernLatencyMap = new HashMap<>();
+            for (ReadConcern rc : ReadConcern.values()) {
+                if (rc == ReadConcern.UNRECOGNIZED) continue;
+                readConcernLatencyMap.put(rc, (double) getAverageReadConcernLatency(rc));
+            }
+
+            boolean isLeader = (currentLeader == serverId);
+
             result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(currentBatch,
                     currentLatency, wcLatencyMap, wcTpsMap,
                     getIncomingTransactionsRate(),
-                    backLogTransactions, backlogTracker.isIncreasing());
+                    backLogTransactions, backlogTracker.isIncreasing(), currentTokens,
+                    readConcernLatencyMap, isLeader);
 
             // Save result for next RL prediction
             previousBatchResult = result;
 
-            // updating the token count here (updating in redis)
-            // tokenBucket.updateTokens((currentTokens - (result.tokensUsed)), lastUpdate);
+            // Update the token count in Redis after batch processing
+            double remainingTokens = Math.max(0, currentTokens - result.tokensUsed);
+            tokenBucket.updateTokens(remainingTokens, lastUpdate);
+
             System.out.printf(
-                    "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Transactions Upgraded : %d%n",
-                    result.profit, currentTps, 0.0, result.tokensUsed, result.transactionsUpgraded);
+                    "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Remaining Tokens: %.2f | Transactions Upgraded : %d%n",
+                    result.profit, currentTps, currentTokens, result.tokensUsed, remainingTokens, result.transactionsUpgraded);
             try (FileWriter fw = new FileWriter("tps.csv", true); PrintWriter out = new PrintWriter(fw)) {
 
                 // Write header only if file is empty
@@ -2050,7 +2117,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
                 // Write data row
-                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, currentTps, 0.0, result.tokensUsed,
+                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, currentTps, currentTokens, result.tokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();
@@ -2118,35 +2185,87 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return freshCount >= (NUM_OF_SERVERS / 2);
     }
 
-    // need to review the logic
-    @Override
-    public void sendReadRequest(ClientReadRequest readRequest, StreamObserver<Ack> responseObserver) {
-        ReadConcern readConcern = readRequest.getReadConcern();
+    /**
+     * Record latency for a specific ReadConcern (mirrors writeConcern latency tracking).
+     * Uses a 5-second sliding window.
+     */
+    private void recordReadConcernLatency(ReadConcern readConcern, long arrivalTime) {
+        int key = readConcern.getNumber();
+        synchronized (readConcernLatencyLocks.get(key)) {
+            long now = System.currentTimeMillis();
+            long currentLatency = now - arrivalTime;
+            Deque<Latency> latencies = readConcernLatencies.get(key);
+            while (!latencies.isEmpty() && (now - latencies.peek().timestamp) >= 5000L) {
+                Latency old = latencies.poll();
+                readConcernLatencySum.put(key, readConcernLatencySum.get(key) - old.latency);
+            }
+            latencies.add(new Latency(now, currentLatency));
+            readConcernLatencySum.put(key, readConcernLatencySum.get(key) + currentLatency);
+        }
+    }
 
-        String accName = readRequest.getAccNameToRead();
-        ReadLevel readLevel = readRequest.getReadLevel();
-        String host = readRequest.getCallbackHost();
-        int port = readRequest.getCallbackPort();
-        String id = readRequest.getId();
+    public long getAverageReadConcernLatency(ReadConcern readConcern) {
+        int key = readConcern.getNumber();
+        synchronized (readConcernLatencyLocks.get(key)) {
+            return readConcernLatencySum.get(key)
+                    / Math.max(readConcernLatencies.get(key).size(), 1);
+        }
+    }
+
+    private Ack getBalanceBasedOnReadLevel(ReadLevel readLevel, String accName, String id) {
+        if (readLevel == ReadLevel.LOCAL) {
+            return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
+                    .setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
+        } else {
+            return Ack.newBuilder()
+                    .addAckMessage(AckMessage.newBuilder().setAccName(accName)
+                            .setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build())
+                    .build();
+        }
+    }
+
+    /**
+     * Process a read request from the batch.
+     * Returns an Ack for immediate reads (EVENTUAL), or null when the result
+     * is sent asynchronously (CAUSAL via callback) or goes through log replication (LINEARIZABLE).
+     */
+    public Ack processReadRequest(ClientMessage cm) {
+        Transaction t = cm.getT();
+        String accName = t.getAccNameToRead();
+        String id = t.getId();
+        ReadLevel readLevel = t.getReadLevel();
+        String host = cm.getCallbackHost();
+        int port = cm.getCallbackPort();
+        ReadConcern readConcern = t.getReadConcern();
+        long arrivalTime = t.getTransactionArrivalTimeOnLeader();
 
         int majority = (NUM_OF_SERVERS / 2) + 1;
 
         if (readConcern == ReadConcern.CAUSAL) {
-            // causal consistency
+            // Causal: async wait for log to catch up to client's timestamp, then ack via callback
             HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp
-                    .convertToTimeStamp(readRequest.getTimeStamp());
+                    .convertToTimeStamp(cm.getTimeStamp());
 
             long startTime = System.nanoTime();
             long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
+
+            String clientId = getClientId(host, port);
+            RaftStub clientStub = clientStubs.computeIfAbsent(clientId, k -> createClientStub(host, port));
+
             Runnable checkLogTask = new Runnable() {
                 @Override
                 public void run() {
                     if (System.nanoTime() - startTime > maxWaitNanos) {
-                        responseObserver.onNext(Ack.newBuilder()
-                                .addAckMessage(
-                                        AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-                                .build());
-                        responseObserver.onCompleted();
+                        // Timeout — record latency and send failure ack to client
+                        recordReadConcernLatency(readConcern, arrivalTime);
+                        Ack failAck = Ack.newBuilder()
+                                .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+                                .build();
+                        clientStub.sendAckToClient(failAck, new StreamObserver<Empty>() {
+                            @Override public void onNext(Empty value) {}
+                            @Override public void onError(Throwable t) {}
+                            @Override public void onCompleted() {}
+                        });
                         return;
                     }
                     LogEntry entry = null;
@@ -2161,58 +2280,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         lock.readLock().unlock();
                     }
                     if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
+                        // Log has caught up — serve the read
                         synchronized (systemWideThroughput) {
                             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
                         }
-                        // log has caught up, safe to read
-                        responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
-                        responseObserver.onCompleted();
+                        recordReadConcernLatency(readConcern, arrivalTime);
+                        Ack ack = getBalanceBasedOnReadLevel(readLevel, accName, id);
+                        clientStub.sendAckToClient(ack, new StreamObserver<Empty>() {
+                            @Override public void onNext(Empty value) {}
+                            @Override public void onError(Throwable t) {}
+                            @Override public void onCompleted() {}
+                        });
                     } else {
-                        // still behind, schedule again after a short delay
-                        causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
+                        // Still behind, retry after 20ms
+                        causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS);
                     }
                 }
             };
             causalReadScheduler.execute(checkLogTask);
+            return null; // ack sent asynchronously via callback
 
         } else if (readConcern == ReadConcern.LINEARIZABLE) {
-            // this readRequest should go to leader
-            // here we check if election is happening or not
-            // if election is happening send failure, client can try again
-            // this read lock is required because in isElection we are using shared
-            // variables and we do not wait for the rpc call to complete before releasing
-            // the lock it is async
+            // Linearizable reads must go through the Raft log with writeConcern = majority.
+            // Only the true leader (with quorum) can commit — a stale leader in a
+            // network partition will never get majority acks, so the read won't be served.
             lock.readLock().lock();
             try {
                 if (status != ServerCurrentStatus.LEADER) {
-                    if (currentLeader == -1) {
-                        responseObserver.onNext(Ack.newBuilder()
-                                .addAckMessage(
-                                        AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-                                .build());
-                        responseObserver.onCompleted();
-                    } else {
-                        // redirect to leader
-                        stubs[currentLeader].sendReadRequest(readRequest, new StreamObserver<Ack>() {
-                            @Override
-                            public void onNext(Ack ack) {
-                                responseObserver.onNext(ack);
-                            }
-
-                            @Override
-                            public void onError(Throwable throwable) {
-                                responseObserver.onNext(Ack.newBuilder().addAckMessage(
-                                        AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-                                        .build());
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                responseObserver.onCompleted();
-                            }
-                        });
-                    }
-                    return;
+                    // not the leader, can't handle linearizable read
+                    return null;
                 }
             } finally {
                 lock.readLock().unlock();
@@ -2221,47 +2317,171 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             try {
                 ClientMessage clientMessage = ClientMessage.newBuilder().setWriteConcern(majority)
                         .setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority)
-                                .setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build())
+                                .setMinRequiredConsistency(majority).setAccNameToRead(accName)
+                                .setReadConcern(readConcern).setReadLevel(readLevel)
+                                .setTransactionArrivalTimeOnLeader(arrivalTime).build())
                         .setCallbackHost(host).setCallbackPort(port).build();
                 batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
             } finally {
                 batchLock.unlock();
             }
-            // responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
-            // responseObserver.onCompleted();
-            // if (!canServeLinearizableRead()) {
-            // responseObserver.onNext(Ack.newBuilder()
-            // .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-            // .build());
-            // responseObserver.onCompleted();
-            // return;
-            // }
-            synchronized (systemWideThroughput) {
-                recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
-            }
-            responseObserver.onNext(getBalanceBasedOnReadConcern(ReadLevel.MAJORITY, accName, id));
-            responseObserver.onCompleted();
+            // Latency recorded when the ack is actually sent after majority replication
+            return null;
+
         } else {
-            // here the readConcern is just local
+            // EVENTUAL: serve immediately from latest local state
             synchronized (systemWideThroughput) {
                 recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
             }
-            responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
-            responseObserver.onCompleted();
+            recordReadConcernLatency(readConcern, arrivalTime);
+            return getBalanceBasedOnReadLevel(readLevel, accName, id);
         }
     }
 
-    private Ack getBalanceBasedOnReadConcern(ReadLevel readLevel, String accName, String id) {
-        if (readLevel == ReadLevel.LOCAL) {
-            return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
-                    .setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
-        } else {
-            return Ack.newBuilder()
-                    .addAckMessage(AckMessage.newBuilder().setAccName(accName)
-                            .setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build())
-                    .build();
-        }
-    }
+    // // need to review the logic
+    // @Override
+    // public void sendReadRequest(ClientReadRequest readRequest, StreamObserver<Ack> responseObserver) {
+    //     ReadConcern readConcern = readRequest.getReadConcern();
+
+    //     String accName = readRequest.getAccNameToRead();
+    //     ReadLevel readLevel = readRequest.getReadLevel();
+    //     String host = readRequest.getCallbackHost();
+    //     int port = readRequest.getCallbackPort();
+    //     String id = readRequest.getId();
+
+    //     int majority = (NUM_OF_SERVERS / 2) + 1;
+
+    //     if (readConcern == ReadConcern.CAUSAL) {
+    //         // causal consistency
+    //         HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp
+    //                 .convertToTimeStamp(readRequest.getTimeStamp());
+
+    //         long startTime = System.nanoTime();
+    //         long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
+    //         Runnable checkLogTask = new Runnable() {
+    //             @Override
+    //             public void run() {
+    //                 if (System.nanoTime() - startTime > maxWaitNanos) {
+    //                     responseObserver.onNext(Ack.newBuilder()
+    //                             .addAckMessage(
+    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+    //                             .build());
+    //                     responseObserver.onCompleted();
+    //                     return;
+    //                 }
+    //                 LogEntry entry = null;
+    //                 lock.readLock().lock();
+    //                 try {
+    //                     if (readLevel == ReadLevel.MAJORITY) {
+    //                         entry = log.get(commitIndex.get());
+    //                     } else {
+    //                         entry = log.get(log.size() - 1);
+    //                     }
+    //                 } finally {
+    //                     lock.readLock().unlock();
+    //                 }
+    //                 if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
+    //                     synchronized (systemWideThroughput) {
+    //                         recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
+    //                     }
+    //                     // log has caught up, safe to read
+    //                     responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
+    //                     responseObserver.onCompleted();
+    //                 } else {
+    //                     // still behind, schedule again after a short delay
+    //                     causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
+    //                 }
+    //             }
+    //         };
+    //         causalReadScheduler.execute(checkLogTask);
+
+    //     } else if (readConcern == ReadConcern.LINEARIZABLE) {
+    //         // this readRequest should go to leader
+    //         // here we check if election is happening or not
+    //         // if election is happening send failure, client can try again
+    //         // this read lock is required because in isElection we are using shared
+    //         // variables and we do not wait for the rpc call to complete before releasing
+    //         // the lock it is async
+    //         lock.readLock().lock();
+    //         try {
+    //             if (status != ServerCurrentStatus.LEADER) {
+    //                 if (currentLeader == -1) {
+    //                     responseObserver.onNext(Ack.newBuilder()
+    //                             .addAckMessage(
+    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+    //                             .build());
+    //                     responseObserver.onCompleted();
+    //                 } else {
+    //                     // redirect to leader
+    //                     stubs[currentLeader].sendReadRequest(readRequest, new StreamObserver<Ack>() {
+    //                         @Override
+    //                         public void onNext(Ack ack) {
+    //                             responseObserver.onNext(ack);
+    //                         }
+
+    //                         @Override
+    //                         public void onError(Throwable throwable) {
+    //                             responseObserver.onNext(Ack.newBuilder().addAckMessage(
+    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+    //                                     .build());
+    //                         }
+
+    //                         @Override
+    //                         public void onCompleted() {
+    //                             responseObserver.onCompleted();
+    //                         }
+    //                     });
+    //                 }
+    //                 return;
+    //             }
+    //         } finally {
+    //             lock.readLock().unlock();
+    //         }
+    //         batchLock.lock();
+    //         try {
+    //             ClientMessage clientMessage = ClientMessage.newBuilder().setWriteConcern(majority)
+    //                     .setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority)
+    //                             .setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build())
+    //                     .setCallbackHost(host).setCallbackPort(port).build();
+    //             batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
+    //         } finally {
+    //             batchLock.unlock();
+    //         }
+    //         // responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
+    //         // responseObserver.onCompleted();
+    //         // if (!canServeLinearizableRead()) {
+    //         // responseObserver.onNext(Ack.newBuilder()
+    //         // .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+    //         // .build());
+    //         // responseObserver.onCompleted();
+    //         // return;
+    //         // }
+    //         synchronized (systemWideThroughput) {
+    //             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
+    //         }
+    //         responseObserver.onNext(getBalanceBasedOnReadConcern(ReadLevel.MAJORITY, accName, id));
+    //         responseObserver.onCompleted();
+    //     } else {
+    //         // here the readConcern is just local
+    //         synchronized (systemWideThroughput) {
+    //             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
+    //         }
+    //         responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
+    //         responseObserver.onCompleted();
+    //     }
+    // }
+
+    // private Ack getBalanceBasedOnReadConcern(ReadLevel readLevel, String accName, String id) {
+    //     if (readLevel == ReadLevel.LOCAL) {
+    //         return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
+    //                 .setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
+    //     } else {
+    //         return Ack.newBuilder()
+    //                 .addAckMessage(AckMessage.newBuilder().setAccName(accName)
+    //                         .setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build())
+    //                 .build();
+    //     }
+    // }
 
     @Override
     public void printLog(Empty request, StreamObserver<Empty> responseObserver) {

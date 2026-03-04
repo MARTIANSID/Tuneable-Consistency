@@ -96,6 +96,7 @@ message Transaction {
   ReadConcern readConcern = 15;
   int32 applicationId = 16;
   int64 transactionArrivalTimeOnLeader = 17;
+  ReadLevel readLevel = 18;
 }
 message LogEntryProto {
   int32 logIndex = 1;

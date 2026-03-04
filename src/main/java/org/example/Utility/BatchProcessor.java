@@ -5,10 +5,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.Map;
+import org.ds.paxos.ReadConcern;
+import org.ds.paxos.Transaction;
 
 import org.ds.paxos.ClientMessage;
 
@@ -27,6 +30,7 @@ public class BatchProcessor {
     private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
     private static final double MIN_TPS_OF_MAJORITY = 10500.0; // Minimum TPS expected from majority writes
 
+
     public BatchProcessor(int numOfServers) {
         this.NUM_OF_SERVERS = numOfServers;
         // Initialize system start time on first BatchProcessor creation
@@ -41,6 +45,14 @@ public class BatchProcessor {
     private static final HashMap<Integer, Double> MIN_HASH_MAP = new HashMap<>() {{
         put(1, 50000.0);
         put(2, 12000.0);
+    }};
+    
+    private static final double writeCost = 1.0;
+
+    private static final HashMap<ReadConcern, Double> token_costs = new HashMap<>(){{
+            put(ReadConcern.CAUSAL, 1.5);
+            put(ReadConcern.LINEARIZABLE, 2.0);
+            put(ReadConcern.EVENTUAL, 0.1);
     }};
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
@@ -107,6 +119,27 @@ public class BatchProcessor {
         for (int wc : consistencyLevels) {
             if (wc > 0) {
                 sum += getMaxLatency(wc, wcLatencyMap);
+                count++;
+            }
+        }
+        return (count == 0) ? currentLatency : sum / (1 + count);
+    }
+
+    /**
+     * Overloaded: Calculate average Latency using ConsistencyAssignment[]
+     */
+    private double calculateAvgLatency(double currentLatency, ConsistencyAssignment[] assignments,
+                                        HashMap<Integer, Double> wcLatencyMap,
+                                        HashMap<ReadConcern, Double> readConcernLatencyMap) {
+        double sum = currentLatency;
+        int count = 0;
+        for (ConsistencyAssignment a : assignments) {
+            if (!a.isDeferred()) {
+                if (a.isReadOnly) {
+                    sum += readConcernLatencyMap.getOrDefault(a.readConcern, 0.0);
+                } else {
+                    sum += getMaxLatency(a.writeConcern, wcLatencyMap);
+                }
                 count++;
             }
         }
@@ -465,30 +498,29 @@ public class BatchProcessor {
     HashMap<Integer, Double> wcLatencyMap,
     HashMap<Integer, Double> wcTpsMap,
     int incomingRateOfTransactions,
-    Set<String> backLogTransactions, boolean isBackLogIncreasing) {
+    Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
+    HashMap<ReadConcern, Double> readConcernLatencyMap, boolean isLeader) {
 
     int n = batch.size();
-    double finalBatchAvgLatency;
 
     if (n == 0) {
         return new ProcessResult(new ArrayList<>(), 0, 0, 0);
     }
 
     int majority = (NUM_OF_SERVERS / 2) + 1;
-    int[] consistencyLevels = new int[n];
+    ConsistencyAssignment[] assignments = new ConsistencyAssignment[n];
     double profit = 0;
     int transactionsUpgraded = 0;
 
     // Step 1: Initialize all at minimum consistency
     for (int i = 0; i < n; i++) {
-        consistencyLevels[i] = batch.get(i).minRequiredConsistency;
+        TransactionOption txInit = batch.get(i);
+        assignments[i] = new ConsistencyAssignment(txInit.minRequiredConsistency, txInit.readConcern, txInit.isReadOnly);
     }
 
     // Step 2: Single pass — build count map, profit lookup maps, and batch index
-    // appWcCount:              appId -> (wc -> count)
-    // appIntermediateProfitMap: appId -> extraIntermediateProfit  (uniform per appId)
-    // appMajorityProfitMap:     appId -> extraMajorityProfit      (uniform per appId)
-    // appWcBatchIndex:          appId -> (wc -> list of batch indices)
+    // Write maps: appId -> (wc -> count/indices)
+    // Read maps:  appId -> (readConcern# -> count/indices)
     HashMap<Integer, HashMap<Integer, Integer>> appWcCount = new HashMap<>();
     HashMap<Integer, Double> appIntermediateProfitMap = new HashMap<>();
     HashMap<Integer, Double> appMajorityProfitMap = new HashMap<>();
@@ -496,36 +528,56 @@ public class BatchProcessor {
     HashMap<Integer, Double> appBaseProfitMap = new HashMap<>();
     HashMap<Integer, HashMap<Integer,HashMap<Integer,Integer>>> wcUpgradesMap = new HashMap<>();
 
+    // Read transaction maps — keyed by ReadConcern number
+    HashMap<Integer, HashMap<Integer, Integer>> appReadConcernCount = new HashMap<>();
+    HashMap<Integer, HashMap<Integer, List<Integer>>> appReadConcernBatchIndex = new HashMap<>();
+    HashMap<Integer, HashMap<Integer, HashMap<Integer, Integer>>> readConcernUpgradesMap = new HashMap<>();
 
     for (int i = 0; i < n; i++) {
         TransactionOption tx = batch.get(i);
         int appId = tx.applicationId;
-        int wc = tx.minRequiredConsistency;
 
-        appWcCount
-            .computeIfAbsent(appId, k -> new HashMap<>())
-            .merge(wc, 1, Integer::sum);
-
+        // Shared profit maps
         appIntermediateProfitMap.putIfAbsent(appId, tx.extraIntermediateProfit);
         appMajorityProfitMap.putIfAbsent(appId, tx.extraMajorityProfit);
-
-        appWcBatchIndex
-            .computeIfAbsent(appId, k -> new HashMap<>())
-            .computeIfAbsent(wc, k -> new ArrayList<>())
-            .add(i);
         appBaseProfitMap.putIfAbsent(appId, tx.baseProfit);
 
-        // this stores {appId : {wc : {upgrades od this wc to higher level}}}
-        wcUpgradesMap
-            .computeIfAbsent(appId, k -> new HashMap<>())
-            .computeIfAbsent(wc, k -> new HashMap<>());
+        if (tx.isReadOnly) {
+            // Read transaction — group by ReadConcern
+            int rc = tx.readConcern.getNumber();
+            appReadConcernCount
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .merge(rc, 1, Integer::sum);
+            appReadConcernBatchIndex
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .computeIfAbsent(rc, k -> new ArrayList<>())
+                .add(i);
+            readConcernUpgradesMap
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .computeIfAbsent(rc, k -> new HashMap<>());
+        } else {
+            // Write transaction — group by writeConcern
+            int wc = tx.minRequiredConsistency;
+            appWcCount
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .merge(wc, 1, Integer::sum);
+            appWcBatchIndex
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .computeIfAbsent(wc, k -> new ArrayList<>())
+                .add(i);
+            wcUpgradesMap
+                .computeIfAbsent(appId, k -> new HashMap<>())
+                .computeIfAbsent(wc, k -> new HashMap<>());
+        }
     }
 
     System.out.println("App-WC Count Map:");
     System.out.println(appWcCount);
+    System.out.println("App-ReadConcern Count Map:");
+    System.out.println(appReadConcernCount);
 
     // Step 3: Calculate avgLatency with all transactions at min consistency
-    double avgLatency = calculateAvgLatency(currentLatency, consistencyLevels, wcLatencyMap);
+    double avgLatency = calculateAvgLatency(currentLatency, assignments, wcLatencyMap, readConcernLatencyMap);
 
     System.out.printf("[APP Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
             currentLatency, avgLatency, MAX_LATENCY);
@@ -536,8 +588,9 @@ public class BatchProcessor {
     }
     System.out.println();
 
-    // Step 4: Check if we can execute all
-    if (avgLatency <= MAX_LATENCY) {
+    // Step 4: Check if we can execute all (latency + token budget)
+    double totalTokenCost = calculateTotalTokenCost(batch, assignments);
+    if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
             profit += batch.get(i).baseProfit;
@@ -549,12 +602,13 @@ public class BatchProcessor {
                 && currentLatency < MAX_LATENCY
                 && isBackLogIncreasing == false) {
 
-            // PQ: ranked by per-t ransaction ratio (profit per unit latency cost)
+            // PQ: unified for write-WC upgrades and read-RC upgrades
+            // ranked by per-transaction ratio (profit per unit cost)
             PriorityQueue<AppUpgradeOption> pq = new PriorityQueue<>(
                     (a, b) -> Double.compare(b.ratio, a.ratio)
             );
 
-            // Seed PQ: for every app, for every WC level that can go higher
+            // === Seed write upgrades: for every app, for every WC level that can go higher ===
             for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appWcCount.entrySet()) {
                 int appId = appEntry.getKey();
                 for (Map.Entry<Integer, Integer> wcEntry : appEntry.getValue().entrySet()) {
@@ -565,84 +619,139 @@ public class BatchProcessor {
                     int toWC = fromWC + 1;
                     double latencyIncPerTx = getMaxLatency(toWC, wcLatencyMap) - getMaxLatency(fromWC, wcLatencyMap);
 
-                    // O(1) profit lookup — keyed by appId only
                     double perTxProfit = (toWC == majority)
                             ? appMajorityProfitMap.get(appId)
                             : appIntermediateProfitMap.get(appId);
 
                     double ratio = (latencyIncPerTx > EPS) ? perTxProfit / latencyIncPerTx : Double.MAX_VALUE;
-                    pq.add(new AppUpgradeOption(appId, fromWC, toWC, count, ratio, fromWC));
+                    pq.add(new AppUpgradeOption(appId, fromWC, toWC, count, ratio, fromWC,
+                            false, 0.0)); // isReadUpgrade=false
                 }
             }
 
-            // Step 6: Greedy upgrade loop — only counts are mutated, no array writes
+            // === Seed read upgrades: EVENTUAL → target (LINEARIZABLE on leader, CAUSAL on follower) ===
+            ReadConcern targetRC = isLeader ? ReadConcern.LINEARIZABLE : ReadConcern.CAUSAL;
+            int targetRCNum = targetRC.getNumber();
+            int eventualRCNum = ReadConcern.EVENTUAL.getNumber();
+            double targetRCLatency = readConcernLatencyMap.getOrDefault(targetRC, Double.MAX_VALUE);
+            double tokenCostIncrease = token_costs.getOrDefault(targetRC, 0.0)
+                    - token_costs.getOrDefault(ReadConcern.EVENTUAL, 0.1);
+            double tokensUsedSoFar = calculateTotalTokenCost(batch, assignments);
+
+            if (targetRCLatency <= MAX_LATENCY) {
+                for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appReadConcernCount.entrySet()) {
+                    int appId = appEntry.getKey();
+                    int eventualCount = appEntry.getValue().getOrDefault(eventualRCNum, 0);
+                    if (eventualCount == 0) continue;
+
+                    double perTxProfit = (targetRC == ReadConcern.LINEARIZABLE)
+                            ? appMajorityProfitMap.getOrDefault(appId, 0.0)
+                            : appIntermediateProfitMap.getOrDefault(appId, 0.0);
+                    // Use tokenCostIncrease as the "cost" dimension for ratio
+                    double ratio = (tokenCostIncrease > EPS)
+                            ? perTxProfit / tokenCostIncrease : Double.MAX_VALUE;
+                    pq.add(new AppUpgradeOption(appId, eventualRCNum, targetRCNum, eventualCount,
+                            ratio, eventualRCNum, true, tokenCostIncrease));
+                }
+            }
+
+            // Step 6: Unified greedy upgrade loop
             while (!pq.isEmpty()) {
                 AppUpgradeOption opt = pq.poll();
 
-                int currentCount = appWcCount.getOrDefault(opt.appId, new HashMap<>()).getOrDefault(opt.fromWC, 0);
-                if (currentCount == 0) continue;
+                if (opt.isReadUpgrade) {
+                    // --- Read upgrade (EVENTUAL → target) ---
+                    int currentCount = appReadConcernCount
+                            .getOrDefault(opt.appId, new HashMap<>())
+                            .getOrDefault(opt.fromWC, 0);
+                    if (currentCount == 0) continue;
 
-                double latencyIncPerTx = getMaxLatency(opt.toWC, wcLatencyMap) - getMaxLatency(opt.fromWC, wcLatencyMap);
-                double remainingHeadroom = (MAX_LATENCY * UPGRADE_LATENCY_FLOOR - avgLatency) * (n + 1);
+                    // Check token budget
+                    double remainingTokenBudget = currentTokens - tokensUsedSoFar;
+                    int maxAffordable = (opt.tokenCostPerTx > EPS)
+                            ? (int) Math.floor(remainingTokenBudget / opt.tokenCostPerTx)
+                            : currentCount;
+                    int toUpgrade = Math.min(currentCount, maxAffordable);
+                    if (toUpgrade <= 0) continue;
 
-                int maxAffordable = (latencyIncPerTx > EPS)
-                        ? (int) Math.floor(remainingHeadroom / latencyIncPerTx)
-                        : currentCount;
+                    tokensUsedSoFar += opt.tokenCostPerTx * toUpgrade;
+                    appReadConcernCount.get(opt.appId).put(opt.fromWC, currentCount - toUpgrade);
+                    appReadConcernCount.get(opt.appId).merge(opt.toWC, toUpgrade, Integer::sum);
+                    transactionsUpgraded += toUpgrade;
 
-                int toUpgrade = Math.min(currentCount, maxAffordable);
-                if (toUpgrade <= 0) continue;
+                    readConcernUpgradesMap.get(opt.appId).get(opt.originalWc)
+                            .put(opt.toWC, readConcernUpgradesMap.get(opt.appId)
+                                    .get(opt.originalWc).getOrDefault(opt.toWC, 0) + toUpgrade);
 
-                // Only update counts — no array writes yet
-                avgLatency += (latencyIncPerTx * toUpgrade) / (n + 1);
-                appWcCount.get(opt.appId).put(opt.fromWC, currentCount - toUpgrade);
-                appWcCount.get(opt.appId).merge(opt.toWC, toUpgrade, Integer::sum);
-                transactionsUpgraded += toUpgrade;
+                    double perTxProfit = (targetRC == ReadConcern.LINEARIZABLE)
+                            ? appMajorityProfitMap.getOrDefault(opt.appId, 0.0)
+                            : appIntermediateProfitMap.getOrDefault(opt.appId, 0.0);
+                    profit += toUpgrade * perTxProfit;
 
-                // O(1) profit lookup — keyed by appId only
-                profit += toUpgrade * ((opt.toWC == majority)
-                        ? appMajorityProfitMap.get(opt.appId)
-                        : appIntermediateProfitMap.get(opt.appId));
+                } else {
+                    // --- Write upgrade (WC level bump) ---
+                    int currentCount = appWcCount.getOrDefault(opt.appId, new HashMap<>()).getOrDefault(opt.fromWC, 0);
+                    if (currentCount == 0) continue;
 
-                // now we update the wcUpgradesMap to reflect the upgrades that we just did
-                // first we increase the number of upgrades of toWc
-                int originalWc = opt.originalWc;
-                wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.toWC, wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.toWC, 0) + toUpgrade);
+                    double latencyIncPerTx = getMaxLatency(opt.toWC, wcLatencyMap) - getMaxLatency(opt.fromWC, wcLatencyMap);
+                    double remainingHeadroom = (MAX_LATENCY * UPGRADE_LATENCY_FLOOR - avgLatency) * (n + 1);
 
-                // decrease the number of upgrades of fromWc 
-                if(opt.fromWC != originalWc) {
-                    wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.fromWC, wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.fromWC, 0) - toUpgrade);
-                }
+                    int maxAffordable = (latencyIncPerTx > EPS)
+                            ? (int) Math.floor(remainingHeadroom / latencyIncPerTx)
+                            : currentCount;
 
-                // Seed next level if still below majority
-                if (opt.toWC < majority) {
-                    int nowAtToWC = appWcCount.get(opt.appId).getOrDefault(opt.toWC, 0);
-                    if (nowAtToWC > 0) {
-                        int nextWC = opt.toWC + 1;
-                        double nextLatencyIncPerTx = getMaxLatency(nextWC, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
+                    int toUpgrade = Math.min(currentCount, maxAffordable);
+                    if (toUpgrade <= 0) continue;
 
-                        // O(1) profit lookup — keyed by appId only
-                        double nextPerTxProfit = (nextWC == majority)
-                                ? appMajorityProfitMap.get(opt.appId)
-                                : appIntermediateProfitMap.get(opt.appId);
+                    avgLatency += (latencyIncPerTx * toUpgrade) / (n + 1);
+                    appWcCount.get(opt.appId).put(opt.fromWC, currentCount - toUpgrade);
+                    appWcCount.get(opt.appId).merge(opt.toWC, toUpgrade, Integer::sum);
+                    transactionsUpgraded += toUpgrade;
 
-                        double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
-                        pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC, nextRatio, originalWc));
+                    profit += toUpgrade * ((opt.toWC == majority)
+                            ? appMajorityProfitMap.get(opt.appId)
+                            : appIntermediateProfitMap.get(opt.appId));
+
+                    int originalWc = opt.originalWc;
+                    wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.toWC,
+                            wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.toWC, 0) + toUpgrade);
+                    if (opt.fromWC != originalWc) {
+                        wcUpgradesMap.get(opt.appId).get(originalWc).put(opt.fromWC,
+                                wcUpgradesMap.get(opt.appId).get(originalWc).getOrDefault(opt.fromWC, 0) - toUpgrade);
+                    }
+
+                    // Seed next write level if still below majority
+                    if (opt.toWC < majority) {
+                        int nowAtToWC = appWcCount.get(opt.appId).getOrDefault(opt.toWC, 0);
+                        if (nowAtToWC > 0) {
+                            int nextWC = opt.toWC + 1;
+                            double nextLatencyIncPerTx = getMaxLatency(nextWC, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
+                            double nextPerTxProfit = (nextWC == majority)
+                                    ? appMajorityProfitMap.get(opt.appId)
+                                    : appIntermediateProfitMap.get(opt.appId);
+                            double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
+                            pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC,
+                                    nextRatio, originalWc, false, 0.0));
+                        }
                     }
                 }
             }
 
             System.out.println("Final App-WC Count Map After Upgrades:");
             System.out.println(appWcCount);
+            System.out.println("Final App-ReadConcern Count Map After Upgrades:");
+            System.out.println(appReadConcernCount);
 
+            // Assign write upgrades to individual write transactions
             for (int i = 0; i < n; i++) {
                 TransactionOption tx = batch.get(i);
+                if (tx.isReadOnly) continue;
                 int appId = tx.applicationId;
                 int minWC = tx.minRequiredConsistency;
-                HashMap<Integer, HashMap<Integer, Integer>> wcUpgrades = wcUpgradesMap.get(appId);
+                HashMap<Integer, HashMap<Integer, Integer>> wcUpgrades = wcUpgradesMap.getOrDefault(appId, new HashMap<>());
 
-                // Assign highest available WC >= minWC that still has quota
                 int assignedWC = minWC;
-                HashMap<Integer, Integer> upgrades = wcUpgrades.get(minWC);
+                HashMap<Integer, Integer> upgrades = wcUpgrades.getOrDefault(minWC, new HashMap<>());
                 for (int wc = majority; wc >= minWC; wc--) {
                     int remaining = upgrades.getOrDefault(wc, 0);
                     if (remaining > 0) {
@@ -651,90 +760,240 @@ public class BatchProcessor {
                         break;
                     }
                 }
+                assignments[i].writeConcern = assignedWC;
+            }
 
-                consistencyLevels[i] = assignedWC;
+            // Assign read upgrades to individual read transactions
+            for (int i = 0; i < n; i++) {
+                TransactionOption tx = batch.get(i);
+                if (!tx.isReadOnly) continue;
+                int appId = tx.applicationId;
+                int originalRC = tx.readConcern.getNumber();
+                HashMap<Integer, Integer> upgrades = readConcernUpgradesMap
+                        .getOrDefault(appId, new HashMap<>())
+                        .getOrDefault(originalRC, new HashMap<>());
+                int remaining = upgrades.getOrDefault(targetRCNum, 0);
+                if (remaining > 0) {
+                    tx.readConcern = targetRC;
+                    assignments[i].readConcern = targetRC;
+                    upgrades.put(targetRCNum, remaining - 1);
+                }
             }
         }
 
-        BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
-        HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
-        System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
-                wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency);
+        // Calculate final token cost after all upgrades
+        double finalTokenCost = calculateTotalTokenCost(batch, assignments);
 
-        return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
+        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions);
+        HashMap<Integer, Integer> wcMix = countByWriteConcern(assignments);
+        System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
+                wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency, finalTokenCost);
+
+        return new ProcessResult(buildResult.executed, finalTokenCost, profit, transactionsUpgraded, buildResult.deferred);
     }
 
-    // Step 8: avgLatency > maxLatency — pressure path, app-id priority
+    // Step 8: avgLatency > maxLatency — pressure path, token-budget based
     else {
-        for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
+        // Reset all assignments to deferred
+        for (int i = 0; i < n; i++) {
+            if (assignments[i].isReadOnly) {
+                assignments[i].readConcern = null;   // null = deferred for reads
+            } else {
+                assignments[i].writeConcern = 0;     // 0 = deferred for writes
+            }
+        }
 
-        int minToProcess = Math.max(1, (int) (n * 0.7));
         int processed = 0;
-        double latencySum = currentLatency;
+        double tokensRemaining = currentTokens;
 
-        // Iterate app IDs descending (highest appId = highest profit first)
-        // Sort app IDs by base profit descending
-        List<Integer> sortedAppIds = new ArrayList<>(appWcCount.keySet());
+        // Collect all app IDs from both writes and reads, sort by base profit descending
+        Set<Integer> allAppIds = new HashSet<>(appWcCount.keySet());
+        allAppIds.addAll(appReadConcernCount.keySet());
+        List<Integer> sortedAppIds = new ArrayList<>(allAppIds);
         sortedAppIds.sort((a, b) -> Double.compare(appBaseProfitMap.get(b), appBaseProfitMap.get(a)));
 
-        outer:
+        // Pass 1: Execute all transactions with retryCount >= 2 (if tokens allow)
+        pass1:
         for (int appId : sortedAppIds) {
-
-            for (int wc = 1; wc <= majority; wc++) {
-                if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
-
-                // Use batch index directly — no scanning
-                for (int idx : appWcBatchIndex.get(appId).get(wc)) {
-                    TransactionOption tx = batch.get(idx);
-                    boolean mustExecute = tx.retryCount >= 2;
-
-                    consistencyLevels[idx] = tx.minRequiredConsistency;
-                    double minLatency = getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
-                    latencySum += minLatency;
-
-                    // processed + 1 for current tx being considered + 1 for currentLatency slot
-                    double newAvgLatency = latencySum / (processed + 2);
-
-                    if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY
-                            || wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
-                        profit += tx.baseProfit;
-                        processed++;
-                    } else {
-                        latencySum -= minLatency;  // undo latency addition
-                        consistencyLevels[idx] = 0;
-                        break outer;
+            // Writes — iterate by WC level
+            if (appWcBatchIndex.containsKey(appId)) {
+                for (int wc = 1; wc <= majority; wc++) {
+                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
+                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
+                        if (tokensRemaining <= 0) break pass1;
+                        TransactionOption tx = batch.get(idx);
+                        if (tx.retryCount < 2) continue;
+                        double cost = getTokenCost(tx);
+                        if (tokensRemaining >= cost) {
+                            assignments[idx].writeConcern = tx.minRequiredConsistency;
+                            tokensRemaining -= cost;
+                            profit += tx.baseProfit;
+                            processed++;
+                        }
+                    }
+                }
+            }
+            // Reads — iterate by ReadConcern level
+            if (appReadConcernBatchIndex.containsKey(appId)) {
+                for (Map.Entry<Integer, List<Integer>> rcEntry : appReadConcernBatchIndex.get(appId).entrySet()) {
+                    for (int idx : rcEntry.getValue()) {
+                        if (tokensRemaining <= 0) break pass1;
+                        TransactionOption tx = batch.get(idx);
+                        if (tx.retryCount < 2) continue;
+                        double cost = getTokenCost(tx);
+                        if (tokensRemaining >= cost) {
+                            assignments[idx].readConcern = tx.readConcern;
+                            tokensRemaining -= cost;
+                            profit += tx.baseProfit;
+                            processed++;
+                        }
                     }
                 }
             }
         }
 
-        finalBatchAvgLatency = latencySum / (processed + 1);
-        BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+        // Pass 2: Execute deferred transactions — lowest consistency first within each app,
+        // stop when at least 70% of batch is processed or tokens run out.
+        int minToProcess = Math.max(1, (int) (n * 0.7));
+        pass2:
+        for (int appId : sortedAppIds) {
+            // Writes — WC level ascending (lowest consistency first)
+            if (appWcBatchIndex.containsKey(appId)) {
+                for (int wc = 1; wc <= majority; wc++) {
+                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
+                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
+                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
+                        if (!assignments[idx].isDeferred()) continue;
+                        TransactionOption tx = batch.get(idx);
+                        double cost = getTokenCost(tx);
+                        if (tokensRemaining >= cost) {
+                            assignments[idx].writeConcern = tx.minRequiredConsistency;
+                            tokensRemaining -= cost;
+                            profit += tx.baseProfit;
+                            processed++;
+                        }
+                    }
+                }
+            }
+            // Reads — ReadConcern number ascending (EVENTUAL → CAUSAL → LINEARIZABLE)
+            if (appReadConcernBatchIndex.containsKey(appId)) {
+                for (int rc = 0; rc <= 2; rc++) {
+                    if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
+                    for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
+                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
+                        if (!assignments[idx].isDeferred()) continue;
+                        TransactionOption tx = batch.get(idx);
+                        double cost = getTokenCost(tx);
+                        if (tokensRemaining >= cost) {
+                            assignments[idx].readConcern = tx.readConcern;
+                            tokensRemaining -= cost;
+                            profit += tx.baseProfit;
+                            processed++;
+                        }
+                    }
+                }
+            }
+        }
 
-        System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
-                processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgLatency);
+        double tokensUsed = currentTokens - tokensRemaining;
+        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions);
 
-        return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+        System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | TokensUsed=%.2f\n",
+                processed, n, buildResult.deferred.size(), backLogTransactions.size(), tokensUsed);
+
+        return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, buildResult.deferred);
     }
 }
 
 static class AppUpgradeOption {
     int appId;
-    int fromWC;
-    int toWC;
+    int fromWC;       // for writes: WC level; for reads: ReadConcern number
+    int toWC;         // for writes: WC level; for reads: ReadConcern number
     int count;
     int originalWc;
-    double ratio; // per single transaction — not total
+    double ratio;
+    boolean isReadUpgrade;
+    double tokenCostPerTx; // only used for read upgrades
 
-    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio, int originalWc) {
+    AppUpgradeOption(int appId, int fromWC, int toWC, int count, double ratio, int originalWc,
+                     boolean isReadUpgrade, double tokenCostPerTx) {
         this.appId = appId;
         this.fromWC = fromWC;
         this.toWC = toWC;
         this.count = count;
         this.ratio = ratio;
         this.originalWc = originalWc;
+        this.isReadUpgrade = isReadUpgrade;
+        this.tokenCostPerTx = tokenCostPerTx;
     }
 }
+
+    /**
+     * Stores the assigned consistency for a transaction in the batch.
+     * For writes: writeConcern is the WC level (0 = deferred).
+     * For reads: readConcern is the assigned ReadConcern (potentially upgraded).
+     */
+    static class ConsistencyAssignment {
+        int writeConcern;        // write concern level (for write transactions; 0 = deferred)
+        ReadConcern readConcern; // read concern level (for read transactions)
+        boolean isReadOnly;      // true if this is a read transaction
+
+        ConsistencyAssignment(int writeConcern, ReadConcern readConcern, boolean isReadOnly) {
+            this.writeConcern = writeConcern;
+            this.readConcern = readConcern;
+            this.isReadOnly = isReadOnly;
+        }
+
+        boolean isDeferred() {
+            // Reads are deferred based on readConcern; writes based on writeConcern
+            if (isReadOnly) {
+                return readConcern == null;
+            }
+            return writeConcern == 0;
+        }
+    }
+
+    /**
+     * Get token cost for a single transaction.
+     * Reads cost varies by ReadConcern; writes have a flat cost.
+     */
+    private double getTokenCost(TransactionOption tx) {
+        if (tx.isReadOnly) {
+            return token_costs.getOrDefault(tx.readConcern, 0.1);
+        }
+        return writeCost;
+    }
+
+    /**
+     * Calculate total token cost for all executed (consistencyLevel > 0) transactions.
+     */
+    private double calculateTotalTokenCost(List<TransactionOption> batch, int[] consistencyLevels) {
+        double total = 0;
+        for (int i = 0; i < batch.size(); i++) {
+            if (consistencyLevels[i] > 0) {
+                total += getTokenCost(batch.get(i));
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Overloaded: Calculate total token cost using ConsistencyAssignment[].
+     * Uses the assignment's readConcern (which may have been upgraded) for reads.
+     */
+    private double calculateTotalTokenCost(List<TransactionOption> batch, ConsistencyAssignment[] assignments) {
+        double total = 0;
+        for (int i = 0; i < batch.size(); i++) {
+            if (!assignments[i].isDeferred()) {
+                if (assignments[i].isReadOnly) {
+                    total += token_costs.getOrDefault(assignments[i].readConcern, 0.1);
+                } else {
+                    total += writeCost;
+                }
+            }
+        }
+        return total;
+    }
 
 
     // create method to log the finalBatchAvgTps in csv
@@ -789,9 +1048,12 @@ static class AppUpgradeOption {
                 backLogTransactions.remove(txId);
             }
 
-
+            // Rebuild Transaction with potentially upgraded readConcern
+            Transaction updatedT = tx.clientMessage.getT().toBuilder()
+                    .setReadConcern(tx.readConcern)
+                    .build();
             ClientMessage msg = ClientMessage.newBuilder()
-                    .setT(tx.clientMessage.getT())
+                    .setT(updatedT)
                     .setWriteConcern(wc)
                     .setCallbackHost(tx.clientHost)
                     .setCallbackPort(tx.clientPort)
@@ -808,6 +1070,51 @@ static class AppUpgradeOption {
     }
 
     /**
+     * Overloaded: Build ClientMessage list using ConsistencyAssignment[].
+     * Uses the assignment's readConcern for read transactions.
+     */
+    private BuildResult buildResultMessages(List<TransactionOption> batch, ConsistencyAssignment[] assignments, Set<String> backLogTransactions) {
+        List<ClientMessage> executed = new ArrayList<>();
+        List<TransactionOption> deferred = new ArrayList<>();
+
+        for (int i = 0; i < batch.size(); i++) {
+            ConsistencyAssignment assignment = assignments[i];
+            TransactionOption tx = batch.get(i);
+            String txId = tx.clientMessage.getT().getId();
+
+            if (assignment.isDeferred()) {
+                tx.retryCount++;
+                if (tx.retryCount == 1) {
+                    backLogTransactions.add(txId);
+                }
+                deferred.add(tx);
+                continue;
+            }
+
+            if (tx.retryCount > 0) {
+                backLogTransactions.remove(txId);
+            }
+
+            Transaction updatedT = tx.clientMessage.getT().toBuilder()
+                    .setReadConcern(assignment.readConcern)
+                    .build();
+            ClientMessage msg = ClientMessage.newBuilder()
+                    .setT(updatedT)
+                    .setWriteConcern(assignment.writeConcern)
+                    .setCallbackHost(tx.clientHost)
+                    .setCallbackPort(tx.clientPort)
+                    .build();
+
+            if (tx.clientMessage.hasTimeStamp()) {
+                msg = msg.toBuilder().setTimeStamp(tx.clientMessage.getTimeStamp()).build();
+            }
+
+            executed.add(msg);
+        }
+        return new BuildResult(executed, deferred);
+    }
+
+    /**
      * Count transactions by write concern
      */
     private HashMap<Integer, Integer> countByWriteConcern(int[] consistencyLevels) {
@@ -815,6 +1122,19 @@ static class AppUpgradeOption {
         for (int wc : consistencyLevels) {
             if (wc > 0) {
                 counts.put(wc, counts.getOrDefault(wc, 0) + 1);
+            }
+        }
+        return counts;
+    }
+
+    /**
+     * Overloaded: Count transactions by write concern using ConsistencyAssignment[]
+     */
+    private HashMap<Integer, Integer> countByWriteConcern(ConsistencyAssignment[] assignments) {
+        HashMap<Integer, Integer> counts = new HashMap<>();
+        for (ConsistencyAssignment a : assignments) {
+            if (!a.isDeferred() && !a.isReadOnly) {
+                counts.put(a.writeConcern, counts.getOrDefault(a.writeConcern, 0) + 1);
             }
         }
         return counts;
