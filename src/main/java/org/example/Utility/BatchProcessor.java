@@ -11,6 +11,7 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.Map;
 import org.ds.paxos.ReadConcern;
+import org.ds.paxos.ReadLevel;
 import org.ds.paxos.Transaction;
 
 import org.ds.paxos.ClientMessage;
@@ -60,10 +61,61 @@ public class BatchProcessor {
         put(2, 3000.0); // 150 ms for W:2
      }};
 
-     private static final double MAX_LATENCY = 100.0; // Max average latency in ms
+     private static final double MAX_LATENCY = 70.0; // Max average latency in ms
      private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
+
+    private static final int RC_KEY_EVENTUAL_ALL = 0;
+    private static final int RC_KEY_CAUSAL_LOCAL = 1;
+    private static final int RC_KEY_CAUSAL_MAJORITY = 2;
+    private static final int RC_KEY_LINEARIZABLE_ALL = 3;
+
+    private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
+        if (readConcern == ReadConcern.CAUSAL) {
+            return readLevel == ReadLevel.MAJORITY ? RC_KEY_CAUSAL_MAJORITY : RC_KEY_CAUSAL_LOCAL;
+        }
+        if (readConcern == ReadConcern.LINEARIZABLE) {
+            return RC_KEY_LINEARIZABLE_ALL;
+        }
+        return RC_KEY_EVENTUAL_ALL;
+    }
+
+    private ReadConcern readConcernFromKey(int key) {
+        if (key == RC_KEY_LINEARIZABLE_ALL) {
+            return ReadConcern.LINEARIZABLE;
+        }
+        if (key == RC_KEY_CAUSAL_LOCAL || key == RC_KEY_CAUSAL_MAJORITY) {
+            return ReadConcern.CAUSAL;
+        }
+        return ReadConcern.EVENTUAL;
+    }
+
+    private ReadLevel readLevelFromKey(int key, ReadLevel fallback) {
+        if (key == RC_KEY_CAUSAL_MAJORITY || key == RC_KEY_LINEARIZABLE_ALL) {
+            return ReadLevel.MAJORITY;
+        }
+        if (key == RC_KEY_CAUSAL_LOCAL) {
+            return ReadLevel.LOCAL;
+        }
+        return fallback;
+    }
+
+    private int getNextReadKey(int fromKey, boolean isLeader) {
+        if (isLeader) {
+            if (fromKey == RC_KEY_EVENTUAL_ALL) return RC_KEY_CAUSAL_MAJORITY;
+            if (fromKey == RC_KEY_CAUSAL_LOCAL) return RC_KEY_CAUSAL_MAJORITY;
+            if (fromKey == RC_KEY_CAUSAL_MAJORITY) return RC_KEY_LINEARIZABLE_ALL;
+            return -1;
+        }
+        if (fromKey == RC_KEY_EVENTUAL_ALL) return RC_KEY_CAUSAL_LOCAL;
+        if (fromKey == RC_KEY_CAUSAL_LOCAL) return RC_KEY_CAUSAL_MAJORITY;
+        return -1;
+    }
+
+    private double getReadLatencyByKey(HashMap<Integer, Double> readLatencyByKey, int key) {
+        return readLatencyByKey.getOrDefault(key, Double.MAX_VALUE);
+    }
 
     /**
      * Check if system is still in warmup phase (first 7 seconds)
@@ -130,13 +182,14 @@ public class BatchProcessor {
      */
     private double calculateAvgLatency(double currentLatency, ConsistencyAssignment[] assignments,
                                         HashMap<Integer, Double> wcLatencyMap,
-                                        HashMap<ReadConcern, Double> readConcernLatencyMap) {
+                                        HashMap<Integer, Double> readLatencyByKey) {
         double sum = currentLatency;
         int count = 0;
         for (ConsistencyAssignment a : assignments) {
             if (!a.isDeferred()) {
                 if (a.isReadOnly) {
-                    sum += readConcernLatencyMap.getOrDefault(a.readConcern, 0.0);
+                    int key = getReadLatencyKey(a.readConcern, a.readLevel);
+                    sum += getReadLatencyByKey(readLatencyByKey, key);
                 } else {
                     sum += getMaxLatency(a.writeConcern, wcLatencyMap);
                 }
@@ -499,7 +552,7 @@ public class BatchProcessor {
     HashMap<Integer, Double> wcTpsMap,
     int incomingRateOfTransactions,
     Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
-    HashMap<ReadConcern, Double> readConcernLatencyMap, boolean isLeader) {
+    HashMap<Integer, Double> readLatencyByKey, boolean isLeader) {
 
     int n = batch.size();
 
@@ -515,7 +568,11 @@ public class BatchProcessor {
     // Step 1: Initialize all at minimum consistency
     for (int i = 0; i < n; i++) {
         TransactionOption txInit = batch.get(i);
-        assignments[i] = new ConsistencyAssignment(txInit.minRequiredConsistency, txInit.readConcern, txInit.isReadOnly);
+        assignments[i] = new ConsistencyAssignment(
+                txInit.minRequiredConsistency,
+                txInit.readConcern,
+                txInit.readLevel,
+                txInit.isReadOnly);
     }
 
     // Step 2: Single pass — build count map, profit lookup maps, and batch index
@@ -528,7 +585,7 @@ public class BatchProcessor {
     HashMap<Integer, Double> appBaseProfitMap = new HashMap<>();
     HashMap<Integer, HashMap<Integer,HashMap<Integer,Integer>>> wcUpgradesMap = new HashMap<>();
 
-    // Read transaction maps — keyed by ReadConcern number
+    // Read transaction maps — keyed by read-latency key
     HashMap<Integer, HashMap<Integer, Integer>> appReadConcernCount = new HashMap<>();
     HashMap<Integer, HashMap<Integer, List<Integer>>> appReadConcernBatchIndex = new HashMap<>();
     HashMap<Integer, HashMap<Integer, HashMap<Integer, Integer>>> readConcernUpgradesMap = new HashMap<>();
@@ -543,8 +600,8 @@ public class BatchProcessor {
         appBaseProfitMap.putIfAbsent(appId, tx.baseProfit);
 
         if (tx.isReadOnly) {
-            // Read transaction — group by ReadConcern
-            int rc = tx.readConcern.getNumber();
+            // Read transaction — group by key(readConcern, readLevel)
+            int rc = getReadLatencyKey(tx.readConcern, tx.readLevel);
             appReadConcernCount
                 .computeIfAbsent(appId, k -> new HashMap<>())
                 .merge(rc, 1, Integer::sum);
@@ -577,7 +634,7 @@ public class BatchProcessor {
     System.out.println(appReadConcernCount);
 
     // Step 3: Calculate avgLatency with all transactions at min consistency
-    double avgLatency = calculateAvgLatency(currentLatency, assignments, wcLatencyMap, readConcernLatencyMap);
+    double avgLatency = calculateAvgLatency(currentLatency, assignments, wcLatencyMap, readLatencyByKey);
 
     System.out.printf("[APP Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
             currentLatency, avgLatency, MAX_LATENCY);
@@ -629,32 +686,37 @@ public class BatchProcessor {
                 }
             }
 
-            // === Seed read upgrades: EVENTUAL → target (LINEARIZABLE on leader, CAUSAL on follower) ===
-            ReadConcern targetRC = isLeader ? ReadConcern.LINEARIZABLE : ReadConcern.CAUSAL;
-            int targetRCNum = targetRC.getNumber();
-            int eventualRCNum = ReadConcern.EVENTUAL.getNumber();
-            double targetRCLatency = readConcernLatencyMap.getOrDefault(targetRC, Double.MAX_VALUE);
-            double tokenCostIncrease = token_costs.getOrDefault(targetRC, 0.0)
-                    - token_costs.getOrDefault(ReadConcern.EVENTUAL, 0.1);
+                // === Seed read upgrades using key chain ===
             double tokensUsedSoFar = calculateTotalTokenCost(batch, assignments);
 
-            if (targetRCLatency <= MAX_LATENCY) {
-                double eventualLatency = readConcernLatencyMap.getOrDefault(ReadConcern.EVENTUAL, 0.0);
-                double readLatencyIncPerTx = targetRCLatency - eventualLatency;
-
                 for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appReadConcernCount.entrySet()) {
-                    int appId = appEntry.getKey();
-                    int eventualCount = appEntry.getValue().getOrDefault(eventualRCNum, 0);
-                    if (eventualCount == 0) continue;
+                int appId = appEntry.getKey();
+                for (Map.Entry<Integer, Integer> keyEntry : appEntry.getValue().entrySet()) {
+                    int fromKey = keyEntry.getKey();
+                    int count = keyEntry.getValue();
+                    if (count <= 0) continue;
 
-                    double perTxProfit = (targetRC == ReadConcern.LINEARIZABLE)
-                            ? appMajorityProfitMap.getOrDefault(appId, 0.0)
-                            : appIntermediateProfitMap.getOrDefault(appId, 0.0);
-                    // Use latency increase as cost dimension (same unit as write upgrades) for fair PQ ranking
+                    int toKey = getNextReadKey(fromKey, isLeader);
+                    if (toKey == -1) continue;
+
+                    double fromLatency = getReadLatencyByKey(readLatencyByKey, fromKey);
+                    double toLatency = getReadLatencyByKey(readLatencyByKey, toKey);
+                    if (toLatency > MAX_LATENCY) continue;
+                    double readLatencyIncPerTx = toLatency - fromLatency;
+
+                    ReadConcern fromConcern = readConcernFromKey(fromKey);
+                    ReadConcern toConcern = readConcernFromKey(toKey);
+                    double tokenCostIncrease = token_costs.getOrDefault(toConcern, 0.0)
+                        - token_costs.getOrDefault(fromConcern, 0.1);
+
+                    double perTxProfit = (toKey == RC_KEY_LINEARIZABLE_ALL)
+                        ? appMajorityProfitMap.getOrDefault(appId, 0.0)
+                        : appIntermediateProfitMap.getOrDefault(appId, 0.0);
                     double ratio = (readLatencyIncPerTx > EPS)
-                            ? perTxProfit / readLatencyIncPerTx : Double.MAX_VALUE;
-                    pq.add(new AppUpgradeOption(appId, eventualRCNum, targetRCNum, eventualCount,
-                            ratio, eventualRCNum, true, tokenCostIncrease));
+                        ? perTxProfit / readLatencyIncPerTx : Double.MAX_VALUE;
+
+                    pq.add(new AppUpgradeOption(appId, fromKey, toKey, count,
+                        ratio, fromKey, true, tokenCostIncrease));
                 }
             }
 
@@ -663,7 +725,7 @@ public class BatchProcessor {
                 AppUpgradeOption opt = pq.poll();
 
                 if (opt.isReadUpgrade) {
-                    // --- Read upgrade (EVENTUAL → target) ---
+                        // --- Read upgrade (key(from) -> key(to)) ---
                     int currentCount = appReadConcernCount
                             .getOrDefault(opt.appId, new HashMap<>())
                             .getOrDefault(opt.fromWC, 0);
@@ -676,8 +738,8 @@ public class BatchProcessor {
                             : currentCount;
 
                     // Check latency headroom (same constraint as write upgrades)
-                    double readLatencyInc = readConcernLatencyMap.getOrDefault(targetRC, 0.0)
-                            - readConcernLatencyMap.getOrDefault(ReadConcern.forNumber(opt.fromWC), 0.0);
+                        double readLatencyInc = getReadLatencyByKey(readLatencyByKey, opt.toWC)
+                            - getReadLatencyByKey(readLatencyByKey, opt.fromWC);
                     double remainingHeadroom = (MAX_LATENCY * UPGRADE_LATENCY_FLOOR - avgLatency) * (n + 1);
                     int maxByLatency = (readLatencyInc > EPS)
                             ? (int) Math.floor(remainingHeadroom / readLatencyInc)
@@ -695,11 +757,37 @@ public class BatchProcessor {
                     readConcernUpgradesMap.get(opt.appId).get(opt.originalWc)
                             .put(opt.toWC, readConcernUpgradesMap.get(opt.appId)
                                     .get(opt.originalWc).getOrDefault(opt.toWC, 0) + toUpgrade);
+                        if (opt.fromWC != opt.originalWc) {
+                        readConcernUpgradesMap.get(opt.appId).get(opt.originalWc)
+                            .put(opt.fromWC, readConcernUpgradesMap.get(opt.appId)
+                                .get(opt.originalWc).getOrDefault(opt.fromWC, 0) - toUpgrade);
+                        }
 
-                    double perTxProfit = (targetRC == ReadConcern.LINEARIZABLE)
+                        double perTxProfit = (opt.toWC == RC_KEY_LINEARIZABLE_ALL)
                             ? appMajorityProfitMap.getOrDefault(opt.appId, 0.0)
                             : appIntermediateProfitMap.getOrDefault(opt.appId, 0.0);
                     profit += toUpgrade * perTxProfit;
+
+                        int nextKey = getNextReadKey(opt.toWC, isLeader);
+                        int nowAtToKey = appReadConcernCount.get(opt.appId).getOrDefault(opt.toWC, 0);
+                        if (nextKey != -1) {
+                        double nextFromLatency = getReadLatencyByKey(readLatencyByKey, opt.toWC);
+                        double nextToLatency = getReadLatencyByKey(readLatencyByKey, nextKey);
+                        if (nextToLatency <= MAX_LATENCY) {
+                            ReadConcern fromConcern = readConcernFromKey(opt.toWC);
+                            ReadConcern toConcern = readConcernFromKey(nextKey);
+                            double nextTokenCostIncrease = token_costs.getOrDefault(toConcern, 0.0)
+                                - token_costs.getOrDefault(fromConcern, 0.1);
+                            double nextLatencyInc = nextToLatency - nextFromLatency;
+                            double nextProfit = (nextKey == RC_KEY_LINEARIZABLE_ALL)
+                                ? appMajorityProfitMap.getOrDefault(opt.appId, 0.0)
+                                : appIntermediateProfitMap.getOrDefault(opt.appId, 0.0);
+                            double nextRatio = (nextLatencyInc > EPS)
+                                ? nextProfit / nextLatencyInc : Double.MAX_VALUE;
+                            pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextKey, nowAtToKey,
+                                nextRatio, opt.originalWc, true, nextTokenCostIncrease));
+                        }
+                        }
 
                 } else {
                     // --- Write upgrade (WC level bump) ---
@@ -736,16 +824,14 @@ public class BatchProcessor {
                     // Seed next write level if still below majority
                     if (opt.toWC < majority) {
                         int nowAtToWC = appWcCount.get(opt.appId).getOrDefault(opt.toWC, 0);
-                        if (nowAtToWC > 0) {
-                            int nextWC = opt.toWC + 1;
-                            double nextLatencyIncPerTx = getMaxLatency(nextWC, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
-                            double nextPerTxProfit = (nextWC == majority)
-                                    ? appMajorityProfitMap.get(opt.appId)
-                                    : appIntermediateProfitMap.get(opt.appId);
-                            double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
-                            pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC,
-                                    nextRatio, originalWc, false, 0.0));
-                        }
+                        int nextWC = opt.toWC + 1;
+                        double nextLatencyIncPerTx = getMaxLatency(nextWC, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
+                        double nextPerTxProfit = (nextWC == majority)
+                                ? appMajorityProfitMap.get(opt.appId)
+                                : appIntermediateProfitMap.get(opt.appId);
+                        double nextRatio = (nextLatencyIncPerTx > EPS) ? nextPerTxProfit / nextLatencyIncPerTx : Double.MAX_VALUE;
+                        pq.add(new AppUpgradeOption(opt.appId, opt.toWC, nextWC, nowAtToWC,
+                                nextRatio, originalWc, false, 0.0));
                     }
                 }
             }
@@ -781,18 +867,23 @@ public class BatchProcessor {
                 TransactionOption tx = batch.get(i);
                 if (!tx.isReadOnly) continue;
                 int appId = tx.applicationId;
-                int originalRC = tx.readConcern.getNumber();
-                // Already at or stronger than target — nothing to upgrade
-                if (originalRC <= targetRCNum) continue;
+                int originalKey = getReadLatencyKey(tx.readConcern, tx.readLevel);
                 HashMap<Integer, Integer> upgrades = readConcernUpgradesMap
                         .getOrDefault(appId, new HashMap<>())
-                        .getOrDefault(originalRC, new HashMap<>());
-                int remaining = upgrades.getOrDefault(targetRCNum, 0);
-                if (remaining > 0) {
-                    tx.readConcern = targetRC;
-                    assignments[i].readConcern = targetRC;
-                    upgrades.put(targetRCNum, remaining - 1);
+                        .getOrDefault(originalKey, new HashMap<>());
+
+                int assignedKey = originalKey;
+                for (int key = RC_KEY_LINEARIZABLE_ALL; key >= RC_KEY_EVENTUAL_ALL; key--) {
+                    int remaining = upgrades.getOrDefault(key, 0);
+                    if (remaining > 0) {
+                        assignedKey = key;
+                        upgrades.put(key, remaining - 1);
+                        break;
+                    }
                 }
+
+                assignments[i].readConcern = readConcernFromKey(assignedKey);
+                assignments[i].readLevel = readLevelFromKey(assignedKey, tx.readLevel);
             }
         }
 
@@ -813,6 +904,7 @@ public class BatchProcessor {
         for (int i = 0; i < n; i++) {
             if (assignments[i].isReadOnly) {
                 assignments[i].readConcern = null;   // null = deferred for reads
+                assignments[i].readLevel = null;
             } else {
                 assignments[i].writeConcern = 0;     // 0 = deferred for writes
             }
@@ -858,6 +950,7 @@ public class BatchProcessor {
                         double cost = getTokenCost(tx);
                         if (tokensRemaining >= cost) {
                             assignments[idx].readConcern = tx.readConcern;
+                            assignments[idx].readLevel = tx.readLevel;
                             tokensRemaining -= cost;
                             profit += tx.baseProfit;
                             processed++;
@@ -890,9 +983,9 @@ public class BatchProcessor {
                     }
                 }
             }
-            // Reads — ReadConcern number ascending (EVENTUAL → CAUSAL → LINEARIZABLE)
+            // Reads — key order ascending (EVENTUAL_ALL → CAUSAL_LOCAL → CAUSAL_MAJORITY → LINEARIZABLE_ALL)
             if (appReadConcernBatchIndex.containsKey(appId)) {
-                for (int rc = 0; rc <= 2; rc++) {
+                for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
                     if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
                     for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
                         if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
@@ -901,6 +994,7 @@ public class BatchProcessor {
                         double cost = getTokenCost(tx);
                         if (tokensRemaining >= cost) {
                             assignments[idx].readConcern = tx.readConcern;
+                            assignments[idx].readLevel = tx.readLevel;
                             tokensRemaining -= cost;
                             profit += tx.baseProfit;
                             processed++;
@@ -951,11 +1045,13 @@ static class AppUpgradeOption {
     static class ConsistencyAssignment {
         int writeConcern;        // write concern level (for write transactions; 0 = deferred)
         ReadConcern readConcern; // read concern level (for read transactions)
+        ReadLevel readLevel;     // read level for read transactions
         boolean isReadOnly;      // true if this is a read transaction
 
-        ConsistencyAssignment(int writeConcern, ReadConcern readConcern, boolean isReadOnly) {
+        ConsistencyAssignment(int writeConcern, ReadConcern readConcern, ReadLevel readLevel, boolean isReadOnly) {
             this.writeConcern = writeConcern;
             this.readConcern = readConcern;
+            this.readLevel = readLevel;
             this.isReadOnly = isReadOnly;
         }
 
@@ -1113,6 +1209,9 @@ static class AppUpgradeOption {
             Transaction updatedT = tx.clientMessage.getT().toBuilder()
                     .setReadConcern(assignment.readConcern)
                     .build();
+                if (assignment.readLevel != null) {
+                updatedT = updatedT.toBuilder().setReadLevel(assignment.readLevel).build();
+                }
             ClientMessage msg = ClientMessage.newBuilder()
                     .setT(updatedT)
                     .setWriteConcern(assignment.writeConcern)

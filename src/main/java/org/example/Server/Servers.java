@@ -52,13 +52,13 @@ public class Servers{
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
         // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 200, 5000, Map.of(1, 0.60, 2, 0.20)));
+        PHASES.add(new Phase("Light", 2000, 5000, Map.of(1, 0.60, 2, 0.20)));
         
         // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 200, 5000, Map.of(1, 0.30, 2, 0.70)));
+        PHASES.add(new Phase("Heavy", 2000, 5000, Map.of(1, 0.30, 2, 0.70)));
         
         // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed",200, 5000, Map.of(1, 0.50, 2, 0.50)));
+        PHASES.add(new Phase("Mixed",2000, 5000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution

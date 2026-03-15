@@ -157,6 +157,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     ConcurrentHashMap<Integer, Object> readConcernLatencyLocks;
     ConcurrentHashMap<Integer, Double> prevReadConcernLatencies;
 
+    private static final int RC_KEY_EVENTUAL_ALL = 0;
+    private static final int RC_KEY_CAUSAL_LOCAL = 1;
+    private static final int RC_KEY_CAUSAL_MAJORITY = 2;
+    private static final int RC_KEY_LINEARIZABLE_ALL = 3;
+
     ScheduledExecutorService sendAppendEntriesScheduler;
     ScheduledExecutorService causalReadScheduler;
 
@@ -309,12 +314,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.readConcernLatencySum = new ConcurrentHashMap<>();
         this.readConcernLatencyLocks = new ConcurrentHashMap<>();
         this.prevReadConcernLatencies = new ConcurrentHashMap<>();
-        for (ReadConcern rc : ReadConcern.values()) {
-            if (rc == ReadConcern.UNRECOGNIZED) continue;
-            readConcernLatencies.put(rc.getNumber(), new ArrayDeque<>());
-            readConcernLatencySum.put(rc.getNumber(), 0L);
-            readConcernLatencyLocks.put(rc.getNumber(), new Object());
-        }
+        initializeReadLatencyKey(RC_KEY_EVENTUAL_ALL);
+        initializeReadLatencyKey(RC_KEY_CAUSAL_LOCAL);
+        initializeReadLatencyKey(RC_KEY_CAUSAL_MAJORITY);
+        initializeReadLatencyKey(RC_KEY_LINEARIZABLE_ALL);
         this.transactionBatchProcessor = new BatchProcessor(NUM_OF_SERVERS);
         this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
         this.lastThroughputSentTimeOnFollower = 0;
@@ -940,7 +943,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         if (entry.t.getIsReadOnly()) {
                             ackBuilder.setId(id).setBalance(
                                     clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
-                            recordReadConcernLatency(ReadConcern.LINEARIZABLE,entry.timeOfArrivalAtLeader);
+                            recordReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY,
+                                entry.timeOfArrivalAtLeader);
                         }
 
                         AckMessage ackMessage = ackBuilder.build();
@@ -2026,24 +2030,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 e.printStackTrace();
             }
 
-            // Print and log read concern latencies
+            // Print and log read latencies by key buckets
             HashMap<Integer, Long> rcLatencyMap = new HashMap<>();
-            for (ReadConcern rc : ReadConcern.values()) {
-                if (rc == ReadConcern.UNRECOGNIZED) continue;
-                long avgRcLatency = getAverageReadConcernLatency(rc);
-                rcLatencyMap.put(rc.getNumber(), avgRcLatency);
-                System.out.printf("Current avg latency for RC=%s is %d ms%n", rc.name(), avgRcLatency);
-            }
+            rcLatencyMap.put(RC_KEY_EVENTUAL_ALL,
+                    getAverageReadConcernLatency(ReadConcern.EVENTUAL, ReadLevel.LOCAL));
+            rcLatencyMap.put(RC_KEY_CAUSAL_LOCAL,
+                    getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.LOCAL));
+            rcLatencyMap.put(RC_KEY_CAUSAL_MAJORITY,
+                    getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.MAJORITY));
+            rcLatencyMap.put(RC_KEY_LINEARIZABLE_ALL,
+                    getAverageReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY));
+
+            System.out.printf("Current avg latency for key=%s is %d ms%n", "EVENTUAL_ALL",
+                    rcLatencyMap.get(RC_KEY_EVENTUAL_ALL));
+            System.out.printf("Current avg latency for key=%s is %d ms%n", "CAUSAL_LOCAL",
+                    rcLatencyMap.get(RC_KEY_CAUSAL_LOCAL));
+            System.out.printf("Current avg latency for key=%s is %d ms%n", "CAUSAL_MAJORITY",
+                    rcLatencyMap.get(RC_KEY_CAUSAL_MAJORITY));
+            System.out.printf("Current avg latency for key=%s is %d ms%n", "LINEARIZABLE_ALL",
+                    rcLatencyMap.get(RC_KEY_LINEARIZABLE_ALL));
             try (FileWriter csvWriter = new FileWriter("read_latencies_" + serverId + ".csv", true)) {
                 File file = new File("read_latencies_" + serverId + ".csv");
                 if (file.length() == 0) {
-                    csvWriter.write("Timestamp,ReadConcern,AvgLatencyMs\n");
+                    csvWriter.write("Timestamp,ReadLatencyKey,AvgLatencyMs\n");
                 }
                 long ts = System.currentTimeMillis();
-                for (ReadConcern rc : ReadConcern.values()) {
-                    if (rc == ReadConcern.UNRECOGNIZED) continue;
-                    csvWriter.write(String.format("%d,%s,%d\n", ts, rc.name(), rcLatencyMap.get(rc.getNumber())));
-                }
+                csvWriter.write(String.format("%d,%s,%d\n", ts, "EVENTUAL_ALL", rcLatencyMap.get(RC_KEY_EVENTUAL_ALL)));
+                csvWriter.write(String.format("%d,%s,%d\n", ts, "CAUSAL_LOCAL", rcLatencyMap.get(RC_KEY_CAUSAL_LOCAL)));
+                csvWriter.write(String.format("%d,%s,%d\n", ts, "CAUSAL_MAJORITY", rcLatencyMap.get(RC_KEY_CAUSAL_MAJORITY)));
+                csvWriter.write(String.format("%d,%s,%d\n", ts, "LINEARIZABLE_ALL", rcLatencyMap.get(RC_KEY_LINEARIZABLE_ALL)));
                 csvWriter.flush();
             } catch (IOException e) {
                 e.printStackTrace();
@@ -2127,12 +2142,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 System.err.println("Failed to write system TPS to system_latency.csv: " + e.getMessage());
             }
 
-            // Build readConcern latency map
-            HashMap<ReadConcern, Double> readConcernLatencyMap = new HashMap<>();
-            for (ReadConcern rc : ReadConcern.values()) {
-                if (rc == ReadConcern.UNRECOGNIZED) continue;
-                readConcernLatencyMap.put(rc, (double) getAverageReadConcernLatency(rc));
-            }
+                // Build read-latency key map for BatchProcessor
+                HashMap<Integer, Double> readLatencyByKey = new HashMap<>();
+                readLatencyByKey.put(RC_KEY_EVENTUAL_ALL,
+                    (double) getAverageReadConcernLatency(ReadConcern.EVENTUAL, ReadLevel.LOCAL));
+                readLatencyByKey.put(RC_KEY_CAUSAL_LOCAL,
+                    (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.LOCAL));
+                readLatencyByKey.put(RC_KEY_CAUSAL_MAJORITY,
+                    (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.MAJORITY));
+                readLatencyByKey.put(RC_KEY_LINEARIZABLE_ALL,
+                    (double) getAverageReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY));
 
             boolean isLeader = (currentLeader == serverId);
 
@@ -2140,7 +2159,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     currentLatency, wcLatencyMap, wcTpsMap,
                     getIncomingTransactionsRate(),
                     backLogTransactions, backlogTracker.isIncreasing(), currentTokens,
-                    readConcernLatencyMap, isLeader);
+                    readLatencyByKey, isLeader);
 
             // Save result for next RL prediction
             previousBatchResult = result;
@@ -2214,6 +2233,23 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    private void initializeReadLatencyKey(int key) {
+        readConcernLatencies.putIfAbsent(key, new ArrayDeque<>());
+        readConcernLatencySum.putIfAbsent(key, 0L);
+        readConcernLatencyLocks.putIfAbsent(key, new Object());
+        prevReadConcernLatencies.putIfAbsent(key, 0.0);
+    }
+
+    private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
+        if (readConcern == ReadConcern.CAUSAL) {
+            return readLevel == ReadLevel.MAJORITY ? RC_KEY_CAUSAL_MAJORITY : RC_KEY_CAUSAL_LOCAL;
+        }
+        if (readConcern == ReadConcern.LINEARIZABLE) {
+            return RC_KEY_LINEARIZABLE_ALL;
+        }
+        return RC_KEY_EVENTUAL_ALL;
+    }
+
     boolean canServeLinearizableRead() {
         long LEASE_DURATION_MS = 1900;
         long now = System.currentTimeMillis();
@@ -2232,8 +2268,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
      * Record latency for a specific ReadConcern (mirrors writeConcern latency tracking).
      * Uses a 5-second sliding window.
      */
-    private void recordReadConcernLatency(ReadConcern readConcern, long arrivalTime) {
-        int key = readConcern.getNumber();
+    private void recordReadConcernLatency(ReadConcern readConcern, ReadLevel readLevel, long arrivalTime) {
+        int key = getReadLatencyKey(readConcern, readLevel);
+        initializeReadLatencyKey(key);
         synchronized (readConcernLatencyLocks.get(key)) {
             long now = System.currentTimeMillis();
             long currentLatency = now - arrivalTime;
@@ -2247,8 +2284,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    public long getAverageReadConcernLatency(ReadConcern readConcern) {
-        int key = readConcern.getNumber();
+    public long getAverageReadConcernLatency(ReadConcern readConcern, ReadLevel readLevel) {
+        int key = getReadLatencyKey(readConcern, readLevel);
+        initializeReadLatencyKey(key);
         synchronized (readConcernLatencyLocks.get(key)) {
             long val = readConcernLatencySum.get(key)
                     / Math.max(readConcernLatencies.get(key).size(), 1);
@@ -2321,7 +2359,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             totalSystemWideLatency.set(systemLatency + latencyOfThisTransaction);
                             countOfSystemWideLatencies.incrementAndGet();
                         }
-                        recordReadConcernLatency(readConcern, arrivalTime);
+                        recordReadConcernLatency(readConcern, readLevel, arrivalTime);
                         Ack failAck = Ack.newBuilder()
                                 .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
                                 .build();
@@ -2363,7 +2401,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             totalSystemWideLatency.set(systemLatency + latencyOfThisTransaction);
                             countOfSystemWideLatencies.incrementAndGet();
                         }
-                        recordReadConcernLatency(readConcern, arrivalTime);
+                        recordReadConcernLatency(readConcern, readLevel, arrivalTime);
                         Ack ack = getBalanceBasedOnReadLevel(readLevel, accName, id);
                         clientStub.sendAckToClient(ack, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
@@ -2427,7 +2465,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 totalSystemWideLatency.set(systemLatency + latencyOfThisTransaction);
                 countOfSystemWideLatencies.incrementAndGet();
             }
-            recordReadConcernLatency(readConcern, arrivalTime);
+            recordReadConcernLatency(readConcern, readLevel, arrivalTime);
             return getBalanceBasedOnReadLevel(readLevel, accName, id);
         }
     }
