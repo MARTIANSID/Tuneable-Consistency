@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -18,6 +19,7 @@ import java.util.stream.Collectors;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import org.example.Client.ClientServerImpl;
 import org.ds.paxos.Ack;
 import org.ds.paxos.ClientMessage;
 import org.ds.paxos.ReadConcern;
@@ -33,6 +35,10 @@ public class Servers{
     
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
+    // Tracks latest committed timestamp from ACKs sent by servers to client callback
+    private static ClientServerImpl clientServerImpl;
+    private static Server clientCallbackServer;
+    private static int clientCallbackPort = 9000;
 
     // ========== Workload Phases (similar to StressTest.java) ==========
     static class Phase {
@@ -52,13 +58,13 @@ public class Servers{
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
         // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 2000, 5000, Map.of(1, 0.60, 2, 0.20)));
+        PHASES.add(new Phase("Light", 200, 5000, Map.of(1, 0.60, 2, 0.20)));
         
         // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 2000, 5000, Map.of(1, 0.30, 2, 0.70)));
+        PHASES.add(new Phase("Heavy", 200, 5000, Map.of(1, 0.30, 2, 0.70)));
         
         // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed",2000, 5000, Map.of(1, 0.50, 2, 0.50)));
+        PHASES.add(new Phase("Mixed",200, 5000, Map.of(1, 0.50, 2, 0.50)));
     }
     
     // Track current phase index for sequential execution
@@ -69,12 +75,15 @@ public class Servers{
 
     // Read transaction configuration
     private static final double READ_RATIO = 0.60; // 60% reads, 40% writes (for leader)
-    // Leader reads: mix of EVENTUAL + LINEARIZABLE
+        // Leader reads: mix of EVENTUAL + CAUSAL + LINEARIZABLE
+        // CAUSAL on leader is always generated with MAJORITY read level.
     private static final Map<Integer, Double> LEADER_READ_CONCERN_DIST = Map.of(
-            0, 0.50,  // LINEARIZABLE
-            2, 0.50   // EVENTUAL
+            0, 0.34,  // LINEARIZABLE
+            1, 0.33,  // CAUSAL
+            2, 0.33   // EVENTUAL
     );
-    // Replica reads: mix of EVENTUAL + CAUSAL (50/50)
+        // Replica reads: mix of EVENTUAL + CAUSAL (50/50)
+        // CAUSAL on followers is split between LOCAL and MAJORITY read levels.
     private static final Map<Integer, Double> REPLICA_READ_CONCERN_DIST = Map.of(
             1, 0.50,  // CAUSAL
             2, 0.50   // EVENTUAL
@@ -101,6 +110,16 @@ public class Servers{
     public static void main(String[] args) throws IOException{
         // Clear all CSV files at startup
         clearCSVFiles();
+
+        // Start client callback endpoint so ACK timestamps can be consumed.
+        clientServerImpl = new ClientServerImpl();
+        clientCallbackPort = findAvailablePort(9000, 9100);
+        clientCallbackServer = ServerBuilder.forPort(clientCallbackPort)
+            .addService(clientServerImpl)
+            .build()
+            .start();
+        clientServerImpl.setUpStubs();
+        System.out.println("Client callback server started on port " + clientCallbackPort);
         
         List<Server> servers = new ArrayList<>();
         List<ServerImpl> serversImpl = new ArrayList<>();
@@ -266,7 +285,6 @@ public class Servers{
                     int batchSize = Math.max(1, phase.targetTPS / batchesPerSecond);
 
                     long batchStart = System.currentTimeMillis();
-                    TimeStampProto lastWriteTs = lastWriteTimestamp;
 
                     ServerImpl currentLeader = injector.getLeader();
 
@@ -276,7 +294,7 @@ public class Servers{
 
                         List<TransactionOption> readBatch = new ArrayList<>(batchSize);
                         for (int j = 0; j < batchSize; j++) {
-                            ClientMessage readMsg = generateReadTransaction(lastWriteTs, REPLICA_READ_CONCERN_DIST);
+                            ClientMessage readMsg = generateReadTransaction(getLatestAckedTimestamp(), REPLICA_READ_CONCERN_DIST, false);
                             readBatch.add(TransactionOption.fromClientMessage(readMsg));
                         }
                         server.batchLock.lock();
@@ -501,7 +519,7 @@ public class Servers{
                     .setWriteConcern(minConsistency)
                     .setTimeStamp(ts)
                     .setCallbackHost("localhost")
-                    .setCallbackPort(9000)
+                    .setCallbackPort(clientCallbackPort)
                     .build();
 
             batch.add(message);
@@ -509,10 +527,9 @@ public class Servers{
             lastWriteTimestamp = ts;
         }
 
-        // Generate leader reads (EVENTUAL + LINEARIZABLE)
-        TimeStampProto lastWriteTs = lastWriteTimestamp;
+        // Generate leader reads (EVENTUAL + CAUSAL(MAJORITY) + LINEARIZABLE)
         for (int i = 0; i < readCount; i++) {
-            batch.add(generateReadTransaction(lastWriteTs, LEADER_READ_CONCERN_DIST));
+            batch.add(generateReadTransaction(getLatestAckedTimestamp(), LEADER_READ_CONCERN_DIST, true));
         }
 
         return batch;
@@ -523,15 +540,26 @@ public class Servers{
      * and the timestamp of the last write (for causal ordering).
      */
     private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs,
-                                                          Map<Integer, Double> rcDistribution) {
+                                                          Map<Integer, Double> rcDistribution,
+                                                          boolean isLeaderTarget) {
         String txId = UUID.randomUUID().toString();
         String accName = "user" + random.nextInt(100);
         long now = System.currentTimeMillis();
 
         int readConcernOrdinal = selectReadConcern(rcDistribution);
         ReadConcern readConcern = ReadConcern.forNumber(readConcernOrdinal);
-        // LINEARIZABLE -> MAJORITY level, others -> LOCAL
-        ReadLevel readLevel = (readConcernOrdinal == 0) ? ReadLevel.MAJORITY : ReadLevel.LOCAL;
+        // Leader-target causal reads are forced to MAJORITY.
+        // Follower-target causal reads are split between LOCAL and MAJORITY.
+        ReadLevel readLevel;
+        if (readConcernOrdinal == 0) {
+            readLevel = ReadLevel.MAJORITY;
+        } else if (readConcernOrdinal == 1) {
+            readLevel = isLeaderTarget
+                    ? ReadLevel.MAJORITY
+                    : (random.nextBoolean() ? ReadLevel.MAJORITY : ReadLevel.LOCAL);
+        } else {
+            readLevel = ReadLevel.LOCAL;
+        }
 
         int applicationId = 1 + random.nextInt(3);
 
@@ -557,8 +585,26 @@ public class Servers{
                 .setWriteConcern(writeConcern)
                 .setTimeStamp(lastWriteTs)
                 .setCallbackHost("localhost")
-                .setCallbackPort(9000)
+                .setCallbackPort(clientCallbackPort)
                 .build();
+    }
+
+    private static int findAvailablePort(int startPort, int endPortInclusive) throws IOException {
+        for (int port = startPort; port <= endPortInclusive; port++) {
+            try (ServerSocket ignored = new ServerSocket(port)) {
+                return port;
+            } catch (IOException ignored) {
+                // Try the next port.
+            }
+        }
+        throw new IOException("No free callback port found in range " + startPort + "-" + endPortInclusive);
+    }
+
+    private static TimeStampProto getLatestAckedTimestamp() {
+        if (clientServerImpl != null) {
+            return clientServerImpl.getLastTimeStampProto();
+        }
+        return lastWriteTimestamp;
     }
 
     /**

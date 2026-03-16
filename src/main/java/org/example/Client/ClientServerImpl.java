@@ -22,6 +22,7 @@ import org.ds.paxos.Empty;
 import org.ds.paxos.RaftGrpc;
 import org.ds.paxos.ReadConcern;
 import org.ds.paxos.ReadLevel;
+import org.ds.paxos.TimeStampProto;
 import org.ds.paxos.Transaction;
 import org.example.Utility.HybridClock;
 
@@ -108,8 +109,11 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
 
             // Only log successful reads and measure latency
             if (t.getIsReadOnly()) {
-                long latency = System.currentTimeMillis() - timeTakenForTransactionToBeExecuted.get(id);
-                latencyPerConcern.get(ReadConcern.LINEARIZABLE).add(latency);
+                Long start = timeTakenForTransactionToBeExecuted.get(id);
+                if (start != null) {
+                    long latency = System.currentTimeMillis() - start;
+                    latencyPerConcern.get(ReadConcern.LINEARIZABLE).add(latency);
+                }
 //                System.out.println("[READ SUCCESS] ID=" + id +
 //                        " | Concern=" + "LINEARIZABLE" +
 //                        " | Account=" + ackMessage.getAccName() +
@@ -209,6 +213,16 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
     // --- Overload for standalone reads ---
     public void sendReadRequest(String accName, ReadConcern readConcern, ReadLevel readLevel) {
         sendReadRequest(accName, readConcern, readLevel, null);
+    }
+
+    // --- Expose latest ACK-updated timestamp for external injectors ---
+    public TimeStampProto getLastTimeStampProto() {
+        lock.readLock().lock();
+        try {
+            return HybridClock.TimeStamp.convertToProto(lastTimeStamp);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     // --- Main Method: Parallel Periodic Reads with unique IDs ---

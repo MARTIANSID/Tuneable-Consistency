@@ -370,7 +370,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
         // setting up the client stub
-        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9001).usePlaintext().build();
         clientStub = RaftGrpc.newStub(channel);
 
         batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
