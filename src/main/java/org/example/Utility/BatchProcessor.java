@@ -61,7 +61,7 @@ public class BatchProcessor {
         put(2, 3000.0); // 150 ms for W:2
      }};
 
-     private static final double MAX_LATENCY = 70.0; // Max average latency in ms
+     private static double MAX_LATENCY = 70.0; // Max average latency in ms
      private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
@@ -430,6 +430,7 @@ public class BatchProcessor {
             // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
             // ** very important **
             // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
+            
             boolean canUpgrade = false;
             if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY && !isBackLogIncreasing) {
                 // Build priority queue for upgrades (best profit/latency-cost ratio first)
@@ -647,6 +648,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
+    MAX_LATENCY = isLeader ? 60 : 40;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
@@ -962,7 +964,7 @@ public class BatchProcessor {
 
         // Pass 2: Execute deferred transactions — lowest consistency first within each app,
         // stop when at least 70% of batch is processed or tokens run out.
-        int minToProcess = Math.max(1, (int) (n * 0.7));
+        int minToProcess = Math.max(1, (int) (n * 1));
         pass2:
         for (int appId : sortedAppIds) {
             // Writes — WC level ascending (lowest consistency first)

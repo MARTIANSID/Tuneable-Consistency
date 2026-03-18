@@ -32,6 +32,10 @@ public class Servers{
 
     // set the number of servers from here
     public static final int NUM_OF_SERVERS = 3;
+
+    // Toggle transaction upgrading (token-bucket based consistency tuning).
+    // false => execute batch at original consistency, no upgrades/deferrals.
+    private static final boolean UPGRADE_TRANSACTIONS = false;
     
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
@@ -45,27 +49,56 @@ public class Servers{
         String name;
         int durationSeconds;
         int targetTPS;
+        double readRatio;
         Map<Integer, Double> writeConcernDistribution; // wc -> probability
+        Map<Integer, Double> leaderReadConcernDistribution; // readConcern -> probability
+        Map<Integer, Double> replicaReadConcernDistribution; // readConcern -> probability
 
-        Phase(String name, int durationSeconds, int targetTPS, Map<Integer, Double> wcDist) {
+        Phase(String name, int durationSeconds, int targetTPS, double readRatio,
+              Map<Integer, Double> wcDist,
+              Map<Integer, Double> leaderReadConcernDistribution,
+              Map<Integer, Double> replicaReadConcernDistribution) {
             this.name = name;
             this.durationSeconds = durationSeconds;
             this.targetTPS = targetTPS;
+            this.readRatio = readRatio;
             this.writeConcernDistribution = wcDist;
+            this.leaderReadConcernDistribution = leaderReadConcernDistribution;
+            this.replicaReadConcernDistribution = replicaReadConcernDistribution;
         }
     }
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
-        // Light workload - mostly W:1 (2 seconds)
-        PHASES.add(new Phase("Light", 200, 5000, Map.of(1, 0.60, 2, 0.20)));
-        
-        // Heavy workload - mostly W:2 (2 seconds)
-        PHASES.add(new Phase("Heavy", 200, 5000, Map.of(1, 0.30, 2, 0.70)));
-        
-        // Mixed workload - balanced W:1/W:2 (2 seconds)
-        PHASES.add(new Phase("Mixed",200, 5000, Map.of(1, 0.50, 2, 0.50)));
+        // light workload: mostly W:1, mostly EVENTUAL reads
+        PHASES.add(new Phase(
+                "Light", 50, 5000, 0.80,
+                Map.of(1, 0.80, 2, 0.20),
+                Map.of(2, 0.80, 1, 0.10, 0, 0.10),
+                Map.of(2, 0.80, 1, 0.20)
+        ));
+        // heavy workload: more W:2, more CAUSAL/LINEARIZABLE reads
+        PHASES.add(new Phase(
+                "Heavy", 50, 5000, 0.80,
+                Map.of(1, 0.30, 2, 0.70),
+                Map.of(2, 0.20, 1, 0.10, 0, 0.70),
+                Map.of(2, 0.20, 1, 0.80)
+        ));
+        // medium workload: balanced W:1 vs W:2, balanced read concerns
+        PHASES.add(new Phase(
+            "Medium", 50, 5000, 0.80,
+                Map.of(1, 0.50, 2, 0.50),
+                Map.of(2, 0.33, 1, 0.33, 0, 0.34),
+                Map.of(2, 0.50, 1, 0.50)
+        ));
     }
+
+    // Phase execution mode
+    // true: run only one selected phase for the whole experiment
+    // false: cycle through all phases sequentially
+    private static final boolean RUN_SINGLE_PHASE = false;
+    // 0-based phase index used when RUN_SINGLE_PHASE=true
+    private static final int SINGLE_PHASE_INDEX = 0;
     
     // Track current phase index for sequential execution
     private static final AtomicInteger currentPhaseIndex = new AtomicInteger(0);
@@ -73,32 +106,18 @@ public class Servers{
     private static final int BATCH_SIZE = 1000;  // Transactions per batch (increased to reduce gRPC overhead)
     private static final Random random = new Random();
 
-    // Read transaction configuration
-    private static final double READ_RATIO = 0.60; // 60% reads, 40% writes (for leader)
-        // Leader reads: mix of EVENTUAL + CAUSAL + LINEARIZABLE
-        // CAUSAL on leader is always generated with MAJORITY read level.
-    private static final Map<Integer, Double> LEADER_READ_CONCERN_DIST = Map.of(
-            0, 0.34,  // LINEARIZABLE
-            1, 0.33,  // CAUSAL
-            2, 0.33   // EVENTUAL
-    );
-        // Replica reads: mix of EVENTUAL + CAUSAL (50/50)
-        // CAUSAL on followers is split between LOCAL and MAJORITY read levels.
-    private static final Map<Integer, Double> REPLICA_READ_CONCERN_DIST = Map.of(
-            1, 0.50,  // CAUSAL
-            2, 0.50   // EVENTUAL
-    );
+    // Read transaction configuration is phase-driven via Phase.readRatio and read concern maps.
     // Track last write timestamp for causal/linearizable reads
     private static volatile TimeStampProto lastWriteTimestamp = TimeStampProto.newBuilder()
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 40000;  // 150 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 150000;  // 150 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
     // Current phase parameters (volatile for thread-safe reads)
-    private static volatile Phase currentPhase = PHASES.get(1);  // Start with Mixed
+    private static volatile Phase currentPhase = PHASES.get(0);  // Start with Light (sequential phases override this)
     private static volatile long phaseEndTime = 0;
     private static final Object phaseLock = new Object();
     
@@ -110,6 +129,9 @@ public class Servers{
     public static void main(String[] args) throws IOException{
         // Clear all CSV files at startup
         clearCSVFiles();
+
+        // Set whether servers should upgrade/tune transaction consistency.
+        ServerImpl.setUpgradeTransactionsEnabled(UPGRADE_TRANSACTIONS);
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
@@ -224,8 +246,8 @@ public class Servers{
 
                     long batchStart = System.currentTimeMillis();
 
-                    // Generate mixed batch (writes + leader reads)
-                    List<ClientMessage> batch = generateLeaderBatch(actualBatchSize, phase.writeConcernDistribution);
+                    // Generate mixed batch (writes + leader reads) deterministically for this phase
+                    List<ClientMessage> batch = generateLeaderBatch(actualBatchSize, phase);
 
                     // Inject directly into leader
                     ServerImpl currentLeader = injector.getLeader();
@@ -288,13 +310,23 @@ public class Servers{
 
                     ServerImpl currentLeader = injector.getLeader();
 
-                    for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                        List<Integer> followerReadConcerns = buildDeterministicChoices(
+                            batchSize,
+                            phase.replicaReadConcernDistribution,
+                            2);
+
+                        for (int i = 0; i < NUM_OF_SERVERS; i++) {
                         ServerImpl server = injector.getServerById(i);
                         if (server == null || server == currentLeader) continue; // skip leader
 
                         List<TransactionOption> readBatch = new ArrayList<>(batchSize);
                         for (int j = 0; j < batchSize; j++) {
-                            ClientMessage readMsg = generateReadTransaction(getLatestAckedTimestamp(), REPLICA_READ_CONCERN_DIST, false);
+                            int readConcernOrdinal = followerReadConcerns.get(j);
+                            ClientMessage readMsg = generateReadTransaction(
+                                getLatestAckedTimestamp(),
+                                readConcernOrdinal,
+                                false,
+                                j);
                             readBatch.add(TransactionOption.fromClientMessage(readMsg));
                         }
                         server.batchLock.lock();
@@ -335,7 +367,17 @@ public class Servers{
         if (!experimentRunning) return;
         
         Phase newPhase = selectNextPhase();
-        long newEndTime = System.currentTimeMillis() + (newPhase.durationSeconds * 1000L);
+        if (newPhase == null) {
+            System.out.println("\n🏁 All phases completed (Phase 1 -> Phase 2 -> Phase 3). Stopping experiment.");
+            experimentRunning = false;
+            return;
+        }
+        long newEndTime;
+        if (RUN_SINGLE_PHASE) {
+            newEndTime = experimentStartTime + TOTAL_EXPERIMENT_DURATION_MS;
+        } else {
+            newEndTime = System.currentTimeMillis() + (newPhase.durationSeconds * 1000L);
+        }
         
         // Don't let phase extend beyond total experiment duration
         long experimentEndTime = experimentStartTime + TOTAL_EXPERIMENT_DURATION_MS;
@@ -446,11 +488,13 @@ public class Servers{
      * Select the next phase sequentially (cycles through all phases)
      */
     private static Phase selectNextPhase() {
+        if (RUN_SINGLE_PHASE) {
+            int clampedIndex = Math.max(0, Math.min(SINGLE_PHASE_INDEX, PHASES.size() - 1));
+            return PHASES.get(clampedIndex);
+        }
         int index = currentPhaseIndex.getAndIncrement();
         if (index >= PHASES.size()) {
-            // Cycle back to first phase if needed
-            currentPhaseIndex.set(1);
-            index = 0;
+            return null;
         }
         return PHASES.get(index);
     }
@@ -461,11 +505,23 @@ public class Servers{
     private static void printPhaseConfig() {
         System.out.println("\n📊 20-Second Experiment Configuration:");
         System.out.println("   Total Duration: 20 seconds");
-        System.out.println("   Phases run sequentially:");
+        if (RUN_SINGLE_PHASE) {
+            System.out.println("   Mode: SINGLE PHASE");
+        } else {
+            System.out.println("   Mode: SEQUENTIAL PHASES");
+        }
+        System.out.println("   Phases:");
         int totalDuration = 0;
         for (Phase p : PHASES) {
-            System.out.printf("   %d. %s: %ds | %d TPS | WC: %s%n",
-                    PHASES.indexOf(p) + 1, p.name, p.durationSeconds, p.targetTPS, p.writeConcernDistribution);
+            System.out.printf("   %d. %s: %ds | %d TPS | ReadRatio=%.2f | WC=%s | LeaderRC=%s | FollowerRC=%s%n",
+                PHASES.indexOf(p) + 1,
+                p.name,
+                p.durationSeconds,
+                p.targetTPS,
+                p.readRatio,
+                p.writeConcernDistribution,
+                p.leaderReadConcernDistribution,
+                p.replicaReadConcernDistribution);
             totalDuration += p.durationSeconds;
         }
         System.out.printf("   Total phase duration: %ds (buffer: %ds)%n", totalDuration, 
@@ -476,16 +532,20 @@ public class Servers{
     /**
      * Generate a mixed batch for the leader: 40% writes + 60% reads (EVENTUAL + LINEARIZABLE)
      */
-    private static List<ClientMessage> generateLeaderBatch(int size, Map<Integer, Double> wcDistribution) {
+    private static List<ClientMessage> generateLeaderBatch(int size, Phase phase) {
         List<ClientMessage> batch = new ArrayList<>(size);
         long now = System.currentTimeMillis();
 
-        int writeCount = (int) (size * (1.0 - READ_RATIO));  // 40%
-        int readCount = size - writeCount;                     // 60%
+        int readCount = (int) Math.round(size * phase.readRatio);
+        readCount = Math.max(0, Math.min(size, readCount));
+        int writeCount = size - readCount;
+
+        List<Integer> writeChoices = buildDeterministicChoices(writeCount, phase.writeConcernDistribution, 1);
+        List<Integer> leaderReadConcerns = buildDeterministicChoices(readCount, phase.leaderReadConcernDistribution, 2);
 
         // Generate write transactions
         for (int i = 0; i < writeCount; i++) {
-            int minConsistency = selectWriteConcern(wcDistribution);
+            int minConsistency = writeChoices.get(i);
 
             String txId = UUID.randomUUID().toString();
             String sender = "user" + (i % 100);
@@ -529,7 +589,8 @@ public class Servers{
 
         // Generate leader reads (EVENTUAL + CAUSAL(MAJORITY) + LINEARIZABLE)
         for (int i = 0; i < readCount; i++) {
-            batch.add(generateReadTransaction(getLatestAckedTimestamp(), LEADER_READ_CONCERN_DIST, true));
+            int readConcernOrdinal = leaderReadConcerns.get(i);
+            batch.add(generateReadTransaction(getLatestAckedTimestamp(), readConcernOrdinal, true, i));
         }
 
         return batch;
@@ -540,23 +601,24 @@ public class Servers{
      * and the timestamp of the last write (for causal ordering).
      */
     private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs,
-                                                          Map<Integer, Double> rcDistribution,
-                                                          boolean isLeaderTarget) {
+                                                          int readConcernOrdinal,
+                                                          boolean isLeaderTarget,
+                                                          int causalLevelSelector) {
         String txId = UUID.randomUUID().toString();
         String accName = "user" + random.nextInt(100);
         long now = System.currentTimeMillis();
 
-        int readConcernOrdinal = selectReadConcern(rcDistribution);
         ReadConcern readConcern = ReadConcern.forNumber(readConcernOrdinal);
         // Leader-target causal reads are forced to MAJORITY.
-        // Follower-target causal reads are split between LOCAL and MAJORITY.
+        // Follower-target causal reads use a deterministic asymmetric split so
+        // CAUSAL_LOCAL and CAUSAL_MAJORITY are intentionally different.
         ReadLevel readLevel;
         if (readConcernOrdinal == 0) {
             readLevel = ReadLevel.MAJORITY;
         } else if (readConcernOrdinal == 1) {
             readLevel = isLeaderTarget
                     ? ReadLevel.MAJORITY
-                    : (random.nextBoolean() ? ReadLevel.MAJORITY : ReadLevel.LOCAL);
+                    : ((Math.floorMod(causalLevelSelector, 10) < 3) ? ReadLevel.MAJORITY : ReadLevel.LOCAL);
         } else {
             readLevel = ReadLevel.LOCAL;
         }
@@ -587,6 +649,63 @@ public class Servers{
                 .setCallbackHost("localhost")
                 .setCallbackPort(clientCallbackPort)
                 .build();
+    }
+
+    /**
+     * Build deterministic level choices for a fixed count using a weighted distribution.
+     */
+    private static List<Integer> buildDeterministicChoices(int total,
+                                                           Map<Integer, Double> distribution,
+                                                           int fallbackKey) {
+        List<Integer> result = new ArrayList<>(Math.max(0, total));
+        if (total <= 0 || distribution == null || distribution.isEmpty()) {
+            return result;
+        }
+
+        Map<Integer, Integer> counts = new HashMap<>();
+        Map<Integer, Double> fractions = new HashMap<>();
+        int assigned = 0;
+
+        for (Map.Entry<Integer, Double> entry : distribution.entrySet()) {
+            int key = entry.getKey();
+            double raw = Math.max(0.0, entry.getValue()) * total;
+            int base = (int) Math.floor(raw);
+            counts.put(key, base);
+            fractions.put(key, raw - base);
+            assigned += base;
+        }
+
+        int remaining = total - assigned;
+        List<Integer> keysByFraction = new ArrayList<>(distribution.keySet());
+        keysByFraction.sort((a, b) -> {
+            int cmp = Double.compare(fractions.getOrDefault(b, 0.0), fractions.getOrDefault(a, 0.0));
+            return (cmp != 0) ? cmp : Integer.compare(a, b);
+        });
+
+        int idx = 0;
+        while (remaining > 0 && !keysByFraction.isEmpty()) {
+            int key = keysByFraction.get(idx % keysByFraction.size());
+            counts.put(key, counts.getOrDefault(key, 0) + 1);
+            remaining--;
+            idx++;
+        }
+
+        List<Integer> sortedKeys = new ArrayList<>(counts.keySet());
+        sortedKeys.sort(Integer::compareTo);
+        for (int key : sortedKeys) {
+            int c = counts.getOrDefault(key, 0);
+            for (int i = 0; i < c; i++) {
+                result.add(key);
+            }
+        }
+
+        while (result.size() < total) {
+            result.add(fallbackKey);
+        }
+        if (result.size() > total) {
+            return new ArrayList<>(result.subList(0, total));
+        }
+        return result;
     }
 
     private static int findAvailablePort(int startPort, int endPortInclusive) throws IOException {
@@ -649,6 +768,8 @@ public class Servers{
             "tps_%d.csv",
             "writeconcern_frequency_%d.csv",
             "writeconcern_tps_%d.csv",
+            "batch_mix_before_after_%d.csv",
+            "read_requests_%d.csv",
             "backlog_%d.csv",
             "avg_latencies_%d.csv",
             "incoming_transaction_rate_%d.csv",

@@ -253,6 +253,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     BacklogTracker backlogTracker;
     ScheduledExecutorService backLogScheuler;
 
+    // ===== Transaction upgrade toggle =====
+    // When false, the server will bypass handleTokenBucket() and execute the incoming
+    // batch exactly as received (no upgrades, no deferrals).
+    private static volatile boolean UPGRADE_TRANSACTIONS_ENABLED = true;
+
+    public static void setUpgradeTransactionsEnabled(boolean enabled) {
+        UPGRADE_TRANSACTIONS_ENABLED = enabled;
+    }
+
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = -1;
@@ -1570,6 +1579,233 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private static final int MAX_BATCH_SIZE = 5000;
 
+    private static final double TOKEN_COST_WRITE = 1.0;
+    private static final double TOKEN_COST_READ_EVENTUAL = 0.1;
+    private static final double TOKEN_COST_READ_CAUSAL = 0.5;
+    private static final double TOKEN_COST_READ_LINEARIZABLE = 1.0;
+
+    private static final class TokenBucketSnapshot {
+        final double currentServerThroughput;
+        final double currentTps;
+        final double currentTokens;
+        final long lastUpdate;
+        final int majority;
+        final HashMap<Integer, Double> wcTpsMap;
+        final HashMap<Integer, Double> wcLatencyMap;
+        final HashMap<Integer, Double> readLatencyByKey;
+        final double currentLatency;
+        final boolean isLeader;
+
+        private TokenBucketSnapshot(double currentServerThroughput,
+                                   double currentTps,
+                                   double currentTokens,
+                                   long lastUpdate,
+                                   int majority,
+                                   HashMap<Integer, Double> wcTpsMap,
+                                   HashMap<Integer, Double> wcLatencyMap,
+                                   HashMap<Integer, Double> readLatencyByKey,
+                                   double currentLatency,
+                                   boolean isLeader) {
+            this.currentServerThroughput = currentServerThroughput;
+            this.currentTps = currentTps;
+            this.currentTokens = currentTokens;
+            this.lastUpdate = lastUpdate;
+            this.majority = majority;
+            this.wcTpsMap = wcTpsMap;
+            this.wcLatencyMap = wcLatencyMap;
+            this.readLatencyByKey = readLatencyByKey;
+            this.currentLatency = currentLatency;
+            this.isLeader = isLeader;
+        }
+    }
+
+    private double estimateTokensUsedAtOriginalConsistency(List<TransactionOption> batch) {
+        double total = 0.0;
+        for (TransactionOption option : batch) {
+            if (option == null) {
+                continue;
+            }
+            if (!option.isReadOnly) {
+                total += TOKEN_COST_WRITE;
+                continue;
+            }
+            ReadConcern rc = option.readConcern;
+            if (rc == ReadConcern.CAUSAL) {
+                total += TOKEN_COST_READ_CAUSAL;
+            } else if (rc == ReadConcern.LINEARIZABLE) {
+                total += TOKEN_COST_READ_LINEARIZABLE;
+            } else {
+                total += TOKEN_COST_READ_EVENTUAL;
+            }
+        }
+        return total;
+    }
+
+    private TokenBucketSnapshot collectAndLogTokenBucketMetrics(List<TransactionOption> currentBatch,
+                                                               double totalFollowerTps) {
+        double currentServerThroughput = getSystemWideThroughput();
+        double currentTps = getSystemWideThroughput() + totalFollowerTps;
+
+        TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
+        double currentTokens = tokenBucketData.getTokenCount();
+        long lastUpdate = tokenBucketData.getLastUpdateTime();
+
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        HashMap<Integer, Double> wcTpsMap = new HashMap<>();
+        for (int wc = 1; wc <= majority; wc++) {
+            wcTpsMap.put(wc, getWriteConcernTPS(wc));
+        }
+
+        HashMap<Integer, Double> wcLatencyMap = new HashMap<>();
+        for (int wc = 1; wc <= majority; wc++) {
+            wcLatencyMap.put(wc, blendedLatencyForWC(wc));
+            System.out.printf("Current blended latency for WC=%d is %.2f ms%n", wc, wcLatencyMap.get(wc));
+        }
+
+        // Store writeConcern latency data in avg_latencies_<sid>.csv
+        try (FileWriter csvWriter = new FileWriter("avg_latencies_" + serverId + ".csv", true)) {
+            for (int wc = 1; wc <= majority; wc++) {
+                double avgLatency = wcLatencyMap.get(wc);
+                csvWriter.write(String.format("%d,%.2f\n", wc, avgLatency));
+            }
+            csvWriter.flush();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Read latency by key (used by BatchProcessor)
+        HashMap<Integer, Double> readLatencyByKey = new HashMap<>();
+        readLatencyByKey.put(RC_KEY_EVENTUAL_ALL,
+                (double) getAverageReadConcernLatency(ReadConcern.EVENTUAL, ReadLevel.LOCAL));
+        readLatencyByKey.put(RC_KEY_CAUSAL_LOCAL,
+                (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.LOCAL));
+        readLatencyByKey.put(RC_KEY_CAUSAL_MAJORITY,
+                (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.MAJORITY));
+        readLatencyByKey.put(RC_KEY_LINEARIZABLE_ALL,
+                (double) getAverageReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY));
+
+        // Store read latency breakdown in read_latencies_<sid>.csv
+        try (FileWriter csvWriter = new FileWriter("read_latencies_" + serverId + ".csv", true)) {
+            File file = new File("read_latencies_" + serverId + ".csv");
+            if (file.length() == 0) {
+                csvWriter.write("Timestamp,ReadLatencyKey,AvgLatencyMs\n");
+            }
+            long ts = System.currentTimeMillis();
+            csvWriter.write(String.format("%d,%s,%.4f\n", ts, "EVENTUAL_ALL", readLatencyByKey.get(RC_KEY_EVENTUAL_ALL)));
+            csvWriter.write(String.format("%d,%s,%.4f\n", ts, "CAUSAL_LOCAL", readLatencyByKey.get(RC_KEY_CAUSAL_LOCAL)));
+            csvWriter.write(String.format("%d,%s,%.4f\n", ts, "CAUSAL_MAJORITY", readLatencyByKey.get(RC_KEY_CAUSAL_MAJORITY)));
+            csvWriter.write(String.format("%d,%s,%.4f\n", ts, "LINEARIZABLE_ALL", readLatencyByKey.get(RC_KEY_LINEARIZABLE_ALL)));
+            csvWriter.flush();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Record writeConcern TPS in CSV (single row per batch)
+        try (FileWriter fw = new FileWriter("writeconcern_tps_" + serverId + ".csv", true);
+             PrintWriter out = new PrintWriter(fw)) {
+            File file = new File("writeconcern_tps_" + serverId + ".csv");
+            if (file.length() == 0) {
+                StringBuilder header = new StringBuilder("Timestamp");
+                for (int wc = 1; wc <= majority; wc++) {
+                    header.append(",WC").append(wc).append("_TPS");
+                }
+                header.append(",SystemTPS");
+                out.println(header);
+            }
+            StringBuilder row = new StringBuilder();
+            row.append(System.currentTimeMillis());
+            for (int wc = 1; wc <= majority; wc++) {
+                row.append(",").append(String.format("%.2f", wcTpsMap.get(wc)));
+            }
+            row.append(",").append(String.format("%.2f", currentTps));
+            out.println(row);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        double currentLatency = ((double) totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
+        try (FileWriter sysWriter = new FileWriter("system_latency_" + serverId + ".csv", true);
+             PrintWriter sysOut = new PrintWriter(sysWriter)) {
+            File file = new File("system_latency_" + serverId + ".csv");
+            if (file.length() == 0) {
+                sysOut.println("Timestamp,SystemLatency");
+            }
+            sysOut.printf("%d,%.4f\n", System.currentTimeMillis(), currentLatency);
+        } catch (IOException e) {
+            System.err.println("Failed to write system latency to system_latency.csv: " + e.getMessage());
+        }
+
+        boolean isLeader = (currentLeader == serverId);
+        return new TokenBucketSnapshot(
+                currentServerThroughput,
+                currentTps,
+                currentTokens,
+                lastUpdate,
+                majority,
+                wcTpsMap,
+                wcLatencyMap,
+                readLatencyByKey,
+                currentLatency,
+                isLeader);
+    }
+
+    private ProcessResult buildResultWithoutUpgrade(List<TransactionOption> currentBatch, double tokensUsed) {
+        List<ClientMessage> messages = new ArrayList<>(currentBatch.size());
+        double profit = 0.0;
+        for (TransactionOption option : currentBatch) {
+            if (option == null || option.clientMessage == null) {
+                continue;
+            }
+            messages.add(option.clientMessage);
+            if (option.clientMessage.hasT()) {
+                profit += option.clientMessage.getT().getBaseProfit();
+            }
+        }
+        return new ProcessResult(messages, tokensUsed, profit, 0, List.of());
+    }
+
+    private ProcessResult handleTokenBucketMetricsOnly(List<TransactionOption> currentBatch, double totalFollowerTps) {
+        redisLock.writeLock().lock();
+        try {
+            TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
+
+            // No upgrades, no deferrals: execute exactly as received.
+            // backLogTransactions.clear();
+            double tokensUsed = estimateTokensUsedAtOriginalConsistency(currentBatch);
+            ProcessResult result = buildResultWithoutUpgrade(currentBatch, tokensUsed);
+            previousBatchResult = result;
+
+            double remainingTokens = Math.max(0, snapshot.currentTokens - tokensUsed);
+            tokenBucket.updateTokens(remainingTokens, snapshot.lastUpdate);
+
+            System.out.printf(
+                    "\uD83D\uDE80 [Batch Result - No Upgrade] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Remaining Tokens: %.2f | Transactions Upgraded : %d%n",
+                    result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, tokensUsed, remainingTokens,
+                    result.transactionsUpgraded);
+
+            try (FileWriter fw = new FileWriter("tps_" + serverId + ".csv", true);
+                 PrintWriter out = new PrintWriter(fw)) {
+                File file = new File("tps_" + serverId + ".csv");
+                if (file.length() == 0) {
+                    out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
+                }
+                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n",
+                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, tokensUsed,
+                        result.transactionsUpgraded);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            return result;
+        } catch (Exception e) {
+            System.out.println("Error in handleTokenBucketMetricsOnly: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        } finally {
+            redisLock.writeLock().unlock();
+        }
+    }
+
     private void processBatch() {
         // here the logic to process the current batch of transaction will come
         List<TransactionOption> currentBatch = new ArrayList<>();
@@ -1596,9 +1832,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // no need for processing if current batch is empty
         if (currentBatch.isEmpty())
             return;
-
-        ProcessResult result = handleTokenBucket(currentBatch, totalFollowerTps);
+        
+        ProcessResult result = UPGRADE_TRANSACTIONS_ENABLED
+            ? handleTokenBucket(currentBatch, totalFollowerTps)
+            : handleTokenBucketMetricsOnly(currentBatch, totalFollowerTps);
         List<ClientMessage> transactionsToExecute = result.messages;
+
+        // Record before/after upgrade transaction mix for this batch.
+        recordBatchMixBeforeAfterUpgrade(currentBatch, transactionsToExecute);
 
         // Add deferred transactions to the FRONT of the queue for priority processing
         // Note: backLogTransactions is already updated inside
@@ -1733,6 +1974,134 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             });
         }
+    }
+
+    private static final class BatchTransactionMix {
+        int total;
+        int totalReads;
+        int eventualReads;
+        int causalLocalReads;
+        int causalMajorityReads;
+        int linearizableReads;
+        int totalWrites;
+        int writeConcernOther;
+        final int[] writeConcernCounts;
+
+        BatchTransactionMix(int majority) {
+            this.writeConcernCounts = new int[Math.max(majority + 1, 2)];
+        }
+    }
+
+    private BatchTransactionMix summarizeClientMessages(List<ClientMessage> transactions, int majority) {
+        BatchTransactionMix mix = new BatchTransactionMix(majority);
+        for (ClientMessage cm : transactions) {
+            if (cm == null || !cm.hasT()) {
+                continue;
+            }
+            addTransactionToMix(mix, cm);
+        }
+        return mix;
+    }
+
+    private BatchTransactionMix summarizeTransactionOptions(List<TransactionOption> transactions, int majority) {
+        BatchTransactionMix mix = new BatchTransactionMix(majority);
+        for (TransactionOption tx : transactions) {
+            if (tx == null || tx.clientMessage == null || !tx.clientMessage.hasT()) {
+                continue;
+            }
+            addTransactionToMix(mix, tx.clientMessage);
+        }
+        return mix;
+    }
+
+    private void addTransactionToMix(BatchTransactionMix mix, ClientMessage cm) {
+        mix.total++;
+
+        Transaction t = cm.getT();
+        if (t.getIsReadOnly()) {
+            mix.totalReads++;
+            ReadConcern rc = t.getReadConcern();
+            ReadLevel rl = t.getReadLevel();
+
+            if (rc == ReadConcern.CAUSAL) {
+                if (rl == ReadLevel.MAJORITY) {
+                    mix.causalMajorityReads++;
+                } else {
+                    mix.causalLocalReads++;
+                }
+            } else if (rc == ReadConcern.LINEARIZABLE) {
+                mix.linearizableReads++;
+            } else {
+                mix.eventualReads++;
+            }
+            return;
+        }
+
+        mix.totalWrites++;
+        int wc = cm.getWriteConcern();
+        if (wc >= 1 && wc < mix.writeConcernCounts.length) {
+            mix.writeConcernCounts[wc]++;
+        } else {
+            mix.writeConcernOther++;
+        }
+    }
+
+    private void recordBatchMixBeforeAfterUpgrade(List<TransactionOption> beforeUpgrade,
+            List<ClientMessage> afterUpgrade) {
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        BatchTransactionMix before = summarizeTransactionOptions(beforeUpgrade, majority);
+        BatchTransactionMix after = summarizeClientMessages(afterUpgrade, majority);
+
+        String csvPath = "batch_mix_before_after_" + serverId + ".csv";
+        try (FileWriter fw = new FileWriter(csvPath, true);
+                PrintWriter out = new PrintWriter(fw)) {
+            File file = new File(csvPath);
+            if (file.length() == 0) {
+                StringBuilder header = new StringBuilder("Timestamp");
+                appendMixHeader(header, "Before", majority);
+                appendMixHeader(header, "After", majority);
+                out.println(header);
+            }
+
+            StringBuilder row = new StringBuilder();
+            row.append(System.currentTimeMillis());
+            appendMixValues(row, before, majority);
+            appendMixValues(row, after, majority);
+            out.println(row);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void appendMixHeader(StringBuilder sb, String prefix, int majority) {
+        sb.append(",")
+                .append(prefix).append("Total")
+                .append(",").append(prefix).append("Reads")
+                .append(",").append(prefix).append("ReadEventual")
+                .append(",").append(prefix).append("ReadCausalLocal")
+                .append(",").append(prefix).append("ReadCausalMajority")
+                .append(",").append(prefix).append("ReadLinearizable")
+                .append(",").append(prefix).append("Writes");
+
+        for (int wc = 1; wc <= majority; wc++) {
+            sb.append(",").append(prefix).append("WriteWC").append(wc);
+        }
+        sb.append(",").append(prefix).append("WriteWCOther");
+    }
+
+    private void appendMixValues(StringBuilder sb, BatchTransactionMix mix, int majority) {
+        sb.append(",").append(mix.total)
+                .append(",").append(mix.totalReads)
+                .append(",").append(mix.eventualReads)
+                .append(",").append(mix.causalLocalReads)
+                .append(",").append(mix.causalMajorityReads)
+                .append(",").append(mix.linearizableReads)
+                .append(",").append(mix.totalWrites);
+
+        for (int wc = 1; wc <= majority; wc++) {
+            sb.append(",").append(mix.writeConcernCounts[wc]);
+        }
+        sb.append(",").append(mix.writeConcernOther);
     }
 
     // private void printAllWriteConernsThroughputAndLatencies() {
@@ -1996,181 +2365,30 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // we can use lua scripts instead of using lock at application level
         redisLock.writeLock().lock();
         try {
+            TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
 
-            // current metrics
-            double currentServerThroughput = getSystemWideThroughput();
-            double currentTps = getSystemWideThroughput() + totalFollowerTps;
-
-            // Store system TPS (timestamp, tps) in a separate CSV row for each batch
-            int n = currentBatch.size();
-            TokenBucketData tokenBucketData = tokenBucket.getCurrentTokenBucketData();
-            double currentTokens = tokenBucketData.getTokenCount();
-            long lastUpdate = tokenBucketData.getLastUpdateTime();
-
-            // Build writeConcern TPS map
-            int majority = (NUM_OF_SERVERS / 2) + 1;
-            HashMap<Integer, Double> wcTpsMap = new HashMap<>();
-            for (int wc = 1; wc <= majority; wc++) {
-                wcTpsMap.put(wc, getWriteConcernTPS(wc));
-            }
-
-            HashMap<Integer, Double> wcLatencyMap = new HashMap<>();
-            for (int wc = 1; wc <= majority; wc++) {
-                wcLatencyMap.put(wc, blendedLatencyForWC(wc));
-                System.out.printf("Current blended latency for WC=%d is %.2f ms%n", wc, wcLatencyMap.get(wc));
-            }
-            // Store writeConcern latency data in avg_latencies.csv
-            try (FileWriter csvWriter = new FileWriter("avg_latencies_" + serverId + ".csv", true)) {
-                for (int wc = 1; wc <= majority; wc++) {
-                    double avgLatency = wcLatencyMap.get(wc);
-                    csvWriter.write(String.format("%d,%.2f\n", wc, avgLatency));
-                }
-                csvWriter.flush();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-
-            // Print and log read latencies by key buckets
-            HashMap<Integer, Long> rcLatencyMap = new HashMap<>();
-            rcLatencyMap.put(RC_KEY_EVENTUAL_ALL,
-                    getAverageReadConcernLatency(ReadConcern.EVENTUAL, ReadLevel.LOCAL));
-            rcLatencyMap.put(RC_KEY_CAUSAL_LOCAL,
-                    getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.LOCAL));
-            rcLatencyMap.put(RC_KEY_CAUSAL_MAJORITY,
-                    getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.MAJORITY));
-            rcLatencyMap.put(RC_KEY_LINEARIZABLE_ALL,
-                    getAverageReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY));
-
-            System.out.printf("Current avg latency for key=%s is %d ms%n", "EVENTUAL_ALL",
-                    rcLatencyMap.get(RC_KEY_EVENTUAL_ALL));
-            System.out.printf("Current avg latency for key=%s is %d ms%n", "CAUSAL_LOCAL",
-                    rcLatencyMap.get(RC_KEY_CAUSAL_LOCAL));
-            System.out.printf("Current avg latency for key=%s is %d ms%n", "CAUSAL_MAJORITY",
-                    rcLatencyMap.get(RC_KEY_CAUSAL_MAJORITY));
-            System.out.printf("Current avg latency for key=%s is %d ms%n", "LINEARIZABLE_ALL",
-                    rcLatencyMap.get(RC_KEY_LINEARIZABLE_ALL));
-            try (FileWriter csvWriter = new FileWriter("read_latencies_" + serverId + ".csv", true)) {
-                File file = new File("read_latencies_" + serverId + ".csv");
-                if (file.length() == 0) {
-                    csvWriter.write("Timestamp,ReadLatencyKey,AvgLatencyMs\n");
-                }
-                long ts = System.currentTimeMillis();
-                csvWriter.write(String.format("%d,%s,%d\n", ts, "EVENTUAL_ALL", rcLatencyMap.get(RC_KEY_EVENTUAL_ALL)));
-                csvWriter.write(String.format("%d,%s,%d\n", ts, "CAUSAL_LOCAL", rcLatencyMap.get(RC_KEY_CAUSAL_LOCAL)));
-                csvWriter.write(String.format("%d,%s,%d\n", ts, "CAUSAL_MAJORITY", rcLatencyMap.get(RC_KEY_CAUSAL_MAJORITY)));
-                csvWriter.write(String.format("%d,%s,%d\n", ts, "LINEARIZABLE_ALL", rcLatencyMap.get(RC_KEY_LINEARIZABLE_ALL)));
-                csvWriter.flush();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-            // Calculate writeConcern frequency in current batch
-            HashMap<Integer, Integer> wcFrequency = new HashMap<>();
-            for (int wc = 1; wc <= majority; wc++) {
-                wcFrequency.put(wc, 0);
-            }
-            for (TransactionOption tx : currentBatch) {
-                int wc = tx.clientMessage.getWriteConcern();
-                wcFrequency.put(wc, wcFrequency.getOrDefault(wc, 0) + 1);
-            }
-
-            // Record writeConcern frequency in CSV (single row per batch)
-            try (FileWriter fw = new FileWriter("writeconcern_frequency_" + serverId + ".csv", true);
-                    PrintWriter out = new PrintWriter(fw)) {
-                File file = new File("writeconcern_frequency_" + serverId + ".csv");
-                if (file.length() == 0) {
-                    // Write header: Timestamp, WC1, WC2, ..., WC_majority, TotalInBatch
-                    StringBuilder header = new StringBuilder("Timestamp");
-                    for (int wc = 1; wc <= majority; wc++) {
-                        header.append(",WC").append(wc);
-                    }
-                    header.append(",TotalInBatch");
-                    out.println(header);
-                }
-                // Write data row
-                StringBuilder row = new StringBuilder();
-                row.append(System.currentTimeMillis());
-                for (int wc = 1; wc <= majority; wc++) {
-                    row.append(",").append(wcFrequency.get(wc));
-                }
-                row.append(",").append(n);
-                out.println(row);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-
-            // Record writeConcern TPS in CSV (single row per batch)
-            try (FileWriter fw = new FileWriter("writeconcern_tps_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
-                File file = new File("writeconcern_tps_" + serverId + ".csv");
-                if (file.length() == 0) {
-                    // Write header: Timestamp, WC1_TPS, WC2_TPS, ..., WC_majority_TPS, SystemTPS
-                    StringBuilder header = new StringBuilder("Timestamp");
-                    for (int wc = 1; wc <= majority; wc++) {
-                        header.append(",WC").append(wc).append("_TPS");
-                    }
-                    header.append(",SystemTPS");
-                    out.println(header);
-                }
-                // Write data row
-                StringBuilder row = new StringBuilder();
-                row.append(System.currentTimeMillis());
-                for (int wc = 1; wc <= majority; wc++) {
-                    row.append(",").append(String.format("%.2f", wcTpsMap.get(wc)));
-                }
-                row.append(",").append(String.format("%.2f", currentTps));
-                out.println(row);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-
-            ProcessResult result;
-
-            // Using the new TPS-based heuristic approach - pass backLogTransactions
-            // directly
-            // result = transactionBatchProcessor.processWithTPSHeuristic(currentBatch,
-            // currentTps, wcTpsMap,
-            // backLogTransactions);
-
-            double currentLatency = (totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
-            try (FileWriter sysTpsWriter = new FileWriter("system_latency_" + serverId + ".csv", true);
-                    PrintWriter sysTpsOut = new PrintWriter(sysTpsWriter)) {
-                File file = new File("system_latency_" + serverId + ".csv");
-                if (file.length() == 0) {
-                    sysTpsOut.println("Timestamp,SystemLatency");
-                }
-                sysTpsOut.printf("%d,%.4f\n", System.currentTimeMillis(), currentLatency);
-            } catch (IOException e) {
-                System.err.println("Failed to write system TPS to system_latency.csv: " + e.getMessage());
-            }
-
-                // Build read-latency key map for BatchProcessor
-                HashMap<Integer, Double> readLatencyByKey = new HashMap<>();
-                readLatencyByKey.put(RC_KEY_EVENTUAL_ALL,
-                    (double) getAverageReadConcernLatency(ReadConcern.EVENTUAL, ReadLevel.LOCAL));
-                readLatencyByKey.put(RC_KEY_CAUSAL_LOCAL,
-                    (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.LOCAL));
-                readLatencyByKey.put(RC_KEY_CAUSAL_MAJORITY,
-                    (double) getAverageReadConcernLatency(ReadConcern.CAUSAL, ReadLevel.MAJORITY));
-                readLatencyByKey.put(RC_KEY_LINEARIZABLE_ALL,
-                    (double) getAverageReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY));
-
-            boolean isLeader = (currentLeader == serverId);
-
-            result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(currentBatch,
-                    currentLatency, wcLatencyMap, wcTpsMap,
+            ProcessResult result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(
+                    currentBatch,
+                    snapshot.currentLatency,
+                    snapshot.wcLatencyMap,
+                    snapshot.wcTpsMap,
                     getIncomingTransactionsRate(),
-                    backLogTransactions, backlogTracker.isIncreasing(), currentTokens,
-                    readLatencyByKey, isLeader);
+                    backLogTransactions,
+                    backlogTracker.isIncreasing(),
+                    snapshot.currentTokens,
+                    snapshot.readLatencyByKey,
+                    snapshot.isLeader);
 
             // Save result for next RL prediction
             previousBatchResult = result;
 
             // Update the token count in Redis after batch processing
-            double remainingTokens = Math.max(0, currentTokens - result.tokensUsed);
-            tokenBucket.updateTokens(remainingTokens, lastUpdate);
+            double remainingTokens = Math.max(0, snapshot.currentTokens - result.tokensUsed);
+            tokenBucket.updateTokens(remainingTokens, snapshot.lastUpdate);
 
             System.out.printf(
                     "\uD83D\uDE80 [Batch Result] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Remaining Tokens: %.2f | Transactions Upgraded : %d%n",
-                    result.profit, currentServerThroughput, currentTokens, result.tokensUsed, remainingTokens, result.transactionsUpgraded);
+                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.tokensUsed, remainingTokens, result.transactionsUpgraded);
             try (FileWriter fw = new FileWriter("tps_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
 
                 // Write header only if file is empty
@@ -2179,7 +2397,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
                 // Write data row
-                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, currentServerThroughput, currentTokens, result.tokensUsed,
+                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.tokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();
