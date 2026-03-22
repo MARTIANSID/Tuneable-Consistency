@@ -1766,13 +1766,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return new ProcessResult(messages, tokensUsed, profit, 0, List.of());
     }
 
+    private void recordSystemTpsIfLeader(double currentTps) {
+        if (status != ServerCurrentStatus.LEADER) {
+            return;
+        }
+        try (FileWriter fw = new FileWriter("system_tps_global.csv", true);
+             PrintWriter out = new PrintWriter(fw)) {
+            File file = new File("system_tps_global.csv");
+            if (file.length() == 0) {
+                out.println("Timestamp,SystemTPS,LeaderId");
+            }
+            out.printf("%d,%.2f,%d%n", System.currentTimeMillis(), currentTps, serverId);
+        } catch (IOException e) {
+            System.err.println("Failed to write leader system TPS: " + e.getMessage());
+        }
+    }
+
     private ProcessResult handleTokenBucketMetricsOnly(List<TransactionOption> currentBatch, double totalFollowerTps) {
         redisLock.writeLock().lock();
         try {
             TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
+            recordSystemTpsIfLeader(snapshot.currentTps);
 
             // No upgrades, no deferrals: execute exactly as received.
             // backLogTransactions.clear();
+
             double tokensUsed = estimateTokensUsedAtOriginalConsistency(currentBatch);
             ProcessResult result = buildResultWithoutUpgrade(currentBatch, tokensUsed);
             previousBatchResult = result;
@@ -1797,7 +1815,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-
             return result;
         } catch (Exception e) {
             System.out.println("Error in handleTokenBucketMetricsOnly: " + e.getMessage());
@@ -2368,6 +2385,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         redisLock.writeLock().lock();
         try {
             TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
+            recordSystemTpsIfLeader(snapshot.currentTps);
 
             ProcessResult result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(
                     currentBatch,
@@ -2404,6 +2422,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             } catch (IOException e) {
                 e.printStackTrace();
             }
+
+         
 
             return result;
         } catch (Exception e) {

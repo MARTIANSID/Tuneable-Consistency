@@ -56,17 +56,23 @@ public class Servers{
         String name;
         int durationSeconds;
         int totalTPS;
+                double readPercentage; // system-wide read share (0.0 to 1.0)
+                double writePercentage; // system-wide write share (0.0 to 1.0)
         Map<ReadClass, Double> readDistribution; // system-wide read shares by class
         Map<Integer, Double> writeDistribution; // system-wide write shares by writeConcern
 
         Phase(String name,
               int durationSeconds,
               int totalTPS,
+                            double readPercentage,
+                            double writePercentage,
               Map<ReadClass, Double> readDistribution,
               Map<Integer, Double> writeDistribution) {
             this.name = name;
             this.durationSeconds = durationSeconds;
             this.totalTPS = totalTPS;
+                        this.readPercentage = readPercentage;
+                        this.writePercentage = writePercentage;
             this.readDistribution = readDistribution;
             this.writeDistribution = writeDistribution;
         }
@@ -74,39 +80,39 @@ public class Servers{
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
-        // light workload: read-heavy mix (90% reads, 10% writes)
-        PHASES.add(new Phase(
-            "Light", 50, 10000,
-            Map.of(
-                ReadClass.EVENTUAL, 0.70,
-                ReadClass.CAUSAL_LOCAL, 0.12,
-                ReadClass.CAUSAL_MAJORITY, 0.06,
-                ReadClass.LINEARIZABLE, 0.02
-            ),
-            Map.of(1, 0.08, 2, 0.02)
-        ));
-        // heavy workload: more strict writes and stricter reads
-        PHASES.add(new Phase(
-            "Heavy", 50, 10000,
-            Map.of(
-                ReadClass.EVENTUAL, 0.50,
-                ReadClass.CAUSAL_LOCAL, 0.12,
-                ReadClass.CAUSAL_MAJORITY, 0.08,
+        // Experiment 1: tunability under changing load
+        // Fixed R/W mix across all phases: 90% reads, 10% writes
+        // Sequence: Light -> Medium -> Heavy -> Light
+        Map<ReadClass, Double> lightReadDist = Map.of(
+                ReadClass.EVENTUAL, 0.80,
+                ReadClass.CAUSAL_LOCAL, 0.10,
+                ReadClass.CAUSAL_MAJORITY, 0.05,
                 ReadClass.LINEARIZABLE, 0.05
-            ),
-            Map.of(1, 0.10, 2, 0.15)
-        ));
-        // medium workload: read-heavy but less skewed than Light
-        PHASES.add(new Phase(
-            "Medium", 50, 10000,
-            Map.of(
-                ReadClass.EVENTUAL, 0.58,
-                ReadClass.CAUSAL_LOCAL, 0.12,
+        );
+        Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
+
+        Map<ReadClass, Double> mediumReadDist = Map.of(
+                ReadClass.EVENTUAL, 0.25,
+                ReadClass.CAUSAL_LOCAL, 0.25,
+                ReadClass.CAUSAL_MAJORITY, 0.25,
+                ReadClass.LINEARIZABLE, 0.25
+        );
+
+        Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
+
+        Map<ReadClass, Double> heavyReadDist = Map.of(
+                ReadClass.EVENTUAL, 0.05,
+                ReadClass.CAUSAL_LOCAL, 0.05,
                 ReadClass.CAUSAL_MAJORITY, 0.10,
-                ReadClass.LINEARIZABLE, 0.05
-            ),
-            Map.of(1, 0.10, 2, 0.05)
-        ));
+                ReadClass.LINEARIZABLE, 0.80
+        );
+
+        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
+
+        PHASES.add(new Phase("Light", 50, 6000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Medium", 50, 10000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
+        PHASES.add(new Phase("Heavy", 50, 14000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+        PHASES.add(new Phase("Light", 50, 6000, 0.90, 0.10, lightReadDist, lightWriteDist));
     }
 
     // Phase execution mode
@@ -128,7 +134,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 150000;  // 150 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 200000;  // 200 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -341,6 +347,7 @@ public class Servers{
         System.out.printf("📌 Starting Phase %d/%d: %s (Experiment time remaining: %ds)%n", 
                 phaseNum, PHASES.size(), newPhase.name, remainingSeconds);
         System.out.printf("   Duration: %ds | Total TPS: %d%n", newPhase.durationSeconds, newPhase.totalTPS);
+        System.out.printf("   Read%%: %.2f | Write%%: %.2f%n", newPhase.readPercentage * 100.0, newPhase.writePercentage * 100.0);
         System.out.printf("   Read Distribution: %s%n", newPhase.readDistribution);
         System.out.printf("   Write Distribution: %s%n", newPhase.writeDistribution);
         System.out.println("========================================");
@@ -459,11 +466,13 @@ public class Servers{
         System.out.println("   Phases:");
         int totalDuration = 0;
         for (Phase p : PHASES) {
-            System.out.printf("   %d. %s: %ds | TotalTPS=%d | Reads=%s | Writes=%s%n",
+            System.out.printf("   %d. %s: %ds | TotalTPS=%d | Read%%=%.2f | Write%%=%.2f | Reads=%s | Writes=%s%n",
                 PHASES.indexOf(p) + 1,
                 p.name,
                 p.durationSeconds,
                 p.totalTPS,
+                p.readPercentage * 100.0,
+                p.writePercentage * 100.0,
                 p.readDistribution,
                 p.writeDistribution);
             totalDuration += p.durationSeconds;
@@ -481,7 +490,7 @@ public class Servers{
 
         Map<ServerImpl, List<TransactionOption>> perServerBatch = new HashMap<>();
 
-        int readCount = computeOperationCount(size, phase.readDistribution, phase.writeDistribution);
+        int readCount = computeReadCount(size, phase);
         int writeCount = Math.max(0, size - readCount);
 
         Map<ReadClass, Double> normalizedReadDistribution = normalizeDistribution(phase.readDistribution);
@@ -640,25 +649,18 @@ public class Servers{
                 .build();
     }
 
-    private static int computeOperationCount(int total,
-                                             Map<?, Double> primaryDistribution,
-                                             Map<?, Double> secondaryDistribution) {
-        double primary = sumPositiveWeights(primaryDistribution);
-        double secondary = sumPositiveWeights(secondaryDistribution);
-        double combined = primary + secondary;
-        if (combined <= 0.0 || total <= 0) {
+    private static int computeReadCount(int total, Phase phase) {
+        if (total <= 0 || phase == null) {
             return 0;
         }
-        return (int) Math.round(total * (primary / combined));
-    }
-
-    private static double sumPositiveWeights(Map<?, Double> distribution) {
-        if (distribution == null || distribution.isEmpty()) {
-            return 0.0;
+        double read = Math.max(0.0, phase.readPercentage);
+        double write = Math.max(0.0, phase.writePercentage);
+        double sum = read + write;
+        if (sum <= 0.0) {
+            return 0;
         }
-        return distribution.values().stream()
-                .mapToDouble(v -> Math.max(0.0, v))
-                .sum();
+        double normalizedRead = read / sum;
+        return (int) Math.round(total * normalizedRead);
     }
 
     private static <T> Map<T, Double> normalizeDistribution(Map<T, Double> distribution) {
@@ -905,7 +907,8 @@ public class Servers{
             "token_costs.csv",
             "lab1_Test.csv",
             "final_batch_avg_tps_log.csv",
-            "incoming_transaction_rate_global.csv"
+            "incoming_transaction_rate_global.csv",
+            "system_tps_global.csv"
         };
 
         for (int sid = 0; sid < NUM_OF_SERVERS; sid++) {
