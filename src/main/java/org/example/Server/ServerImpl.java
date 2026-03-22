@@ -1722,8 +1722,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         } catch (IOException e) {
             e.printStackTrace();
         }
-
-        double currentLatency = ((double) totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
+        double currentLatency;
+        synchronized(systemWideLatency) {
+            currentLatency = ((double) totalSystemWideLatency.get() / Math.max(1, countOfSystemWideLatencies.get()));
+        }
         try (FileWriter sysWriter = new FileWriter("system_latency_" + serverId + ".csv", true);
              PrintWriter sysOut = new PrintWriter(sysWriter)) {
             File file = new File("system_latency_" + serverId + ".csv");
