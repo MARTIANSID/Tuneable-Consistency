@@ -169,6 +169,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     AtomicLongArray lastHeartBeatSent;
     AtomicIntegerArray lastIndexSent;
+    // When true, this node stops all Raft inter-server network communication.
+    private volatile boolean dropAllServerNetworkTraffic;
 
     BatchProcessor transactionBatchProcessor;
 
@@ -261,8 +263,20 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public static void setUpgradeTransactionsEnabled(boolean enabled) {
         UPGRADE_TRANSACTIONS_ENABLED = enabled;
     }
+    public void setDropAllServerNetworkTraffic(boolean enabled) {
+        this.dropAllServerNetworkTraffic = enabled;
+    }
+
+    public boolean isDropAllServerNetworkTraffic() {
+        return dropAllServerNetworkTraffic;
+    }
+
+    private boolean shouldDropServerNetworkTraffic() {
+        return dropAllServerNetworkTraffic;
+    }
 
     public ServerImpl(int serverId, int NUM_OF_SERVERS) {
+        this.dropAllServerNetworkTraffic = false;
         this.currentTerm = new AtomicInteger(0);
         this.votedFor = -1;
         this.commitIndex = new AtomicInteger(-1);
@@ -406,6 +420,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     @Override
     public void appendEntries(AppendEntriesArgument appendEntriesArgument,
             StreamObserver<AppendEntriesResult> responseObserver) {
+            if (shouldDropServerNetworkTraffic()) {
+                responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("Node is configured as failed: appendEntries dropped")
+                    .asRuntimeException());
+                return;
+            }
         int leadersTerm = appendEntriesArgument.getLeadersTerm(),
                 prevLogIndex = appendEntriesArgument.getPrevLogIndex(),
                 prevLogTerm = appendEntriesArgument.getPrevLogTerm(),
@@ -569,6 +589,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     @Override
     public void requestVote(RequestVoteArguments requestVoteArguments,
             StreamObserver<RequestVoteResult> responseObserver) {
+            if (shouldDropServerNetworkTraffic()) {
+                responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("Node is configured as failed: requestVote dropped")
+                    .asRuntimeException());
+                return;
+            }
         int currentTermOfTheCandidate = requestVoteArguments.getCandidatesTerm(),
                 lastLogIndexOfCandidate = requestVoteArguments.getLastLogIndex(),
                 lastLogTermOfCandidate = requestVoteArguments.getLastLogTerm(),
@@ -614,6 +640,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void sendTransaction(ClientMessage clientMessage, StreamObserver<Empty> responseObserver) {
+            if (shouldDropServerNetworkTraffic()) {
+                responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("Node is configured as failed: sendTransaction dropped")
+                    .asRuntimeException());
+                return;
+            }
         // check if the current node is leader or not, if not forward request to leader,
         // this might fail if election is going on
         if (serverId != currentLeader && currentLeader != -1) {
@@ -780,6 +812,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void requestForVotes(RequestVoteArguments requestVoteArguments) {
+        if (shouldDropServerNetworkTraffic()) {
+            return;
+        }
+
         // here I have deducted one because obviously the server requesting for votes,
         // will not be responding to requestVote rpc
         // also we expect response from total servers - 1
@@ -1061,6 +1097,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     @Override
     public void sendAckToAllServers(Ack ack, StreamObserver<Empty> responseObserver) {
+        if (shouldDropServerNetworkTraffic()) {
+            responseObserver.onError(Status.UNAVAILABLE
+                .withDescription("Node is configured as failed: sendAckToAllServers dropped")
+                .asRuntimeException());
+            return;
+        }
         List<AckMessage> ackMessages = ack.getAckMessageList();
     }
 
@@ -1328,9 +1370,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // }
     private void sendAppendEntries() {
 
-        final int MAX_ENTRIES_PER_RPC = 1000;
+        final int MAX_ENTRIES_PER_RPC = 20000;
 
         sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
+
+            if (shouldDropServerNetworkTraffic()) {
+                return;
+            }
 
             if (status != ServerCurrentStatus.LEADER)
                 return;
@@ -1408,6 +1454,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             .setSystemThroughput(combinedSystemThroughput)
                             .build();
 
+                            if (shouldDropServerNetworkTraffic()) {
+                            return;
+                            }
+
                     stubs[followerId].appendEntries(
                             request,
                             new StreamObserver<AppendEntriesResult>() {
@@ -1437,7 +1487,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 });
             }
 
-        }, 0, 80, TimeUnit.MILLISECONDS);
+        }, 0, 30, TimeUnit.MILLISECONDS);
     }
 
     // already in writeLock
@@ -1462,6 +1512,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     public void startElection() {
+        if (shouldDropServerNetworkTraffic()) {
+            return;
+        }
+
         lock.writeLock().lock();// Acquire the write lock for the entire election process
         RequestVoteArguments requestVoteArguments;
         try {
@@ -2574,7 +2628,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     .convertToTimeStamp(cm.getTimeStamp());
 
             long startTime = System.nanoTime();
-            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
+            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(150);
 
             String clientId = getClientId(host, port);
             RaftStub clientStub = clientStubs.computeIfAbsent(clientId, k -> createClientStub(host, port));

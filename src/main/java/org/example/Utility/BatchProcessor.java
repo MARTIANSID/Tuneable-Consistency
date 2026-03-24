@@ -648,7 +648,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ? 60 : 40;
+    MAX_LATENCY = isLeader ? 60 : 50;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {

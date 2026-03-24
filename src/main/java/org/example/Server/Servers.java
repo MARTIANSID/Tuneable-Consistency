@@ -36,6 +36,22 @@ public class Servers{
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
     private static final boolean UPGRADE_TRANSACTIONS = false;
+
+    // Simulate node failure by dropping all inter-server network RPCs on one node.
+    // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
+    private static final boolean ENABLE_NODE_NETWORK_FAILURE = false;
+    private static final int FAILED_NODE_ID = 0;
+
+    enum FailureTargetRole {
+        LEADER,
+        FOLLOWER
+    }
+
+    // Timed failure: fail one node N seconds after experiment start.
+    // Target can be LEADER or FOLLOWER at trigger time.
+    private static final boolean ENABLE_TIMED_NODE_FAILURE = false;
+    private static final FailureTargetRole FAILURE_TARGET_ROLE = FailureTargetRole.LEADER;
+    private static final int FAILURE_AFTER_SECONDS = 30;
     
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
@@ -50,6 +66,12 @@ public class Servers{
         CAUSAL_LOCAL,
         CAUSAL_MAJORITY,
         EVENTUAL
+    }
+
+    enum WorkloadProfile {
+        LIGHT,
+        MEDIUM,
+        HEAVY
     }
 
     static class Phase {
@@ -80,6 +102,8 @@ public class Servers{
 
     private static final List<Phase> PHASES = new ArrayList<>();
     static {
+        int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
+
         // Experiment 1: tunability under changing load
         // Fixed R/W mix across all phases: 90% reads, 10% writes
         // Sequence: Light -> Medium -> Heavy -> Light
@@ -89,30 +113,63 @@ public class Servers{
                 ReadClass.CAUSAL_MAJORITY, 0.05,
                 ReadClass.LINEARIZABLE, 0.05
         );
-        Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
+        // Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
 
-        Map<ReadClass, Double> mediumReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.25,
-                ReadClass.CAUSAL_LOCAL, 0.25,
-                ReadClass.CAUSAL_MAJORITY, 0.25,
-                ReadClass.LINEARIZABLE, 0.25
+        // Map<ReadClass, Double> mediumReadDist = Map.of(
+        //         ReadClass.EVENTUAL, 0.25,
+        //         ReadClass.CAUSAL_LOCAL, 0.25,
+        //         ReadClass.CAUSAL_MAJORITY, 0.25,
+        //         ReadClass.LINEARIZABLE, 0.25
+        // );
+
+        // Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
+
+        // Map<ReadClass, Double> heavyReadDist = Map.of(
+        //         ReadClass.EVENTUAL, 0.05,
+        //         ReadClass.CAUSAL_LOCAL, 0.05,
+        //         ReadClass.CAUSAL_MAJORITY, 0.10,
+        //         ReadClass.LINEARIZABLE, 0.80
+        // );
+
+        // Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
+
+        List<ReadClass> readLevelsLowToHigh = List.of(
+            ReadClass.EVENTUAL,
+            ReadClass.CAUSAL_LOCAL,
+            ReadClass.CAUSAL_MAJORITY,
+            ReadClass.LINEARIZABLE
         );
+        List<Integer> writeLevelsLowToHigh = new ArrayList<>();
+        for (int wc = 1; wc <= majorityLevel; wc++) {
+            writeLevelsLowToHigh.add(wc);
+        }
 
-        Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
+        // Map<ReadClass, Double> lightReadDist = buildConsistencyDistribution(
+        //     readLevelsLowToHigh,
+        //     WorkloadProfile.LIGHT,
+        //     0.10);
+        // Map<ReadClass, Double> mediumReadDist = buildConsistencyDistribution(
+        //     readLevelsLowToHigh,
+        //     WorkloadProfile.MEDIUM,
+        //     0.10);
+        // Map<ReadClass, Double> heavyReadDist = buildConsistencyDistribution(
+        //     readLevelsLowToHigh,
+        //     WorkloadProfile.HEAVY,
+        //     0.10);
 
-        Map<ReadClass, Double> heavyReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.05,
-                ReadClass.CAUSAL_LOCAL, 0.05,
-                ReadClass.CAUSAL_MAJORITY, 0.10,
-                ReadClass.LINEARIZABLE, 0.80
-        );
+        double writeTailShare = getLightNonDominantShare(writeLevelsLowToHigh.size());
+        Map<Integer, Double> lightWriteDist = buildConsistencyDistribution(
+            writeLevelsLowToHigh,
+            WorkloadProfile.LIGHT,
+            writeTailShare);
+        // Keep writes light across all phases, especially for larger server counts.
+        Map<Integer, Double> mediumWriteDist = lightWriteDist;
+        Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
-        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
-
-        PHASES.add(new Phase("Light", 50, 6000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Medium", 50, 10000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
-        PHASES.add(new Phase("Heavy", 50, 14000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
-        PHASES.add(new Phase("Light", 50, 6000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 80000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
     }
 
     // Phase execution mode
@@ -134,7 +191,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 200000;  // 200 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 240000;  // 240 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -182,6 +239,8 @@ public class Servers{
             servers.add(server);
             serversImpl.add(serverImpl);
         }
+
+        applyNodeFailureConfig(serversImpl);
         
         // Initialize the TransactionInjector
         injector = new TransactionInjector(serversImpl);
@@ -199,6 +258,84 @@ public class Servers{
                     Thread.currentThread().interrupt();
                 }
         }
+    }
+
+    private static void applyNodeFailureConfig(List<ServerImpl> serversImpl) {
+        if (!ENABLE_NODE_NETWORK_FAILURE) {
+            return;
+        }
+
+        if (FAILED_NODE_ID < 0 || FAILED_NODE_ID >= serversImpl.size()) {
+            System.err.printf("Invalid FAILED_NODE_ID=%d (valid range: 0 to %d)%n",
+                    FAILED_NODE_ID,
+                    Math.max(0, serversImpl.size() - 1));
+            return;
+        }
+
+        ServerImpl failedNode = serversImpl.get(FAILED_NODE_ID);
+        failedNode.setDropAllServerNetworkTraffic(true);
+        System.out.printf("⚠️ Simulated node failure enabled on server %d (inter-server RPCs are dropped)%n",
+                FAILED_NODE_ID);
+    }
+
+    private static void scheduleTimedNodeFailure() {
+        if (!ENABLE_TIMED_NODE_FAILURE) {
+            return;
+        }
+
+        Thread failureScheduler = new Thread(() -> {
+            long triggerAtMs = experimentStartTime + (Math.max(0, FAILURE_AFTER_SECONDS) * 1000L);
+            while (experimentRunning && !Thread.currentThread().isInterrupted()) {
+                if (System.currentTimeMillis() >= triggerAtMs) {
+                    injectTimedFailure();
+                    return;
+                }
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "TimedFailureScheduler");
+
+        failureScheduler.setDaemon(true);
+        failureScheduler.start();
+    }
+
+    private static void injectTimedFailure() {
+        ServerImpl leader = injector.getLeader();
+        ServerImpl target = null;
+
+        if (FAILURE_TARGET_ROLE == FailureTargetRole.LEADER) {
+            target = leader;
+        } else {
+            int leaderId = findLeaderId(leader);
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (i == leaderId) {
+                    continue;
+                }
+                ServerImpl candidate = injector.getServerById(i);
+                if (candidate != null) {
+                    target = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (target == null) {
+            System.err.printf("❌ Timed failure skipped at t=%ds. Could not resolve target=%s%n",
+                    FAILURE_AFTER_SECONDS,
+                    FAILURE_TARGET_ROLE);
+            return;
+        }
+
+        target.setDropAllServerNetworkTraffic(true);
+        int targetId = findLeaderId(target);
+        System.out.printf("⚠️ Timed failure injected at t=%ds on %s node (serverId=%d)%n",
+                FAILURE_AFTER_SECONDS,
+                FAILURE_TARGET_ROLE,
+                targetId);
     }
 
     /**
@@ -221,6 +358,7 @@ public class Servers{
         experimentStartTime = System.currentTimeMillis();
         experimentRunning = true;
         selectAndStartNewPhase();
+        scheduleTimedNodeFailure();
         
         // Thread 1: Phase Manager - switches phases and monitors total experiment time
         Thread phaseManager = new Thread(() -> {
@@ -737,6 +875,64 @@ public class Servers{
         return result;
     }
 
+    private static <T> Map<T, Double> buildConsistencyDistribution(List<T> levelsLowToHigh,
+                                                                    WorkloadProfile profile,
+                                                                    double nonExtremesShare) {
+        Map<T, Double> distribution = new HashMap<>();
+        if (levelsLowToHigh == null || levelsLowToHigh.isEmpty()) {
+            return distribution;
+        }
+
+        int n = levelsLowToHigh.size();
+        if (profile == WorkloadProfile.MEDIUM) {
+            double equalShare = 1.0 / n;
+            for (T level : levelsLowToHigh) {
+                distribution.put(level, equalShare);
+            }
+            return distribution;
+        }
+
+        if (n == 1) {
+            distribution.put(levelsLowToHigh.get(0), 1.0);
+            return distribution;
+        }
+
+        double perNonExtreme = Math.max(0.0, nonExtremesShare);
+        if ((n - 1) * perNonExtreme > 1.0) {
+            // If there are too many levels for the requested fixed share,
+            // degrade safely to equal distribution.
+            double equalShare = 1.0 / n;
+            for (T level : levelsLowToHigh) {
+                distribution.put(level, equalShare);
+            }
+            return distribution;
+        }
+
+        double dominantShare = 1.0 - ((n - 1) * perNonExtreme);
+        T lowest = levelsLowToHigh.get(0);
+        T highest = levelsLowToHigh.get(n - 1);
+
+        for (T level : levelsLowToHigh) {
+            distribution.put(level, perNonExtreme);
+        }
+
+        if (profile == WorkloadProfile.HEAVY) {
+            distribution.put(highest, dominantShare);
+        } else {
+            distribution.put(lowest, dominantShare);
+        }
+
+        return distribution;
+    }
+
+    private static double getLightNonDominantShare(int levelCount) {
+        if (levelCount <= 1) {
+            return 0.0;
+        }
+        // For larger clusters, shrink non-dominant shares so low consistency stays dominant.
+        return Math.min(0.10, 0.20 / (levelCount - 1));
+    }
+
     private static int findLeaderId(ServerImpl leader) {
         if (leader == null) {
             return -1;
@@ -911,7 +1107,7 @@ public class Servers{
             "system_tps_global.csv"
         };
 
-        for (int sid = 0; sid < NUM_OF_SERVERS; sid++) {
+        for (int sid = 0; sid < 30; sid++) {
             for (String pattern : perServerFiles) {
                 String filename = String.format(pattern, sid);
                 File file = new File(filename);
