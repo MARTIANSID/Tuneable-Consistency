@@ -36,6 +36,9 @@ public class TransactionInjector {
             return null;
         }
         for (ServerImpl server : servers) {
+            if (server.isDropAllServerNetworkTraffic()) {
+                continue;
+            }
             if (server.status == ServerStatus.ServerCurrentStatus.LEADER) {
                 return server;
             }

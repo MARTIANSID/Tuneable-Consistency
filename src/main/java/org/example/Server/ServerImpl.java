@@ -240,6 +240,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private static final double TPS_EPSILON = 0.20; // allow up to +20% over TPS_min budget
     private static final double BUCKET_FRACTION_MAX = 0.95; // max 6% of bucket per request
     private static final double DEFAULT_BUDGET = 10000.0; // default budget for transaction processing
+    private static final long FOLLOWER_TPS_STALE_MS = 400L;
 
     double[] followerReadThroughput;
 
@@ -1117,6 +1118,25 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             queue.add(timeStampOfTransaction);
     }
 
+    private double getFreshFollowerReadThroughputSum(long nowMs) {
+        lock.readLock().lock();
+        try {
+            double sum = 0.0;
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (i == serverId) {
+                    continue;
+                }
+                long lastSeen = lastHeartBeatReceived[i].get();
+                if (lastSeen > 0 && (nowMs - lastSeen) <= FOLLOWER_TPS_STALE_MS) {
+                    sum += followerReadThroughput[i];
+                }
+            }
+            return sum;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     // we can optimize the write lock here
     private boolean handleAppendEntriesResult(AppendEntriesResult appendEntriesResult, int matchIndexOfFollower,
             int prevNextIndex) {
@@ -1423,7 +1443,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         includeThroughput = (now - lastThroughputSentTime.get(followerId) >= 200);
                         if (includeThroughput) {
                             lastThroughputSentTime.set(followerId, now);
-                            combinedSystemThroughput = combinedThroughputOfFollowers + getSystemWideThroughput();
+                            double freshFollowerTps = getFreshFollowerReadThroughputSum(now);
+                            combinedSystemThroughput = freshFollowerTps + getSystemWideThroughput();
                         }
 
                         lastHeartBeatSent.set(followerId, now);
@@ -1596,6 +1617,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void processBatchWithErrorHandling() {
+        if (shouldDropServerNetworkTraffic()) {
+            return;
+        }
         try {
             processBatch();
         } catch (Exception e) {
@@ -1880,6 +1904,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private void processBatch() {
+        if (shouldDropServerNetworkTraffic()) {
+            return;
+        }
+
         // here the logic to process the current batch of transaction will come
         List<TransactionOption> currentBatch = new ArrayList<>();
         double totalFollowerTps = 0;
@@ -1897,7 +1925,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             int currentNumberOfTransactionsInQueue = batchOfTransactions.size();
             // we need to verify if the above quantity is growing over time
 
-            totalFollowerTps = combinedThroughputOfFollowers;
+            totalFollowerTps = getFreshFollowerReadThroughputSum(System.currentTimeMillis());
         } finally {
             batchLock.unlock();
         }
@@ -2605,6 +2633,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
+    private Ack buildFailureAck(String accName, String id) {
+        return Ack.newBuilder()
+                .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+                .build();
+    }
+
     /**
      * Process a read request from the batch.
      * Returns an Ack for immediate reads (EVENTUAL), or null when the result
@@ -2620,6 +2654,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         ReadConcern readConcern = t.getReadConcern();
         long arrivalTime = t.getTransactionArrivalTimeOnLeader();
 
+        if (shouldDropServerNetworkTraffic()) {
+            return buildFailureAck(accName, id);
+        }
+
         int majority = (NUM_OF_SERVERS / 2) + 1;
 
         if (readConcern == ReadConcern.CAUSAL) {
@@ -2628,7 +2666,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     .convertToTimeStamp(cm.getTimeStamp());
 
             long startTime = System.nanoTime();
-            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(150);
+            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(200);
 
             String clientId = getClientId(host, port);
             RaftStub clientStub = clientStubs.computeIfAbsent(clientId, k -> createClientStub(host, port));
@@ -2636,6 +2674,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             Runnable checkLogTask = new Runnable() {
                 @Override
                 public void run() {
+                    if (shouldDropServerNetworkTraffic()) {
+                        clientStub.sendAckToClient(buildFailureAck(accName, id), new StreamObserver<Empty>() {
+                            @Override public void onNext(Empty value) {}
+                            @Override public void onError(Throwable t) {}
+                            @Override public void onCompleted() {}
+                        });
+                        return;
+                    }
+
                     if (System.nanoTime() - startTime > maxWaitNanos) {
                         // Timeout — record latency and send failure ack to client
                         long failNow = System.currentTimeMillis();
@@ -2654,9 +2701,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             countOfSystemWideLatencies.incrementAndGet();
                         }
                         recordReadConcernLatency(readConcern, readLevel, arrivalTime);
-                        Ack failAck = Ack.newBuilder()
-                                .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-                                .build();
+                        Ack failAck = buildFailureAck(accName, id);
                         clientStub.sendAckToClient(failAck, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}

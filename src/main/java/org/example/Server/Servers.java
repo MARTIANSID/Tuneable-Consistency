@@ -35,7 +35,7 @@ public class Servers{
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = false;
+    private static final boolean UPGRADE_TRANSACTIONS = true;
 
     // Simulate node failure by dropping all inter-server network RPCs on one node.
     // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
@@ -50,7 +50,7 @@ public class Servers{
     // Timed failure: fail one node N seconds after experiment start.
     // Target can be LEADER or FOLLOWER at trigger time.
     private static final boolean ENABLE_TIMED_NODE_FAILURE = false;
-    private static final FailureTargetRole FAILURE_TARGET_ROLE = FailureTargetRole.LEADER;
+    private static final FailureTargetRole FAILURE_TARGET_ROLE = FailureTargetRole.FOLLOWER;
     private static final int FAILURE_AFTER_SECONDS = 30;
     
     // Static reference to TransactionInjector for testing
@@ -133,6 +133,9 @@ public class Servers{
 
         // Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
 
+        Map<Integer, Double> allMajority = Map.of(1, 0.0, 2, 1.0);
+
+
         List<ReadClass> readLevelsLowToHigh = List.of(
             ReadClass.EVENTUAL,
             ReadClass.CAUSAL_LOCAL,
@@ -166,7 +169,10 @@ public class Servers{
         Map<Integer, Double> mediumWriteDist = lightWriteDist;
         Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
-        PHASES.add(new Phase("Light", 60, 80000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60,25000, 0, 1, lightReadDist, allMajority));
+        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -191,7 +197,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 240000;  // 240 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 100000;  // 240 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
@@ -336,6 +342,43 @@ public class Servers{
                 FAILURE_AFTER_SECONDS,
                 FAILURE_TARGET_ROLE,
                 targetId);
+
+        if (FAILURE_TARGET_ROLE == FailureTargetRole.LEADER) {
+            monitorNewLeaderAfterFailure(targetId);
+        }
+    }
+
+    private static void monitorNewLeaderAfterFailure(int failedLeaderId) {
+        Thread reElectionMonitor = new Thread(() -> {
+            long timeoutMs = 15000L;
+            long deadline = System.currentTimeMillis() + timeoutMs;
+
+            while (experimentRunning && !Thread.currentThread().isInterrupted() && System.currentTimeMillis() < deadline) {
+                ServerImpl newLeader = injector.getLeader();
+                int newLeaderId = findLeaderId(newLeader);
+
+                if (newLeaderId >= 0 && newLeaderId != failedLeaderId) {
+                    System.out.printf("✅ New leader elected after failure: serverId=%d (failed leader was serverId=%d)%n",
+                            newLeaderId,
+                            failedLeaderId);
+                    return;
+                }
+
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+
+            System.err.printf("❌ No new leader detected within %.1fs after failing leader serverId=%d%n",
+                    timeoutMs / 1000.0,
+                    failedLeaderId);
+        }, "LeaderReElectionMonitor");
+
+        reElectionMonitor.setDaemon(true);
+        reElectionMonitor.start();
     }
 
     /**
