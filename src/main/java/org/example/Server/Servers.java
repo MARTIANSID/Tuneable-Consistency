@@ -3,6 +3,8 @@ package org.example.Server;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.BufferedReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.util.ArrayList;
@@ -15,6 +17,7 @@ import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import io.grpc.Server;
@@ -41,6 +44,20 @@ public class Servers{
     // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
     private static final boolean ENABLE_NODE_NETWORK_FAILURE = false;
     private static final int FAILED_NODE_ID = 0;
+
+    // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
+    // using runtime values including the selected callback port.
+    private static final boolean ENABLE_GEO_SETTINGS = true;
+    private static final int GEO_LATENCY_MS = 100;
+    private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
+    // true => also delay client callback/ack port; false => delay only server ports (8001..)
+    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
+    private static final String GEO_SCRIPT_PATH = "./simulate_geo_latency.sh";
+    private static final int GEO_SCRIPT_TIMEOUT_SECONDS = 10;
+    private static final boolean CLEAR_GEO_SETTINGS_ON_EXIT = true;
+    // When true, run the geo script with "sudo -n" (no password prompt).
+    // Configure sudoers accordingly if passwordless sudo is required.
+    private static final boolean USE_SUDO_FOR_GEO_SCRIPT = true;
 
     enum FailureTargetRole {
         LEADER,
@@ -170,9 +187,10 @@ public class Servers{
         Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
         // PHASES.add(new Phase("Light", 60,25000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 20, 50000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -223,12 +241,15 @@ public class Servers{
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
         clientCallbackPort = findAvailablePort(9000, 9100);
+        
         clientCallbackServer = ServerBuilder.forPort(clientCallbackPort)
             .addService(clientServerImpl)
             .build()
             .start();
         clientServerImpl.setUpStubs();
         System.out.println("Client callback server started on port " + clientCallbackPort);
+
+        applyGeoSettingsIfEnabled(clientCallbackPort);
         
         List<Server> servers = new ArrayList<>();
         List<ServerImpl> serversImpl = new ArrayList<>();
@@ -264,6 +285,101 @@ public class Servers{
                     Thread.currentThread().interrupt();
                 }
         }
+    }
+
+    private static void applyGeoSettingsIfEnabled(int callbackPort) {
+        if (!ENABLE_GEO_SETTINGS) {
+            return;
+        }
+
+        if (!isRunningAsRoot() && !USE_SUDO_FOR_GEO_SCRIPT) {
+            System.err.println("Geo settings enabled but current process is not root; skipping geo apply/clear.");
+            System.err.println("Run with sudo, or enable USE_SUDO_FOR_GEO_SCRIPT, to manage tc/netem automatically.");
+            return;
+        }
+
+        runGeoScript("apply", GEO_LATENCY_MS, GEO_NUM_SERVERS, callbackPort);
+
+        if (CLEAR_GEO_SETTINGS_ON_EXIT) {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                runGeoScript("clear", 0, 0, 0);
+            }, "GeoSettingsCleanup"));
+        }
+    }
+
+    private static void runGeoScript(String action, int latencyMs, int numServers, int callbackPort) {
+        List<String> command = new ArrayList<>();
+
+        if (USE_SUDO_FOR_GEO_SCRIPT && !isRunningAsRoot()) {
+            command.add("sudo");
+            command.add("-n");
+        }
+
+        command.add("bash");
+        command.add(GEO_SCRIPT_PATH);
+        command.add(action);
+
+        if ("apply".equals(action)) {
+            command.add(String.valueOf(latencyMs));
+            command.add(String.valueOf(numServers));
+            command.add(GEO_INCLUDE_CLIENT_CALLBACK_LATENCY
+                    ? String.valueOf(callbackPort)
+                    : "none");
+        }
+
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
+        processBuilder.redirectErrorStream(true);
+
+        try {
+            Process process = processBuilder.start();
+
+            StringBuilder output = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append(System.lineSeparator());
+                }
+            }
+
+            boolean finished = process.waitFor(GEO_SCRIPT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                System.err.printf("Geo script timed out (%s)%n", action);
+                return;
+            }
+
+            int exitCode = process.exitValue();
+            if (exitCode == 0) {
+                System.out.printf("Geo script %s succeeded. latencyMs=%d callbackPort=%d%n",
+                        action,
+                        latencyMs,
+                        callbackPort);
+            } else {
+                if ("clear".equals(action) && output.toString().contains("Please run as root")) {
+                    System.err.println("Geo clear skipped: not running as root.");
+                    return;
+                }
+                System.err.printf("Geo script %s failed (exit=%d). Output:%n%s",
+                        action,
+                        exitCode,
+                        output.toString());
+                if ("apply".equals(action)) {
+                    System.err.println("Hint: run the Java process with sudo, or apply geo latency manually with sudo script command.");
+                }
+                if (output.toString().toLowerCase().contains("password is required")) {
+                    System.err.println("Hint: configure passwordless sudo for the geo script (or run the server with sudo).");
+                }
+            }
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            System.err.printf("Failed to run geo script action=%s : %s%n", action, e.getMessage());
+        }
+    }
+
+    private static boolean isRunningAsRoot() {
+        return "root".equals(System.getProperty("user.name"));
     }
 
     private static void applyNodeFailureConfig(List<ServerImpl> serversImpl) {

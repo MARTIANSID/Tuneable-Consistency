@@ -2666,7 +2666,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     .convertToTimeStamp(cm.getTimeStamp());
 
             long startTime = System.nanoTime();
-            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(200);
+            long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(400);
 
             String clientId = getClientId(host, port);
             RaftStub clientStub = clientStubs.computeIfAbsent(clientId, k -> createClientStub(host, port));

@@ -48,12 +48,12 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 1.0;
+    private static final double writeCost = 8.0;
 
     private static final HashMap<ReadConcern, Double> token_costs = new HashMap<>(){{
-            put(ReadConcern.CAUSAL, 0.5);
-            put(ReadConcern.LINEARIZABLE, 1.0);
-            put(ReadConcern.EVENTUAL, 0.1);
+            put(ReadConcern.CAUSAL, 1.0);
+            put(ReadConcern.LINEARIZABLE, 7.69);
+            put(ReadConcern.EVENTUAL, 1.0);
     }};
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
