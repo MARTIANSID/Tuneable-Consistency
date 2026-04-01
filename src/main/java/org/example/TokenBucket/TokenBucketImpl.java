@@ -14,8 +14,8 @@ public class TokenBucketImpl {
     private final String CURRENT_TERM_KEY;
 
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 200000;
-    private static final double REFILL_RATE = 200000; // tokens per second
+    private static final double MAX_TOKENS = 350000;
+    private static final double REFILL_RATE = 350000; // tokens per second
 
     public TokenBucketImpl(String redisHost, int redisPort, int serverId) {
         // here first I connect to redis master

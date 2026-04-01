@@ -48,10 +48,10 @@ public class Servers{
     // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
     // using runtime values including the selected callback port.
     private static final boolean ENABLE_GEO_SETTINGS = true;
-    private static final int GEO_LATENCY_MS = 100;
+    private static final int GEO_LATENCY_MS = 15;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
-    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
+    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = true;
     private static final String GEO_SCRIPT_PATH = "./simulate_geo_latency.sh";
     private static final int GEO_SCRIPT_TIMEOUT_SECONDS = 10;
     private static final boolean CLEAR_GEO_SETTINGS_ON_EXIT = true;
@@ -187,10 +187,10 @@ public class Servers{
         Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
         // PHASES.add(new Phase("Light", 60,25000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));

@@ -48,13 +48,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 8.0;
-
-    private static final HashMap<ReadConcern, Double> token_costs = new HashMap<>(){{
-            put(ReadConcern.CAUSAL, 1.0);
-            put(ReadConcern.LINEARIZABLE, 7.69);
-            put(ReadConcern.EVENTUAL, 1.0);
-    }};
+    private static final double writeCost = 13.46;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -70,6 +64,13 @@ public class BatchProcessor {
     private static final int RC_KEY_CAUSAL_LOCAL = 1;
     private static final int RC_KEY_CAUSAL_MAJORITY = 2;
     private static final int RC_KEY_LINEARIZABLE_ALL = 3;
+
+    private static final HashMap<Integer, Double> token_costs = new HashMap<>() {{
+        put(RC_KEY_EVENTUAL_ALL, 1.0);
+        put(RC_KEY_CAUSAL_LOCAL, 1.17);
+        put(RC_KEY_CAUSAL_MAJORITY, 1.4);
+        put(RC_KEY_LINEARIZABLE_ALL, 12.96);
+    }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
         if (readConcern == ReadConcern.CAUSAL) {
@@ -115,6 +116,15 @@ public class BatchProcessor {
 
     private double getReadLatencyByKey(HashMap<Integer, Double> readLatencyByKey, int key) {
         return readLatencyByKey.getOrDefault(key, Double.MAX_VALUE);
+    }
+
+    private double getReadTokenCostByKey(int key) {
+        return token_costs.getOrDefault(key, 0.1);
+    }
+
+    private double getReadTokenCost(ReadConcern readConcern, ReadLevel readLevel) {
+        int key = getReadLatencyKey(readConcern, readLevel);
+        return getReadTokenCostByKey(key);
     }
 
     /**
@@ -648,7 +658,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ? 60 : 50;
+    MAX_LATENCY = isLeader ?  180 : 150;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
@@ -708,8 +718,8 @@ public class BatchProcessor {
 
                     ReadConcern fromConcern = readConcernFromKey(fromKey);
                     ReadConcern toConcern = readConcernFromKey(toKey);
-                    double tokenCostIncrease = token_costs.getOrDefault(toConcern, 0.0)
-                        - token_costs.getOrDefault(fromConcern, 0.1);
+                    double tokenCostIncrease = getReadTokenCostByKey(toKey)
+                        - getReadTokenCostByKey(fromKey);
 
                     double perTxProfit = (toKey == RC_KEY_LINEARIZABLE_ALL)
                         ? appMajorityProfitMap.getOrDefault(appId, 0.0)
@@ -778,8 +788,8 @@ public class BatchProcessor {
                         if (nextToLatency <= MAX_LATENCY) {
                             ReadConcern fromConcern = readConcernFromKey(opt.toWC);
                             ReadConcern toConcern = readConcernFromKey(nextKey);
-                            double nextTokenCostIncrease = token_costs.getOrDefault(toConcern, 0.0)
-                                - token_costs.getOrDefault(fromConcern, 0.1);
+                            double nextTokenCostIncrease = getReadTokenCostByKey(nextKey)
+                                - getReadTokenCostByKey(opt.toWC);
                             double nextLatencyInc = nextToLatency - nextFromLatency;
                             double nextProfit = (nextKey == RC_KEY_LINEARIZABLE_ALL)
                                 ? appMajorityProfitMap.getOrDefault(opt.appId, 0.0)
@@ -1072,7 +1082,7 @@ static class AppUpgradeOption {
      */
     private double getTokenCost(TransactionOption tx) {
         if (tx.isReadOnly) {
-            return token_costs.getOrDefault(tx.readConcern, 0.1);
+            return getReadTokenCost(tx.readConcern, tx.readLevel);
         }
         return writeCost;
     }
@@ -1099,7 +1109,7 @@ static class AppUpgradeOption {
         for (int i = 0; i < batch.size(); i++) {
             if (!assignments[i].isDeferred()) {
                 if (assignments[i].isReadOnly) {
-                    total += token_costs.getOrDefault(assignments[i].readConcern, 0.1);
+                    total += getReadTokenCost(assignments[i].readConcern, assignments[i].readLevel);
                 } else {
                     total += writeCost;
                 }
