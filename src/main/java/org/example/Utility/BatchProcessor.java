@@ -48,7 +48,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 13.46;
+    private static final double writeCost = 11.29;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -69,7 +69,7 @@ public class BatchProcessor {
         put(RC_KEY_EVENTUAL_ALL, 1.0);
         put(RC_KEY_CAUSAL_LOCAL, 1.17);
         put(RC_KEY_CAUSAL_MAJORITY, 1.4);
-        put(RC_KEY_LINEARIZABLE_ALL, 12.96);
+        put(RC_KEY_LINEARIZABLE_ALL, 10.96);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -933,20 +933,24 @@ public class BatchProcessor {
         List<Integer> appIdsDesc = new ArrayList<>(allAppIds);
         appIdsDesc.sort((a, b) -> Integer.compare(b, a));
 
-        // Pass 1: Execute all transactions with retryCount >= 2 (if tokens allow)
+        // Pass 1: Execute retry-priority transactions (retryCount >= 2)
+        // using the same ordering policy as pass2.
         pass1:
-        for (int appId : sortedAppIds) {
-            // Writes — iterate by WC level
-            if (appWcBatchIndex.containsKey(appId)) {
-                for (int wc = 1; wc <= majority; wc++) {
-                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
-                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
+        {
+            // Reads first: consistency level ascending, then appId descending
+            for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
+                for (int appId : appIdsDesc) {
+                    if (!appReadConcernBatchIndex.containsKey(appId)) continue;
+                    if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
+                    for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
                         if (tokensRemaining <= 0) break pass1;
+                        if (!assignments[idx].isDeferred()) continue;
                         TransactionOption tx = batch.get(idx);
                         if (tx.retryCount < 2) continue;
                         double cost = getTokenCost(tx);
                         if (tokensRemaining >= cost) {
-                            assignments[idx].writeConcern = tx.minRequiredConsistency;
+                            assignments[idx].readConcern = tx.readConcern;
+                            assignments[idx].readLevel = tx.readLevel;
                             tokensRemaining -= cost;
                             profit += tx.baseProfit;
                             processed++;
@@ -954,17 +958,20 @@ public class BatchProcessor {
                     }
                 }
             }
-            // Reads — iterate by ReadConcern level
-            if (appReadConcernBatchIndex.containsKey(appId)) {
-                for (Map.Entry<Integer, List<Integer>> rcEntry : appReadConcernBatchIndex.get(appId).entrySet()) {
-                    for (int idx : rcEntry.getValue()) {
+
+            // Writes next: consistency level ascending, then appId descending
+            for (int wc = 1; wc <= majority; wc++) {
+                for (int appId : appIdsDesc) {
+                    if (!appWcBatchIndex.containsKey(appId)) continue;
+                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
+                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
                         if (tokensRemaining <= 0) break pass1;
+                        if (!assignments[idx].isDeferred()) continue;
                         TransactionOption tx = batch.get(idx);
                         if (tx.retryCount < 2) continue;
                         double cost = getTokenCost(tx);
                         if (tokensRemaining >= cost) {
-                            assignments[idx].readConcern = tx.readConcern;
-                            assignments[idx].readLevel = tx.readLevel;
+                            assignments[idx].writeConcern = tx.minRequiredConsistency;
                             tokensRemaining -= cost;
                             profit += tx.baseProfit;
                             processed++;
@@ -979,25 +986,8 @@ public class BatchProcessor {
         int minToProcess = Math.max(1, (int) (n * 1));
         pass2:
         {
-            // Writes — WC level ascending first, then highest appId first
-            for (int wc = 1; wc <= majority; wc++) {
-                for (int appId : appIdsDesc) {
-                    if (!appWcBatchIndex.containsKey(appId)) continue;
-                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
-                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
-                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
-                        if (!assignments[idx].isDeferred()) continue;
-                        TransactionOption tx = batch.get(idx);
-                        double cost = getTokenCost(tx);
-                        if (tokensRemaining >= cost) {
-                            assignments[idx].writeConcern = tx.minRequiredConsistency;
-                            tokensRemaining -= cost;
-                            profit += tx.baseProfit;
-                            processed++;
-                        }
-                    }
-                }
-            }
+
+            // we execute reads first because they have lowest token costs
             // Reads — key order ascending first, then highest appId first
             for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
                 for (int appId : appIdsDesc) {
@@ -1011,6 +1001,26 @@ public class BatchProcessor {
                         if (tokensRemaining >= cost) {
                             assignments[idx].readConcern = tx.readConcern;
                             assignments[idx].readLevel = tx.readLevel;
+                            tokensRemaining -= cost;
+                            profit += tx.baseProfit;
+                            processed++;
+                        }
+                    }
+                }
+            }
+            // writes have higher token cost than reads so we execute them after all the reads, to maximize the number of transactions we can execute within the token budget
+            // Writes — WC level ascending first, then highest appId first
+            for (int wc = 1; wc <= majority; wc++) {
+                for (int appId : appIdsDesc) {
+                    if (!appWcBatchIndex.containsKey(appId)) continue;
+                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
+                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
+                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
+                        if (!assignments[idx].isDeferred()) continue;
+                        TransactionOption tx = batch.get(idx);
+                        double cost = getTokenCost(tx);
+                        if (tokensRemaining >= cost) {
+                            assignments[idx].writeConcern = tx.minRequiredConsistency;
                             tokensRemaining -= cost;
                             profit += tx.baseProfit;
                             processed++;
