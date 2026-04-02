@@ -187,10 +187,10 @@ public class Servers{
         Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
         // PHASES.add(new Phase("Light", 60,25000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));

@@ -658,7 +658,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ?  180 : 150;
+    MAX_LATENCY = isLeader ?  80 : 70;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
@@ -930,6 +930,8 @@ public class BatchProcessor {
         allAppIds.addAll(appReadConcernCount.keySet());
         List<Integer> sortedAppIds = new ArrayList<>(allAppIds);
         sortedAppIds.sort((a, b) -> Double.compare(appBaseProfitMap.get(b), appBaseProfitMap.get(a)));
+        List<Integer> appIdsDesc = new ArrayList<>(allAppIds);
+        appIdsDesc.sort((a, b) -> Integer.compare(b, a));
 
         // Pass 1: Execute all transactions with retryCount >= 2 (if tokens allow)
         pass1:
@@ -972,14 +974,15 @@ public class BatchProcessor {
             }
         }
 
-        // Pass 2: Execute deferred transactions — lowest consistency first within each app,
-        // stop when at least 70% of batch is processed or tokens run out.
+        // Pass 2: Execute deferred transactions — lowest consistency first globally,
+        // then highest appId first within each consistency level.
         int minToProcess = Math.max(1, (int) (n * 1));
         pass2:
-        for (int appId : sortedAppIds) {
-            // Writes — WC level ascending (lowest consistency first)
-            if (appWcBatchIndex.containsKey(appId)) {
-                for (int wc = 1; wc <= majority; wc++) {
+        {
+            // Writes — WC level ascending first, then highest appId first
+            for (int wc = 1; wc <= majority; wc++) {
+                for (int appId : appIdsDesc) {
+                    if (!appWcBatchIndex.containsKey(appId)) continue;
                     if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
                     for (int idx : appWcBatchIndex.get(appId).get(wc)) {
                         if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
@@ -995,9 +998,10 @@ public class BatchProcessor {
                     }
                 }
             }
-            // Reads — key order ascending (EVENTUAL_ALL → CAUSAL_LOCAL → CAUSAL_MAJORITY → LINEARIZABLE_ALL)
-            if (appReadConcernBatchIndex.containsKey(appId)) {
-                for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
+            // Reads — key order ascending first, then highest appId first
+            for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
+                for (int appId : appIdsDesc) {
+                    if (!appReadConcernBatchIndex.containsKey(appId)) continue;
                     if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
                     for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
                         if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
