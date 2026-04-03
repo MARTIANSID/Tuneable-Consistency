@@ -47,7 +47,7 @@ public class Servers{
 
     // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
     // using runtime values including the selected callback port.
-    private static final boolean ENABLE_GEO_SETTINGS = true;
+    private static final boolean ENABLE_GEO_SETTINGS = false;
     private static final int GEO_LATENCY_MS = 15;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
@@ -130,25 +130,25 @@ public class Servers{
                 ReadClass.CAUSAL_MAJORITY, 0.05,
                 ReadClass.LINEARIZABLE, 0.05
         );
-        // Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
+        Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
 
-        // Map<ReadClass, Double> mediumReadDist = Map.of(
-        //         ReadClass.EVENTUAL, 0.25,
-        //         ReadClass.CAUSAL_LOCAL, 0.25,
-        //         ReadClass.CAUSAL_MAJORITY, 0.25,
-        //         ReadClass.LINEARIZABLE, 0.25
-        // );
+        Map<ReadClass, Double> mediumReadDist = Map.of(
+                ReadClass.EVENTUAL, 0.25,
+                ReadClass.CAUSAL_LOCAL, 0.25,
+                ReadClass.CAUSAL_MAJORITY, 0.25,
+                ReadClass.LINEARIZABLE, 0.25
+        );
 
-        // Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
+        Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
 
-        // Map<ReadClass, Double> heavyReadDist = Map.of(
-        //         ReadClass.EVENTUAL, 0.05,
-        //         ReadClass.CAUSAL_LOCAL, 0.05,
-        //         ReadClass.CAUSAL_MAJORITY, 0.10,
-        //         ReadClass.LINEARIZABLE, 0.80
-        // );
+        Map<ReadClass, Double> heavyReadDist = Map.of(
+                ReadClass.EVENTUAL, 0.05,
+                ReadClass.CAUSAL_LOCAL, 0.05,
+                ReadClass.CAUSAL_MAJORITY, 0.10,
+                ReadClass.LINEARIZABLE, 0.80
+        );
 
-        // Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
+        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
 
         Map<Integer, Double> allMajority = Map.of(1, 0.0, 2, 1.0);
 
@@ -178,19 +178,17 @@ public class Servers{
         //     0.10);
 
         double writeTailShare = getLightNonDominantShare(writeLevelsLowToHigh.size());
-        Map<Integer, Double> lightWriteDist = buildConsistencyDistribution(
-            writeLevelsLowToHigh,
-            WorkloadProfile.LIGHT,
-            writeTailShare);
-        // Keep writes light across all phases, especially for larger server counts.
-        Map<Integer, Double> mediumWriteDist = lightWriteDist;
-        Map<Integer, Double> heavyWriteDist = lightWriteDist;
+        // Map<Integer, Double> lightWriteDist = buildConsistencyDistribution(
+        //     writeLevelsLowToHigh,
+        //     WorkloadProfile.LIGHT,
+        //     writeTailShare);
 
         // PHASES.add(new Phase("Light", 60,31000, 0, 1, lightReadDist, allMajority));
         PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
         PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 200000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -217,7 +215,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 190000;  // 240 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 240000;  // 240 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     

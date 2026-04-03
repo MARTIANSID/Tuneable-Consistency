@@ -1885,9 +1885,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                  PrintWriter out = new PrintWriter(fw)) {
                 File file = new File("tps_" + serverId + ".csv");
                 if (file.length() == 0) {
-                    out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
+                    out.println("Timestamp,Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
-                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n",
+                out.printf("%d,%.2f,%.2f,%.2f,%.2f,%d%n",
+                        System.currentTimeMillis(),
                         result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, tokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
@@ -1958,9 +1959,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             try (FileWriter fw = new FileWriter("backlog_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
                 File file = new File("backlog_" + serverId + ".csv");
                 if (file.length() == 0) {
-                    out.println("Backlog");
+                    out.println("Timestamp,Backlog");
                 }
-                out.printf("%d%n", backLog);
+                out.printf("%d,%d%n", System.currentTimeMillis(), backLog);
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -2496,10 +2497,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // Write header only if file is empty
                 File file = new File("tps_" + serverId + ".csv");
                 if (file.length() == 0) {
-                    out.println("Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
+                    out.println("Timestamp,Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
                 // Write data row
-                out.printf("%.2f,%.2f,%.2f,%.2f,%d%n", result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.tokensUsed,
+                out.printf("%d,%.2f,%.2f,%.2f,%.2f,%d%n",
+                        System.currentTimeMillis(),
+                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.tokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();
