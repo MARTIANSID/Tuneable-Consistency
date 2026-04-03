@@ -186,11 +186,13 @@ public class Servers{
         Map<Integer, Double> mediumWriteDist = lightWriteDist;
         Map<Integer, Double> heavyWriteDist = lightWriteDist;
 
-        // PHASES.add(new Phase("Light", 60,25000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 160000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60,31000, 0, 1, lightReadDist, allMajority));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 200000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -215,7 +217,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 100000;  // 240 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 190000;  // 240 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     

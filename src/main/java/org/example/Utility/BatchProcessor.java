@@ -48,7 +48,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 11.29;
+    private static final double writeCost = 10.97;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -68,8 +68,8 @@ public class BatchProcessor {
     private static final HashMap<Integer, Double> token_costs = new HashMap<>() {{
         put(RC_KEY_EVENTUAL_ALL, 1.0);
         put(RC_KEY_CAUSAL_LOCAL, 1.17);
-        put(RC_KEY_CAUSAL_MAJORITY, 1.4);
-        put(RC_KEY_LINEARIZABLE_ALL, 10.96);
+        put(RC_KEY_CAUSAL_MAJORITY, 1.42);
+        put(RC_KEY_LINEARIZABLE_ALL, 10.63);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -658,7 +658,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ?  80 : 70;
+    MAX_LATENCY = isLeader ?  10000 : 10000;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {

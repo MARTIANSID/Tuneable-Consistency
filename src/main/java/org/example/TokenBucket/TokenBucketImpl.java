@@ -13,9 +13,13 @@ public class TokenBucketImpl {
     private final String LAST_UPDATE_KEY;
     private final String CURRENT_TERM_KEY;
 
+    private static final double UNLIMITED_TOKENS = Double.MAX_VALUE; // for testing purposes, can be set to a very high value
+    private static final double UNLIMITED_REFILL_RATE = Double.MAX_VALUE; // for testing purposes, can be set to a very high value
     // all these thing will be adjusted dynamically later on, right now it is made constant
-    private static final double MAX_TOKENS = 350000;
-    private static final double REFILL_RATE = 350000; // tokens per second
+
+    private static final boolean testing = false;
+    private static final double MAX_TOKENS =!testing ? 340000 : Double.MAX_VALUE;
+    private static final double REFILL_RATE = !testing ? 340000 : Double.MAX_VALUE; // tokens per second
 
     public TokenBucketImpl(String redisHost, int redisPort, int serverId) {
         // here first I connect to redis master
