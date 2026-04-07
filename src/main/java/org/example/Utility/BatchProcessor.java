@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.Queue;
 import java.util.Set;
 import java.util.Map;
 import org.ds.paxos.ReadConcern;
@@ -23,6 +24,7 @@ public class BatchProcessor {
 
     // ========== Warmup Phase Constants ==========
     private static final long WARMUP_DURATION_MS = 7000;  // 7 seconds warmup
+    private static final long UPGRADE_WARMUP_MS = 3000;   // disable upgrades for first 3 seconds
     private static volatile long systemStartTime = 0;
 
     // ========== TPS Constants (Heuristic) ==========
@@ -48,7 +50,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 10.97;
+    private static final double writeCost = 17.33;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -56,7 +58,7 @@ public class BatchProcessor {
      }};
 
      private static double MAX_LATENCY = 70.0; // Max average latency in ms
-     private static final double UPGRADE_LATENCY_THRESHOLD = 0.85; // Need 15% headroom to start upgrading
+     private static final double UPGRADE_LATENCY_THRESHOLD = 1.0; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
 
@@ -67,9 +69,9 @@ public class BatchProcessor {
 
     private static final HashMap<Integer, Double> token_costs = new HashMap<>() {{
         put(RC_KEY_EVENTUAL_ALL, 1.0);
-        put(RC_KEY_CAUSAL_LOCAL, 1.17);
-        put(RC_KEY_CAUSAL_MAJORITY, 1.42);
-        put(RC_KEY_LINEARIZABLE_ALL, 10.63);
+        put(RC_KEY_CAUSAL_LOCAL, 1.24);
+        put(RC_KEY_CAUSAL_MAJORITY, 1.63);
+        put(RC_KEY_LINEARIZABLE_ALL, 16.25);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -134,6 +136,10 @@ public class BatchProcessor {
         return (System.currentTimeMillis() - systemStartTime) < WARMUP_DURATION_MS;
     }
 
+    private boolean isInUpgradeWarmupPhase() {
+        return (System.currentTimeMillis() - systemStartTime) < UPGRADE_WARMUP_MS;
+    }
+
 
     /**
      * Get max TPS for a given write concern level
@@ -151,7 +157,7 @@ public class BatchProcessor {
 
     private double getMaxLatency(int writeConcern, HashMap<Integer, Double> wcLatencyMap) {
         if(isInWarmupPhase()) {
-            return MIN_LATENCY_MAP.getOrDefault(writeConcern, 0.0);
+            return 200; 
         }
         return wcLatencyMap.get(writeConcern);
     }
@@ -265,7 +271,10 @@ public class BatchProcessor {
             }
 
             // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
-            if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD && backLogTransactions.isEmpty() && currentTPS > MIN_TPS) {
+                if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD
+                    && backLogTransactions.isEmpty()
+                    && currentTPS > MIN_TPS
+                    && !isInUpgradeWarmupPhase()) {
                 
                 // Build priority queue for upgrades (best profit/tps-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
@@ -442,7 +451,11 @@ public class BatchProcessor {
             // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
             
             boolean canUpgrade = false;
-            if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD && backLogTransactions.isEmpty() && currentLatency < MAX_LATENCY && !isBackLogIncreasing) {
+                if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
+                    && backLogTransactions.isEmpty()
+                    && currentLatency < MAX_LATENCY
+                    && !isBackLogIncreasing
+                    && !isInUpgradeWarmupPhase()) {
                 // Build priority queue for upgrades (best profit/latency-cost ratio first)
                 PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
                         (a, b) -> Double.compare(b.ratio, a.ratio)
@@ -556,14 +569,15 @@ public class BatchProcessor {
     }
 
 
-   public ProcessResult processWithLatencyApplicationBasedHeuristic(
+    public ProcessResult processWithLatencyApplicationBasedHeuristic(
     List<TransactionOption> batch,
     double currentLatency,
     HashMap<Integer, Double> wcLatencyMap,
     HashMap<Integer, Double> wcTpsMap,
     int incomingRateOfTransactions,
     Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
-    HashMap<Integer, Double> readLatencyByKey, boolean isLeader) {
+     HashMap<Integer, Double> readLatencyByKey, boolean isLeader,
+     Queue<TransactionOption> deferredQueue) {
 
     int n = batch.size();
 
@@ -658,7 +672,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ?  60 : 50;
+    MAX_LATENCY = isLeader ?  80 : 70;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
@@ -667,9 +681,10 @@ public class BatchProcessor {
 
         // Step 5: Upgrade phase
         if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
-                && backLogTransactions.isEmpty()
+                && deferredQueue.isEmpty()
                 && currentLatency < MAX_LATENCY
-                && isBackLogIncreasing == false) {
+            && isBackLogIncreasing == false
+            && !isInUpgradeWarmupPhase()) {
 
             // PQ: unified for write-WC upgrades and read-RC upgrades
             // ranked by per-transaction ratio (profit per unit cost)
@@ -902,10 +917,10 @@ public class BatchProcessor {
         // Calculate final token cost after all upgrades
         double finalTokenCost = calculateTotalTokenCost(batch, assignments);
 
-        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions);
+        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, deferredQueue);
         HashMap<Integer, Integer> wcMix = countByWriteConcern(assignments);
         System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
-                wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency, finalTokenCost);
+                wcMix, transactionsUpgraded, deferredQueue.size(), avgLatency, finalTokenCost);
 
         return new ProcessResult(buildResult.executed, finalTokenCost, profit, transactionsUpgraded, buildResult.deferred);
     }
@@ -925,116 +940,83 @@ public class BatchProcessor {
         int processed = 0;
         double tokensRemaining = currentTokens;
 
-        // Collect all app IDs from both writes and reads, sort by base profit descending
+        // Collect all app IDs from both writes and reads
         Set<Integer> allAppIds = new HashSet<>(appWcCount.keySet());
         allAppIds.addAll(appReadConcernCount.keySet());
-        List<Integer> sortedAppIds = new ArrayList<>(allAppIds);
-        sortedAppIds.sort((a, b) -> Double.compare(appBaseProfitMap.get(b), appBaseProfitMap.get(a)));
         List<Integer> appIdsDesc = new ArrayList<>(allAppIds);
-        appIdsDesc.sort((a, b) -> Integer.compare(b, a));
+        appIdsDesc.sort((a, b) -> {
+            double pa = appBaseProfitMap.getOrDefault(a, 0.0);
+            double pb = appBaseProfitMap.getOrDefault(b, 0.0);
+            int byProfit = Double.compare(pb, pa); // higher profit first
+            if (byProfit != 0) {
+                return byProfit;
+            }
+            return Integer.compare(b, a); // deterministic fallback
+        });
 
-        // Pass 1: Execute retry-priority transactions (retryCount >= 2)
-        // using the same ordering policy as pass2.
-        pass1:
-        {
-            // Reads first: consistency level ascending, then appId descending
-            for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
-                for (int appId : appIdsDesc) {
-                    if (!appReadConcernBatchIndex.containsKey(appId)) continue;
-                    if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
-                    for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
-                        if (tokensRemaining <= 0) break pass1;
-                        if (!assignments[idx].isDeferred()) continue;
-                        TransactionOption tx = batch.get(idx);
-                        if (tx.retryCount < 2) continue;
-                        double cost = getTokenCost(tx);
-                        if (tokensRemaining >= cost) {
-                            assignments[idx].readConcern = tx.readConcern;
-                            assignments[idx].readLevel = tx.readLevel;
-                            tokensRemaining -= cost;
-                            profit += tx.baseProfit;
-                            processed++;
-                        }
-                    }
+        // Build one deterministic execution order for pressure handling:
+        // reads first by read key, then writes by write concern, both with appId DESC.
+        List<Integer> pressureOrder = new ArrayList<>(n);
+        for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
+            for (int appId : appIdsDesc) {
+                List<Integer> idxList = appReadConcernBatchIndex
+                        .getOrDefault(appId, new HashMap<>())
+                        .get(rc);
+                if (idxList != null && !idxList.isEmpty()) {
+                    pressureOrder.addAll(idxList);
                 }
             }
-
-            // Writes next: consistency level ascending, then appId descending
-            for (int wc = 1; wc <= majority; wc++) {
-                for (int appId : appIdsDesc) {
-                    if (!appWcBatchIndex.containsKey(appId)) continue;
-                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
-                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
-                        if (tokensRemaining <= 0) break pass1;
-                        if (!assignments[idx].isDeferred()) continue;
-                        TransactionOption tx = batch.get(idx);
-                        if (tx.retryCount < 2) continue;
-                        double cost = getTokenCost(tx);
-                        if (tokensRemaining >= cost) {
-                            assignments[idx].writeConcern = tx.minRequiredConsistency;
-                            tokensRemaining -= cost;
-                            profit += tx.baseProfit;
-                            processed++;
-                        }
-                    }
+        }
+        for (int wc = 1; wc <= majority; wc++) {
+            for (int appId : appIdsDesc) {
+                List<Integer> idxList = appWcBatchIndex
+                        .getOrDefault(appId, new HashMap<>())
+                        .get(wc);
+                if (idxList != null && !idxList.isEmpty()) {
+                    pressureOrder.addAll(idxList);
                 }
             }
         }
 
-        // Pass 2: Execute deferred transactions — lowest consistency first globally,
-        // then highest appId first within each consistency level.
+        // Build retry-first plan once while preserving the original pressure order.
+        List<Integer> retryOrder = new ArrayList<>(pressureOrder.size());
+        List<Integer> regularOrder = new ArrayList<>(pressureOrder.size());
+        for (int idx : pressureOrder) {
+            TransactionOption tx = batch.get(idx);
+            if (tx.retryCount >= 2) {
+                retryOrder.add(idx);
+            } else {
+                regularOrder.add(idx);
+            }
+        }
+
+        // Execute retries first.
+        double[] tokensRemainingHolder = new double[] { tokensRemaining };
+        double[] profitHolder = new double[] { profit };
+        for (int idx : retryOrder) {
+            if (tokensRemainingHolder[0] <= 0) {
+                break;
+            }
+            processed += tryExecuteDeferredTransaction(batch, assignments, idx, tokensRemainingHolder, profitHolder);
+        }
+
+        // Execute remaining deferred transactions using the same deterministic order.
         int minToProcess = Math.max(1, (int) (n * 1));
-        pass2:
-        {
-
-            // we execute reads first because they have lowest token costs
-            // Reads — key order ascending first, then highest appId first
-            for (int rc = RC_KEY_EVENTUAL_ALL; rc <= RC_KEY_LINEARIZABLE_ALL; rc++) {
-                for (int appId : appIdsDesc) {
-                    if (!appReadConcernBatchIndex.containsKey(appId)) continue;
-                    if (!appReadConcernBatchIndex.get(appId).containsKey(rc)) continue;
-                    for (int idx : appReadConcernBatchIndex.get(appId).get(rc)) {
-                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
-                        if (!assignments[idx].isDeferred()) continue;
-                        TransactionOption tx = batch.get(idx);
-                        double cost = getTokenCost(tx);
-                        if (tokensRemaining >= cost) {
-                            assignments[idx].readConcern = tx.readConcern;
-                            assignments[idx].readLevel = tx.readLevel;
-                            tokensRemaining -= cost;
-                            profit += tx.baseProfit;
-                            processed++;
-                        }
-                    }
-                }
+        for (int idx : regularOrder) {
+            if (tokensRemainingHolder[0] <= 0 || processed >= minToProcess) {
+                break;
             }
-            // writes have higher token cost than reads so we execute them after all the reads, to maximize the number of transactions we can execute within the token budget
-            // Writes — WC level ascending first, then highest appId first
-            for (int wc = 1; wc <= majority; wc++) {
-                for (int appId : appIdsDesc) {
-                    if (!appWcBatchIndex.containsKey(appId)) continue;
-                    if (!appWcBatchIndex.get(appId).containsKey(wc)) continue;
-                    for (int idx : appWcBatchIndex.get(appId).get(wc)) {
-                        if (tokensRemaining <= 0 || processed >= minToProcess) break pass2;
-                        if (!assignments[idx].isDeferred()) continue;
-                        TransactionOption tx = batch.get(idx);
-                        double cost = getTokenCost(tx);
-                        if (tokensRemaining >= cost) {
-                            assignments[idx].writeConcern = tx.minRequiredConsistency;
-                            tokensRemaining -= cost;
-                            profit += tx.baseProfit;
-                            processed++;
-                        }
-                    }
-                }
-            }
+            processed += tryExecuteDeferredTransaction(batch, assignments, idx, tokensRemainingHolder, profitHolder);
         }
+
+        tokensRemaining = tokensRemainingHolder[0];
+        profit = profitHolder[0];
 
         double tokensUsed = currentTokens - tokensRemaining;
-        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions);
+        BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, deferredQueue);
 
         System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | TokensUsed=%.2f\n",
-                processed, n, buildResult.deferred.size(), backLogTransactions.size(), tokensUsed);
+                processed, n, buildResult.deferred.size(), deferredQueue.size(), tokensUsed);
 
         return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, buildResult.deferred);
     }
@@ -1099,6 +1081,34 @@ static class AppUpgradeOption {
             return getReadTokenCost(tx.readConcern, tx.readLevel);
         }
         return writeCost;
+    }
+
+    private int tryExecuteDeferredTransaction(
+            List<TransactionOption> batch,
+            ConsistencyAssignment[] assignments,
+            int idx,
+            double[] tokensRemainingHolder,
+            double[] profitHolder) {
+        if (!assignments[idx].isDeferred()) {
+            return 0;
+        }
+
+        TransactionOption tx = batch.get(idx);
+        double cost = getTokenCost(tx);
+        if (tokensRemainingHolder[0] < cost) {
+            return 0;
+        }
+
+        if (tx.isReadOnly) {
+            assignments[idx].readConcern = tx.readConcern;
+            assignments[idx].readLevel = tx.readLevel;
+        } else {
+            assignments[idx].writeConcern = tx.minRequiredConsistency;
+        }
+
+        tokensRemainingHolder[0] -= cost;
+        profitHolder[0] += tx.baseProfit;
+        return 1;
     }
 
     /**
@@ -1174,7 +1184,9 @@ static class AppUpgradeOption {
                 tx.retryCount++;
                 // Add to backlog set only on FIRST deferral (retryCount just became 1)
                 if (tx.retryCount == 1) {
-                    backLogTransactions.add(txId);
+                    // synchronized (backLogTransactions) {
+                    //     backLogTransactions.add(txId);
+                    // }
                 }
                 deferred.add(tx);
                 continue;
@@ -1182,7 +1194,9 @@ static class AppUpgradeOption {
             
             // Transaction is being executed - remove from backlog if it was there
             if(tx.retryCount > 0) {
-                backLogTransactions.remove(txId);
+                // synchronized (backLogTransactions) {
+                //     backLogTransactions.remove(txId);
+                // }
             }
 
             // Rebuild Transaction with potentially upgraded readConcern
@@ -1211,6 +1225,14 @@ static class AppUpgradeOption {
      * Uses the assignment's readConcern for read transactions.
      */
     private BuildResult buildResultMessages(List<TransactionOption> batch, ConsistencyAssignment[] assignments, Set<String> backLogTransactions) {
+        return buildResultMessages(batch, assignments, backLogTransactions, null);
+        }
+
+        private BuildResult buildResultMessages(
+            List<TransactionOption> batch,
+            ConsistencyAssignment[] assignments,
+            Set<String> backLogTransactions,
+            Queue<TransactionOption> deferredQueue) {
         List<ClientMessage> executed = new ArrayList<>();
         List<TransactionOption> deferred = new ArrayList<>();
 
@@ -1222,14 +1244,23 @@ static class AppUpgradeOption {
             if (assignment.isDeferred()) {
                 tx.retryCount++;
                 if (tx.retryCount == 1) {
-                    backLogTransactions.add(txId);
+                    // synchronized (backLogTransactions) {
+                    //     backLogTransactions.add(txId);
+                    // }
                 }
                 deferred.add(tx);
+                if (deferredQueue != null) {
+                    if(deferredQueue.size() < 1000) { // prevent unbounded growth
+                    deferredQueue.add(tx);
+                    }
+                }
                 continue;
             }
 
             if (tx.retryCount > 0) {
-                backLogTransactions.remove(txId);
+                // synchronized (backLogTransactions) {
+                //     backLogTransactions.remove(txId);
+                // }
             }
 
             Transaction updatedT = tx.clientMessage.getT().toBuilder()

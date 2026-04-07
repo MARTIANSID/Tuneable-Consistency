@@ -51,7 +51,7 @@ public class Servers{
     private static final int GEO_LATENCY_MS = 15;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
-    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = true;
+    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
     private static final String GEO_SCRIPT_PATH = "./simulate_geo_latency.sh";
     private static final int GEO_SCRIPT_TIMEOUT_SECONDS = 10;
     private static final boolean CLEAR_GEO_SETTINGS_ON_EXIT = true;
@@ -142,13 +142,13 @@ public class Servers{
         Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
 
         Map<ReadClass, Double> heavyReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.05,
-                ReadClass.CAUSAL_LOCAL, 0.05,
+                ReadClass.EVENTUAL, 0.10,
+                ReadClass.CAUSAL_LOCAL, 0.10,
                 ReadClass.CAUSAL_MAJORITY, 0.10,
-                ReadClass.LINEARIZABLE, 0.80
+                ReadClass.LINEARIZABLE, 0.70
         );
 
-        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.10, 2, 0.90);
+        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.20, 2, 0.80);
 
         Map<Integer, Double> allMajority = Map.of(1, 0.0, 2, 1.0);
 
@@ -183,14 +183,16 @@ public class Servers{
         //     WorkloadProfile.LIGHT,
         //     writeTailShare);
 
-        // PHASES.add(new Phase("Light", 60,31000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60,15000, 0, 1, lightReadDist, allMajority));
+        PHASES.add(new Phase("Light", 50, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
+        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
-        PHASES.add(new Phase("Light", 60, 150000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60, 200000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 40, 17000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+
+        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 40, 40000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -658,19 +660,20 @@ public class Servers{
         List<TransactionOption> transactionOptions = batch.stream()
                 .map(TransactionOption::fromClientMessage)
                 .collect(Collectors.toList());
-        
-        // Track incoming transactions BEFORE injection
-        trackIncomingTransactions(batch.size());
+
+        int dropped = 0;
         
         // First try: current leader
         ServerImpl leader = injector.getLeader();
         if (leader != null) {
-            leader.batchLock.lock();
-            try {
-                leader.batchOfTransactions.addAll(transactionOptions);
+            int accepted = leader.enqueueWithoutDroppingExisting(transactionOptions);
+            dropped = Math.max(0, transactionOptions.size() - accepted);
+            if (accepted > 0) {
+                trackIncomingTransactions(accepted);
+                if (dropped > 0) {
+                    System.out.printf("⚠️ Rejected %d new transactions at leader enqueue (queue full)%n", dropped);
+                }
                 return true;
-            } finally {
-                leader.batchLock.unlock();
             }
         }
         
@@ -678,14 +681,20 @@ public class Servers{
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             ServerImpl server = injector.getServerById(i);
             if (server != null) {
-                server.batchLock.lock();
-                try {
-                    server.batchOfTransactions.addAll(transactionOptions);
+                int accepted = server.enqueueWithoutDroppingExisting(transactionOptions);
+                dropped = Math.max(0, transactionOptions.size() - accepted);
+                if (accepted > 0) {
+                    trackIncomingTransactions(accepted);
+                    if (dropped > 0) {
+                        System.out.printf("⚠️ Rejected %d new transactions at fallback enqueue (queue full)%n", dropped);
+                    }
                     return true;
-                } finally {
-                    server.batchLock.unlock();
                 }
             }
+        }
+
+        if (dropped > 0) {
+            System.out.printf("⚠️ Rejected %d new transactions (all candidate queues full)%n", dropped);
         }
     
         return false;
@@ -826,23 +835,23 @@ public class Servers{
         }
 
         int injected = 0;
+        int dropped = 0;
         for (Map.Entry<ServerImpl, List<TransactionOption>> entry : perServerBatch.entrySet()) {
             ServerImpl server = entry.getKey();
             List<TransactionOption> txs = entry.getValue();
             if (txs == null || txs.isEmpty()) {
                 continue;
             }
-            server.batchLock.lock();
-            try {
-                server.batchOfTransactions.addAll(txs);
-                injected += txs.size();
-            } finally {
-                server.batchLock.unlock();
-            }
+            int accepted = server.enqueueWithoutDroppingExisting(txs);
+            injected += accepted;
+            dropped += Math.max(0, txs.size() - accepted);
         }
 
         if (injected > 0) {
             trackIncomingTransactions(injected);
+        }
+        if (dropped > 0) {
+            System.out.printf("⚠️ Rejected %d new transactions during system batch injection (queue full)%n", dropped);
         }
 
         return injected;
@@ -1253,7 +1262,8 @@ public class Servers{
             "incoming_transaction_rate_%d.csv",
             "system_latency_%d.csv",
             "backlog_samples_%d.csv",
-            "read_latencies_%d.csv"
+            "read_latencies_%d.csv",
+            "process_batch_duration_%d.csv"
         };
 
         // Global (non-server-specific) CSV files
