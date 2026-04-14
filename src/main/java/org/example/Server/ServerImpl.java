@@ -266,7 +266,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // ===== Transaction upgrade toggle =====
     // When false, the server will bypass handleTokenBucket() and execute the incoming
     // batch exactly as received (no upgrades, no deferrals).
-    private static volatile boolean UPGRADE_TRANSACTIONS_ENABLED = true;
+    private static volatile boolean UPGRADE_TRANSACTIONS_ENABLED = false;
 
     public static void setUpgradeTransactionsEnabled(boolean enabled) {
         UPGRADE_TRANSACTIONS_ENABLED = enabled;
@@ -539,7 +539,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             responseObserver.onCompleted();
 
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            System.out.println("Exception in appendEntries: " + e.getMessage());
+            // throw new RuntimeException(e);
         } finally {
             lock.writeLock().unlock();
         }
@@ -645,7 +646,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private final int MAX_QUEUE_SIZE = 300000;
+    private final int MAX_QUEUE_SIZE = 500000;
 
     /**
      * Enqueue new transactions up to remaining queue capacity without dropping
@@ -656,6 +657,27 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public int enqueueWithoutDroppingExisting(List<TransactionOption> transactions) {
         if (transactions == null || transactions.isEmpty()) {
             return 0;
+        }
+
+        boolean isLeaderNode;
+        lock.readLock().lock();
+        try {
+            isLeaderNode = (status == ServerCurrentStatus.LEADER);
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        // Followers should only accept follower-safe reads.
+        if (!isLeaderNode) {
+            for (TransactionOption tx : transactions) {
+                if (tx == null || tx.clientMessage == null || !tx.clientMessage.hasT()) {
+                    return 0;
+                }
+                Transaction t = tx.clientMessage.getT();
+                if (!t.getIsReadOnly() || t.getReadConcern() == ReadConcern.LINEARIZABLE) {
+                    return 0;
+                }
+            }
         }
 
         batchLock.lock();
@@ -1426,7 +1448,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // }
     private void sendAppendEntries() {
 
-        final int MAX_ENTRIES_PER_RPC = 20000;
+        final int MAX_ENTRIES_PER_RPC = 7000;
 
         sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
 
@@ -1660,7 +1682,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         try {
             processBatch();
         } catch (Exception e) {
-            throw new RuntimeException("Error processing batch", e);
+            System.err.println("Error processing batch: " + e.getMessage());
+            // throw new RuntimeException("Error processing batch", e);
         } finally {
             long elapsedNs = System.nanoTime() - startNs;
             logProcessBatchDuration(elapsedNs / 1_000_000.0);
@@ -1709,7 +1732,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private static final int MAX_BATCH_SIZE = 5000;
+    private static final int MAX_BATCH_SIZE = 20000;
 
     private static final double TOKEN_COST_WRITE = 17.33;
     private static final double TOKEN_COST_READ_EVENTUAL = 1.0;
@@ -1990,10 +2013,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         int backlogTaken = 0;
         int freshTaken = 0;
 
+        System.out.println("Backlog size at start of batch processing: " + backLogQueue.size());
+
         while (count < cycleItemBudget) {
-            if ((System.nanoTime() - cycleStartNs) >= timeBudgetNs) {
-                break;
-            }
+            // if ((System.nanoTime() - cycleStartNs) >= timeBudgetNs) {
+            //     break;
+            // }
 
             int targetBacklogByNow = (int) Math.ceil((count + 1) * BACKLOG_DRAIN_RATIO);
             boolean preferBacklog = backlogTaken < targetBacklogByNow;
@@ -2101,6 +2126,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
         // Simultaneously append writes to the Raft log under write lock
         List<LogEntry> entry = new ArrayList<>();
+
+        // for followers return directly
+        if(status != ServerCurrentStatus.LEADER) {
+            return;
+        }
 
         lock.writeLock().lock();
         try {
@@ -2804,6 +2834,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 // System.out.printf("📥 [Incoming Transactions] Server %d | Transactions/sec: %d | Time: %s%n", serverId,
                                 //         incomingTPS,
                                 //         new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
+                        }
+                        Ack failAck = buildFailureAck(accName, id);
                         clientStub.sendAckToClient(failAck, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}

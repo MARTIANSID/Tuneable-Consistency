@@ -50,7 +50,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 17.33;
+    private static final double writeCost = 15;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -61,6 +61,7 @@ public class BatchProcessor {
      private static final double UPGRADE_LATENCY_THRESHOLD = 1.0; // Need 15% headroom to start upgrading
      private static final double UPGRADE_LATENCY_FLOOR = 0.95; // Stop upgrading at 10% above max latency
      private static final double MAX_LOAD = 12500;
+    
 
     private static final int RC_KEY_EVENTUAL_ALL = 0;
     private static final int RC_KEY_CAUSAL_LOCAL = 1;
@@ -69,9 +70,9 @@ public class BatchProcessor {
 
     private static final HashMap<Integer, Double> token_costs = new HashMap<>() {{
         put(RC_KEY_EVENTUAL_ALL, 1.0);
-        put(RC_KEY_CAUSAL_LOCAL, 1.24);
-        put(RC_KEY_CAUSAL_MAJORITY, 1.63);
-        put(RC_KEY_LINEARIZABLE_ALL, 16.25);
+        put(RC_KEY_CAUSAL_LOCAL, 1.54);
+        put(RC_KEY_CAUSAL_MAJORITY, 2.0);
+        put(RC_KEY_LINEARIZABLE_ALL, 14.0);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -653,22 +654,22 @@ public class BatchProcessor {
         }
     }
 
-    System.out.println("App-WC Count Map:");
-    System.out.println(appWcCount);
-    System.out.println("App-ReadConcern Count Map:");
-    System.out.println(appReadConcernCount);
+    // System.out.println("App-WC Count Map:");
+    // System.out.println(appWcCount);
+    // System.out.println("App-ReadConcern Count Map:");
+    // System.out.println(appReadConcernCount);
 
     // Step 3: Calculate avgLatency with all transactions at min consistency
     double avgLatency = calculateAvgLatency(currentLatency, assignments, wcLatencyMap, readLatencyByKey);
 
-    System.out.printf("[APP Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
-            currentLatency, avgLatency, MAX_LATENCY);
+    // System.out.printf("[APP Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
+    //         currentLatency, avgLatency, MAX_LATENCY);
 
-    System.out.print("[WriteConcern Latency] ");
-    for (int wc = 1; wc <= majority; wc++) {
-        System.out.printf("W:%d=%.2f ms | ", wc, wcLatencyMap.get(wc));
-    }
-    System.out.println();
+    // System.out.print("[WriteConcern Latency] ");
+    // for (int wc = 1; wc <= majority; wc++) {
+    //     System.out.printf("W:%d=%.2f ms | ", wc, wcLatencyMap.get(wc));
+    // }
+    // System.out.println();
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
@@ -863,10 +864,10 @@ public class BatchProcessor {
                 }
             }
 
-            System.out.println("Final App-WC Count Map After Upgrades:");
-            System.out.println(appWcCount);
-            System.out.println("Final App-ReadConcern Count Map After Upgrades:");
-            System.out.println(appReadConcernCount);
+            // System.out.println("Final App-WC Count Map After Upgrades:");
+            // System.out.println(appWcCount);
+            // System.out.println("Final App-ReadConcern Count Map After Upgrades:");
+            // System.out.println(appReadConcernCount);
 
             // Assign write upgrades to individual write transactions
             for (int i = 0; i < n; i++) {
@@ -919,8 +920,8 @@ public class BatchProcessor {
 
         BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, deferredQueue);
         HashMap<Integer, Integer> wcMix = countByWriteConcern(assignments);
-        System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
-                wcMix, transactionsUpgraded, deferredQueue.size(), avgLatency, finalTokenCost);
+        // System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
+        //         wcMix, transactionsUpgraded, deferredQueue.size(), avgLatency, finalTokenCost);
 
         return new ProcessResult(buildResult.executed, finalTokenCost, profit, transactionsUpgraded, buildResult.deferred);
     }
@@ -953,6 +954,9 @@ public class BatchProcessor {
             }
             return Integer.compare(b, a); // deterministic fallback
         });
+
+
+        // System.out.println("Backlog is "+ deferredQueue.size());
 
         // Build one deterministic execution order for pressure handling:
         // reads first by read key, then writes by write concern, both with appId DESC.
@@ -1015,8 +1019,8 @@ public class BatchProcessor {
         double tokensUsed = currentTokens - tokensRemaining;
         BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, deferredQueue);
 
-        System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | TokensUsed=%.2f\n",
-                processed, n, buildResult.deferred.size(), deferredQueue.size(), tokensUsed);
+        // System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | TokensUsed=%.2f\n",
+        //         processed, n, buildResult.deferred.size(), deferredQueue.size(), tokensUsed);
 
         return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, buildResult.deferred);
     }
@@ -1250,7 +1254,7 @@ static class AppUpgradeOption {
                 }
                 deferred.add(tx);
                 if (deferredQueue != null) {
-                    if(deferredQueue.size() < 1000) { // prevent unbounded growth
+                    if(deferredQueue.size() < 100) { // prevent unbounded growth
                     deferredQueue.add(tx);
                     }
                 }

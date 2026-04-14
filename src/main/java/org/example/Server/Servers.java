@@ -38,7 +38,7 @@ public class Servers{
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = true;
+    private static final boolean UPGRADE_TRANSACTIONS = false;
 
     // Simulate node failure by dropping all inter-server network RPCs on one node.
     // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
@@ -152,6 +152,13 @@ public class Servers{
 
         Map<Integer, Double> allMajority = Map.of(1, 0.0, 2, 1.0);
 
+        
+        Map<ReadClass, Double> allLinearizable = Map.of(
+                ReadClass.EVENTUAL, 0.0,
+                ReadClass.CAUSAL_LOCAL, 0.0,
+                ReadClass.CAUSAL_MAJORITY, 0.0,
+                ReadClass.LINEARIZABLE, 1.0
+        );
 
         List<ReadClass> readLevelsLowToHigh = List.of(
             ReadClass.EVENTUAL,
@@ -183,15 +190,22 @@ public class Servers{
         //     WorkloadProfile.LIGHT,
         //     writeTailShare);
 
-        // PHASES.add(new Phase("Light", 60,15000, 0, 1, lightReadDist, allMajority));
-        PHASES.add(new Phase("Light", 50, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.5, 0.5, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 40000, 0.10, 0.90, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
 
-        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
-        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 40, 17000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+        // PHASES.add(new Phase("Light", 40, 20000, 0.50, 0.50, lightReadDist, lightWriteDist));
 
-        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 40, 20000, 0.10, 0.90, lightReadDist, lightWriteDist));
+
+        // PHASES.add(new Phase("Light", 40, 20000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
+        // // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 80 ,55000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+
+        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 40, 40000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -676,17 +690,31 @@ public class Servers{
                 return true;
             }
         }
-        
-        // Second try: any server (they will forward to leader or queue)
-        for (int i = 0; i < NUM_OF_SERVERS; i++) {
-            ServerImpl server = injector.getServerById(i);
-            if (server != null) {
-                int accepted = server.enqueueWithoutDroppingExisting(transactionOptions);
-                dropped = Math.max(0, transactionOptions.size() - accepted);
+
+        // Second try: followers can take only follower-safe reads.
+        List<TransactionOption> followerSafeReads = transactionOptions.stream()
+                .filter(tx -> tx != null
+                        && tx.clientMessage != null
+                        && tx.clientMessage.hasT()
+                        && tx.clientMessage.getT().getIsReadOnly()
+                        && tx.clientMessage.getT().getReadConcern() != ReadConcern.LINEARIZABLE)
+                .collect(Collectors.toList());
+
+        if (!followerSafeReads.isEmpty()) {
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                ServerImpl server = injector.getServerById(i);
+                if (server == null || server == leader) {
+                    continue;
+                }
+
+                int accepted = server.enqueueWithoutDroppingExisting(followerSafeReads);
                 if (accepted > 0) {
                     trackIncomingTransactions(accepted);
-                    if (dropped > 0) {
-                        System.out.printf("⚠️ Rejected %d new transactions at fallback enqueue (queue full)%n", dropped);
+                    int remainingDropped = Math.max(0, transactionOptions.size() - accepted);
+                    if (remainingDropped > 0) {
+                        System.out.printf(
+                                "⚠️ Rejected %d transactions (writes/linearizable require leader or queue full)%n",
+                                remainingDropped);
                     }
                     return true;
                 }
@@ -1263,7 +1291,8 @@ public class Servers{
             "system_latency_%d.csv",
             "backlog_samples_%d.csv",
             "read_latencies_%d.csv",
-            "process_batch_duration_%d.csv"
+            "process_batch_duration_%d.csv",
+            "liveness_%d.csv"
         };
 
         // Global (non-server-specific) CSV files
@@ -1302,7 +1331,6 @@ public class Servers{
         }
     }
 }
-
 
 
 
