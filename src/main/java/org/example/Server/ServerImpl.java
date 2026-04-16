@@ -189,7 +189,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private static final int BATCH_INTERVAL_MS = 20;
     private static final int PROCESS_BATCH_TIME_BUDGET_MS = 15;
     private static final int MAX_ITEMS_PER_CYCLE = 2000;
-    private static final double BACKLOG_DRAIN_RATIO = 0.70;
+    private static final double BACKLOG_DRAIN_RATIO = 1.0;
     private static final int ACK_FUTURE_TIMEOUT_MS = 300;
 
     // private static final double COST_W1 = 1;
@@ -646,11 +646,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private final int MAX_QUEUE_SIZE = 500000;
-
     /**
-     * Enqueue new transactions up to remaining queue capacity without dropping
-     * existing queued entries.
+        * Enqueue new transactions while preserving existing queued entries.
      *
      * @return number of transactions accepted into the queue
      */
@@ -680,21 +677,62 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
 
-        batchLock.lock();
+        return admitTransactionsIntoQueue(transactions);
+    }
+
+    private int admitTransactionsIntoQueue(List<TransactionOption> transactions) {
+        int candidateCount = transactions.size();
+        if (candidateCount <= 0) {
+            return 0;
+        }
+
+        if (tokenBucket == null || !UPGRADE_TRANSACTIONS_ENABLED ) {
+            batchLock.lock();
+            try {
+                for (int i = 0; i < candidateCount; i++) {
+                    batchOfTransactions.addLast(transactions.get(i));
+                }
+                return candidateCount;
+            } finally {
+                batchLock.unlock();
+            }
+        }
+
+        int accepted;
+        redisLock.writeLock().lock();
         try {
-            int available = Math.max(0, MAX_QUEUE_SIZE - batchOfTransactions.size());
-            if (available <= 0) {
-                return 0;
+            TokenBucketData data = tokenBucket.getCurrentTokenBucketData();
+            double tokensRemaining = data.getTokenCount();
+            accepted = 0;
+
+            for (int i = 0; i < candidateCount; i++) {
+                TransactionOption tx = transactions.get(i);
+                double tokenCost = estimateTokenCostForAdmission(tx);
+                if (tokenCost <= tokensRemaining + 1e-9) {
+                    tokensRemaining -= tokenCost;
+                    accepted++;
+                } else {
+                    // Keep admission deterministic: stop admitting once budget is exhausted.
+                    break;
+                }
             }
 
-            int accepted = Math.min(available, transactions.size());
-            for (int i = 0; i < accepted; i++) {
-                batchOfTransactions.addLast(transactions.get(i));
-            }
-            return accepted;
+            tokenBucket.updateTokens(Math.max(0.0, tokensRemaining), data.getLastUpdateTime());
         } finally {
-            batchLock.unlock();
+            redisLock.writeLock().unlock();
         }
+
+        if (accepted > 0) {
+            batchLock.lock();
+            try {
+                for (int i = 0; i < accepted; i++) {
+                    batchOfTransactions.addLast(transactions.get(i));
+                }
+            } finally {
+                batchLock.unlock();
+            }
+        }
+        return accepted;
     }
 
     @Override
@@ -739,18 +777,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         clientStubs.computeIfAbsent(clientId,
                 k -> createClientStub(clientMessage.getCallbackHost(), clientMessage.getCallbackPort()));
 
-        // here I add the transactions in batch
-        batchLock.lock();
-        try {
-            if (batchOfTransactions.size() > MAX_QUEUE_SIZE) {
-                return;
-            }
-            batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
-            // System.out.println(batchOfTransactions.size() + "This is the batchSize at the
-            // leader end");
-        } finally {
-            batchLock.unlock();
-        }
+        TransactionOption option = TransactionOption.fromClientMessage(clientMessage);
+        enqueueWithoutDroppingExisting(List.of(option));
     }
 
     private String getClientId(String host, int port) {
@@ -1776,6 +1804,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private double estimateTokensUsedAtOriginalConsistency(List<TransactionOption> batch) {
+        if (transactionBatchProcessor != null) {
+            return transactionBatchProcessor.estimateTokenCostAtOriginalConsistency(batch);
+        }
+
         double total = 0.0;
         for (TransactionOption option : batch) {
             if (option == null) {
@@ -1800,6 +1832,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
         return total;
+    }
+
+    private double estimateTokenCostForAdmission(TransactionOption option) {
+        if (option == null) {
+            return 0.0;
+        }
+        if (transactionBatchProcessor != null) {
+            return transactionBatchProcessor.estimateTokenCostAtOriginalConsistency(option);
+        }
+        if (!option.isReadOnly) {
+            return TOKEN_COST_WRITE;
+        }
+
+        ReadConcern rc = option.readConcern;
+        if (rc == ReadConcern.CAUSAL) {
+            return option.readLevel == ReadLevel.MAJORITY
+                    ? TOKEN_COST_READ_CAUSAL_MAJORITY
+                    : TOKEN_COST_READ_CAUSAL_LOCAL;
+        }
+        if (rc == ReadConcern.LINEARIZABLE) {
+            return TOKEN_COST_READ_LINEARIZABLE;
+        }
+        return TOKEN_COST_READ_EVENTUAL;
     }
 
     private TokenBucketSnapshot collectAndLogTokenBucketMetrics(List<TransactionOption> currentBatch,
@@ -1944,25 +1999,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     private ProcessResult handleTokenBucketMetricsOnly(List<TransactionOption> currentBatch, double totalFollowerTps) {
-        redisLock.writeLock().lock();
         try {
-            TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
-            recordSystemTpsIfLeader(snapshot.currentTps);
+            double currentServerThroughput = getSystemWideThroughput();
+            double currentTps = currentServerThroughput + totalFollowerTps;
+            recordSystemTpsIfLeader(currentTps);
 
-            // No upgrades, no deferrals: execute exactly as received.
-            // backLogTransactions.clear();
+            double currentLatency;
+            synchronized (systemWideLatency) {
+                currentLatency = ((double) totalSystemWideLatency.get()
+                        / Math.max(1, countOfSystemWideLatencies.get()));
+            }
+            try (FileWriter sysWriter = new FileWriter("system_latency_" + serverId + ".csv", true);
+                 PrintWriter sysOut = new PrintWriter(sysWriter)) {
+                File file = new File("system_latency_" + serverId + ".csv");
+                if (file.length() == 0) {
+                    sysOut.println("Timestamp,SystemLatency");
+                }
+                sysOut.printf("%d,%.4f%n", System.currentTimeMillis(), currentLatency);
+            } catch (IOException e) {
+                System.err.println("Failed to write system latency to system_latency.csv: " + e.getMessage());
+            }
 
+            // Upgrades are disabled: execute exactly as received and do not touch token bucket state.
             double tokensUsed = estimateTokensUsedAtOriginalConsistency(currentBatch);
             ProcessResult result = buildResultWithoutUpgrade(currentBatch, tokensUsed);
             previousBatchResult = result;
-
-            double remainingTokens = Math.max(0, snapshot.currentTokens - tokensUsed);
-            tokenBucket.updateTokens(remainingTokens, snapshot.lastUpdate);
-
-                // System.out.printf(
-                //         "\uD83D\uDE80 [Batch Result - No Upgrade] Profit: %.2f | Current TPS: %.2f | Current Tokens: %.2f | Tokens Used: %.2f | Remaining Tokens: %.2f | Transactions Upgraded : %d%n",
-                //         result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, tokensUsed, remainingTokens,
-                //         result.transactionsUpgraded);
 
             try (FileWriter fw = new FileWriter("tps_" + serverId + ".csv", true);
                  PrintWriter out = new PrintWriter(fw)) {
@@ -1970,20 +2031,20 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 if (file.length() == 0) {
                     out.println("Timestamp,Profit,CurrentTPS,CurrentTokens,TokensUsed,TransactionsUpgraded");
                 }
-                out.printf("%d,%.2f,%.2f,%.2f,%.2f,%d%n",
+                out.printf("%d,%.2f,%.2f,%s,%.2f,%d%n",
                         System.currentTimeMillis(),
-                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, tokensUsed,
+                        result.profit,
+                        currentServerThroughput,
+                        "NA",
+                        tokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();
             }
             return result;
         } catch (Exception e) {
-            // System.out.println("Error in handleTokenBucketMetricsOnly: " + e.getMessage());
             e.printStackTrace();
             return null;
-        } finally {
-            redisLock.writeLock().unlock();
         }
     }
 
@@ -2598,7 +2659,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
             recordSystemTpsIfLeader(snapshot.currentTps);
 
-            ProcessResult result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(
+                ProcessResult result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristicNoPressure(
                     currentBatch,
                     snapshot.currentLatency,
                     snapshot.wcLatencyMap,

@@ -50,7 +50,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 15;
+    private static final double writeCost = 8;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -72,7 +72,7 @@ public class BatchProcessor {
         put(RC_KEY_EVENTUAL_ALL, 1.0);
         put(RC_KEY_CAUSAL_LOCAL, 1.54);
         put(RC_KEY_CAUSAL_MAJORITY, 2.0);
-        put(RC_KEY_LINEARIZABLE_ALL, 14.0);
+        put(RC_KEY_LINEARIZABLE_ALL, 10.0);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -579,6 +579,55 @@ public class BatchProcessor {
     Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
      HashMap<Integer, Double> readLatencyByKey, boolean isLeader,
      Queue<TransactionOption> deferredQueue) {
+        return processWithLatencyApplicationBasedHeuristicInternal(
+                batch,
+                currentLatency,
+                wcLatencyMap,
+                wcTpsMap,
+                incomingRateOfTransactions,
+                backLogTransactions,
+                isBackLogIncreasing,
+                currentTokens,
+                readLatencyByKey,
+                isLeader,
+                deferredQueue,
+                true);
+    }
+
+    public ProcessResult processWithLatencyApplicationBasedHeuristicNoPressure(
+    List<TransactionOption> batch,
+    double currentLatency,
+    HashMap<Integer, Double> wcLatencyMap,
+    HashMap<Integer, Double> wcTpsMap,
+    int incomingRateOfTransactions,
+    Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
+    HashMap<Integer, Double> readLatencyByKey, boolean isLeader,
+    Queue<TransactionOption> deferredQueue) {
+        return processWithLatencyApplicationBasedHeuristicInternal(
+                batch,
+                currentLatency,
+                wcLatencyMap,
+                wcTpsMap,
+                incomingRateOfTransactions,
+                backLogTransactions,
+                isBackLogIncreasing,
+                currentTokens,
+                readLatencyByKey,
+                isLeader,
+                deferredQueue,
+                false);
+    }
+
+    private ProcessResult processWithLatencyApplicationBasedHeuristicInternal(
+    List<TransactionOption> batch,
+    double currentLatency,
+    HashMap<Integer, Double> wcLatencyMap,
+    HashMap<Integer, Double> wcTpsMap,
+    int incomingRateOfTransactions,
+    Set<String> backLogTransactions, boolean isBackLogIncreasing, double currentTokens,
+     HashMap<Integer, Double> readLatencyByKey, boolean isLeader,
+     Queue<TransactionOption> deferredQueue,
+     boolean pressureModeEnabled) {
 
     int n = batch.size();
 
@@ -673,7 +722,7 @@ public class BatchProcessor {
 
     // Step 4: Check if we can execute all (latency + token budget)
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
-    MAX_LATENCY = isLeader ?  80 : 70;
+    MAX_LATENCY = isLeader ?  60 : 50;
     if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
 
         for (int i = 0; i < n; i++) {
@@ -928,6 +977,15 @@ public class BatchProcessor {
 
     // Step 8: avgLatency > maxLatency — pressure path, token-budget based
     else {
+        if (!pressureModeEnabled) {
+            for (int i = 0; i < n; i++) {
+                profit += batch.get(i).baseProfit;
+            }
+            double tokensUsed = calculateTotalTokenCost(batch, assignments);
+            BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, null);
+            return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, List.of());
+        }
+
         // Reset all assignments to deferred
         for (int i = 0; i < n; i++) {
             if (assignments[i].isReadOnly) {
@@ -1085,6 +1143,32 @@ static class AppUpgradeOption {
             return getReadTokenCost(tx.readConcern, tx.readLevel);
         }
         return writeCost;
+    }
+
+    /**
+     * Estimate token cost at original (incoming) consistency levels.
+     * This is used by the no-upgrade execution path to keep token accounting
+     * consistent with BatchProcessor token-cost maps.
+     */
+    public double estimateTokenCostAtOriginalConsistency(List<TransactionOption> batch) {
+        if (batch == null || batch.isEmpty()) {
+            return 0.0;
+        }
+        double total = 0.0;
+        for (TransactionOption tx : batch) {
+            if (tx == null) {
+                continue;
+            }
+            total += getTokenCost(tx);
+        }
+        return total;
+    }
+
+    public double estimateTokenCostAtOriginalConsistency(TransactionOption tx) {
+        if (tx == null) {
+            return 0.0;
+        }
+        return getTokenCost(tx);
     }
 
     private int tryExecuteDeferredTransaction(
@@ -1254,7 +1338,7 @@ static class AppUpgradeOption {
                 }
                 deferred.add(tx);
                 if (deferredQueue != null) {
-                    if(deferredQueue.size() < 100) { // prevent unbounded growth
+                    if(deferredQueue.size() < 0) { // prevent unbounded growth
                     deferredQueue.add(tx);
                     }
                 }

@@ -48,7 +48,7 @@ public class Servers{
     // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
     // using runtime values including the selected callback port.
     private static final boolean ENABLE_GEO_SETTINGS = false;
-    private static final int GEO_LATENCY_MS = 15;
+    private static final int GEO_LATENCY_MS = 100;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
     private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
@@ -68,7 +68,7 @@ public class Servers{
     // Target can be LEADER or FOLLOWER at trigger time.
     private static final boolean ENABLE_TIMED_NODE_FAILURE = false;
     private static final FailureTargetRole FAILURE_TARGET_ROLE = FailureTargetRole.FOLLOWER;
-    private static final int FAILURE_AFTER_SECONDS = 30;
+    private static final int FAILURE_AFTER_SECONDS = 40;
     
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
@@ -130,7 +130,7 @@ public class Servers{
                 ReadClass.CAUSAL_MAJORITY, 0.05,
                 ReadClass.LINEARIZABLE, 0.05
         );
-        Map<Integer, Double> lightWriteDist = Map.of(1, 0.90, 2, 0.10);
+        Map<Integer, Double> lightWriteDist = Map.of(1, 0.80, 2, 0.20);
 
         Map<ReadClass, Double> mediumReadDist = Map.of(
                 ReadClass.EVENTUAL, 0.25,
@@ -190,20 +190,20 @@ public class Servers{
         //     WorkloadProfile.LIGHT,
         //     writeTailShare);
 
-        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60, 30000, 0.5, 0.5, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 40000, 0.10, 0.90, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
 
-        // PHASES.add(new Phase("Light", 40, 20000, 0.50, 0.50, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 30000, 0.50, 0.50, lightReadDist, lightWriteDist));
 
-        // PHASES.add(new Phase("Light", 40, 20000, 0.10, 0.90, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 50000, 0.10, 0.90, lightReadDist, lightWriteDist));
 
-        // PHASES.add(new Phase("Light", 40, 20000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
         // // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 80 ,55000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+        // PHASES.add(new Phase("Light", 60 ,70000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
 
         // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 40, 40000, 0.90, 0.10, lightReadDist, lightWriteDist));
@@ -231,7 +231,7 @@ public class Servers{
             .setP(System.currentTimeMillis()).setL(0).build();
     
     // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 240000;  // 240 seconds total
+    private static final long TOTAL_EXPERIMENT_DURATION_MS = 270000;  // 240 seconds total
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
     
