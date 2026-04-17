@@ -38,7 +38,7 @@ public class Servers{
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = false;
+    private static final boolean UPGRADE_TRANSACTIONS = true;
 
     // Simulate node failure by dropping all inter-server network RPCs on one node.
     // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
@@ -47,8 +47,8 @@ public class Servers{
 
     // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
     // using runtime values including the selected callback port.
-    private static final boolean ENABLE_GEO_SETTINGS = false;
-    private static final int GEO_LATENCY_MS = 100;
+    private static final boolean ENABLE_GEO_SETTINGS = true;
+    private static final int GEO_LATENCY_MS = 50;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
     private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
@@ -190,16 +190,16 @@ public class Servers{
         //     WorkloadProfile.LIGHT,
         //     writeTailShare);
 
-        PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
 
-        PHASES.add(new Phase("Light", 60, 30000, 0.50, 0.50, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.50, 0.50, lightReadDist, lightWriteDist));
 
-        PHASES.add(new Phase("Light", 60, 50000, 0.10, 0.90, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 50000, 0.10, 0.90, lightReadDist, lightWriteDist));
 
-        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
         // // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
