@@ -267,9 +267,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // When false, the server will bypass handleTokenBucket() and execute the incoming
     // batch exactly as received (no upgrades, no deferrals).
     private static volatile boolean UPGRADE_TRANSACTIONS_ENABLED = false;
+    // When true, enable pressure-aware processing and bypass token-gated admission.
+    private static volatile boolean PRESSURE_MODE_ENABLED = false;
 
     public static void setUpgradeTransactionsEnabled(boolean enabled) {
         UPGRADE_TRANSACTIONS_ENABLED = enabled;
+    }
+
+    public static void setPressureModeEnabled(boolean enabled) {
+        PRESSURE_MODE_ENABLED = enabled;
     }
     public void setDropAllServerNetworkTraffic(boolean enabled) {
         this.dropAllServerNetworkTraffic = enabled;
@@ -686,7 +692,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return 0;
         }
 
-        if (tokenBucket == null || !UPGRADE_TRANSACTIONS_ENABLED ) {
+        if (tokenBucket == null || !UPGRADE_TRANSACTIONS_ENABLED || PRESSURE_MODE_ENABLED) {
             batchLock.lock();
             try {
                 for (int i = 0; i < candidateCount; i++) {
@@ -2659,18 +2665,34 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             TokenBucketSnapshot snapshot = collectAndLogTokenBucketMetrics(currentBatch, totalFollowerTps);
             recordSystemTpsIfLeader(snapshot.currentTps);
 
-                ProcessResult result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristicNoPressure(
-                    currentBatch,
-                    snapshot.currentLatency,
-                    snapshot.wcLatencyMap,
-                    snapshot.wcTpsMap,
-                    getIncomingTransactionsRate(),
-                    backLogTransactions,
-                    backlogTracker.isIncreasing(),
-                    snapshot.currentTokens,
-                    snapshot.readLatencyByKey,
-                    snapshot.isLeader,
-                    backLogQueue);
+            ProcessResult result;
+            if (PRESSURE_MODE_ENABLED) {
+                result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristic(
+                        currentBatch,
+                        snapshot.currentLatency,
+                        snapshot.wcLatencyMap,
+                        snapshot.wcTpsMap,
+                        getIncomingTransactionsRate(),
+                        backLogTransactions,
+                        backlogTracker.isIncreasing(),
+                        snapshot.currentTokens,
+                        snapshot.readLatencyByKey,
+                        snapshot.isLeader,
+                        backLogQueue);
+            } else {
+                result = transactionBatchProcessor.processWithLatencyApplicationBasedHeuristicNoPressure(
+                        currentBatch,
+                        snapshot.currentLatency,
+                        snapshot.wcLatencyMap,
+                        snapshot.wcTpsMap,
+                        getIncomingTransactionsRate(),
+                        backLogTransactions,
+                        backlogTracker.isIncreasing(),
+                        snapshot.currentTokens,
+                        snapshot.readLatencyByKey,
+                        snapshot.isLeader,
+                        backLogQueue);
+            }
 
             // Save result for next RL prediction
             previousBatchResult = result;

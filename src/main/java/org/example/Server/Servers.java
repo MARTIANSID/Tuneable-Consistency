@@ -39,6 +39,10 @@ public class Servers{
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
     private static final boolean UPGRADE_TRANSACTIONS = true;
+    // Toggle pressure mode in BatchProcessor flow.
+    // true => direct admission + pressure-aware processing/deferral path.
+    // false => keep current no-pressure flow (base token prepay at admission + upgrade differential later).
+    private static final boolean PRESSURE_MODE_ENABLED = false;
 
     // Simulate node failure by dropping all inter-server network RPCs on one node.
     // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
@@ -253,6 +257,7 @@ public class Servers{
 
         // Set whether servers should upgrade/tune transaction consistency.
         ServerImpl.setUpgradeTransactionsEnabled(UPGRADE_TRANSACTIONS);
+        ServerImpl.setPressureModeEnabled(PRESSURE_MODE_ENABLED);
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();

@@ -720,14 +720,20 @@ public class BatchProcessor {
     // }
     // System.out.println();
 
-    // Step 4: Check if we can execute all (latency + token budget)
+    // Step 4: Check if we can execute all.
+    // In no-pressure mode, base token cost is assumed to be already paid.
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
+    boolean skipBaseTokenGate = !pressureModeEnabled;
     MAX_LATENCY = isLeader ?  50 : 50;
-    if (avgLatency <= MAX_LATENCY && totalTokenCost <= currentTokens) {
+    if (avgLatency <= MAX_LATENCY && (skipBaseTokenGate || totalTokenCost <= currentTokens)) {
 
         for (int i = 0; i < n; i++) {
             profit += batch.get(i).baseProfit;
         }
+
+        // Tracks token usage baseline + upgrades.
+        // In no-pressure mode, baseline is 0 (base cost already paid).
+        double tokensUsedSoFar = skipBaseTokenGate ? 0.0 : totalTokenCost;
 
         // Step 5: Upgrade phase
         if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
@@ -764,7 +770,6 @@ public class BatchProcessor {
             }
 
                 // === Seed read upgrades using key chain ===
-            double tokensUsedSoFar = calculateTotalTokenCost(batch, assignments);
 
                 for (Map.Entry<Integer, HashMap<Integer, Integer>> appEntry : appReadConcernCount.entrySet()) {
                 int appId = appEntry.getKey();
@@ -964,15 +969,19 @@ public class BatchProcessor {
             }
         }
 
-        // Calculate final token cost after all upgrades
+        // Calculate final token usage after all upgrades.
+        // In no-pressure mode, return only differential upgrade cost tracked in tokensUsedSoFar.
         double finalTokenCost = calculateTotalTokenCost(batch, assignments);
+        double tokensUsedForResult = pressureModeEnabled
+            ? finalTokenCost
+            : tokensUsedSoFar;
 
         BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, deferredQueue);
         HashMap<Integer, Integer> wcMix = countByWriteConcern(assignments);
         // System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
         //         wcMix, transactionsUpgraded, deferredQueue.size(), avgLatency, finalTokenCost);
 
-        return new ProcessResult(buildResult.executed, finalTokenCost, profit, transactionsUpgraded, buildResult.deferred);
+        return new ProcessResult(buildResult.executed, tokensUsedForResult, profit, transactionsUpgraded, buildResult.deferred);
     }
 
     // Step 8: avgLatency > maxLatency — pressure path, token-budget based
@@ -981,7 +990,7 @@ public class BatchProcessor {
             for (int i = 0; i < n; i++) {
                 profit += batch.get(i).baseProfit;
             }
-            double tokensUsed = calculateTotalTokenCost(batch, assignments);
+            double tokensUsed = 0.0;
             BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, null);
             return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, List.of());
         }
