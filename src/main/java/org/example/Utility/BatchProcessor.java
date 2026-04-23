@@ -50,7 +50,7 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 8;
+    private static final double writeCost = 22;
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -72,7 +72,7 @@ public class BatchProcessor {
         put(RC_KEY_EVENTUAL_ALL, 1.0);
         put(RC_KEY_CAUSAL_LOCAL, 1.54);
         put(RC_KEY_CAUSAL_MAJORITY, 2.0);
-        put(RC_KEY_LINEARIZABLE_ALL, 10.0);
+        put(RC_KEY_LINEARIZABLE_ALL, 15.0);
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {

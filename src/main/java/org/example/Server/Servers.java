@@ -38,7 +38,7 @@ public class Servers{
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = true;
+    private static final boolean UPGRADE_TRANSACTIONS = false;
     // Toggle pressure mode in BatchProcessor flow.
     // true => direct admission + pressure-aware processing/deferral path.
     // false => keep current no-pressure flow (base token prepay at admission + upgrade differential later).
@@ -51,7 +51,7 @@ public class Servers{
 
     // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
     // using runtime values including the selected callback port.
-    private static final boolean ENABLE_GEO_SETTINGS = true;
+    private static final boolean ENABLE_GEO_SETTINGS = false;
     private static final int GEO_LATENCY_MS = 50;
     private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
     // true => also delay client callback/ack port; false => delay only server ports (8001..)
@@ -194,10 +194,10 @@ public class Servers{
         //     WorkloadProfile.LIGHT,
         //     writeTailShare);
 
-        PHASES.add(new Phase("Light", 40, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
 
         // PHASES.add(new Phase("Light", 60, 30000, 0.50, 0.50, lightReadDist, lightWriteDist));
 
@@ -205,11 +205,11 @@ public class Servers{
 
         // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
+        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
         // // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60 ,70000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
+        PHASES.add(new Phase("Light", 60 ,70000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
 
-        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
+        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Light", 40, 40000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
         // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
