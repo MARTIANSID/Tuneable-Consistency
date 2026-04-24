@@ -228,346 +228,346 @@ public class BatchProcessor {
      * 6. If avgTPS < minTPS → process from weakest first until avgTPS >= minTPS
      */
 
-    public ProcessResult processWithTPSHeuristic(
-            List<TransactionOption> batch,
-            double currentTPS,
-            HashMap<Integer, Double> wcTpsMap,
-            Set<String> backLogTransactions) {
+    // public ProcessResult processWithTPSHeuristic(
+    //         List<TransactionOption> batch,
+    //         double currentTPS,
+    //         HashMap<Integer, Double> wcTpsMap,
+    //         Set<String> backLogTransactions) {
 
-        int n = batch.size();
-        double finalBatchAvgTps;
+    //     int n = batch.size();
+    //     double finalBatchAvgTps;
 
-        if (n == 0) {
-            return new ProcessResult(new ArrayList<>(), 0, 0, 0);
-        }
+    //     if (n == 0) {
+    //         return new ProcessResult(new ArrayList<>(), 0, 0, 0);
+    //     }
 
-        int majority = (NUM_OF_SERVERS / 2) + 1;
-        int[] consistencyLevels = new int[n];
-        double profit = 0;
-        int transactionsUpgraded = 0;
+    //     int majority = (NUM_OF_SERVERS / 2) + 1;
+    //     int[] consistencyLevels = new int[n];
+    //     double profit = 0;
+    //     int transactionsUpgraded = 0;
 
-        // Step 1: Initialize all at minimum consistency
-        for (int i = 0; i < n; i++) {
-            consistencyLevels[i] = batch.get(i).minRequiredConsistency;
-        }
+    //     // Step 1: Initialize all at minimum consistency
+    //     for (int i = 0; i < n; i++) {
+    //         consistencyLevels[i] = batch.get(i).minRequiredConsistency;
+    //     }
 
-        // Step 2: Calculate avgTPS with all transactions at min consistency
-        double avgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
+    //     // Step 2: Calculate avgTPS with all transactions at min consistency
+    //     double avgTPS = calculateAvgTPS(currentTPS, consistencyLevels, wcTpsMap);
 
-        System.out.printf("[TPS Heuristic] currentTPS=%.0f | avgTPS=%.0f | minTPS=%.0f%n", 
-                currentTPS, avgTPS, MIN_TPS);
+    //     System.out.printf("[TPS Heuristic] currentTPS=%.0f | avgTPS=%.0f | minTPS=%.0f%n", 
+    //             currentTPS, avgTPS, MIN_TPS);
         
-        // Print individual writeConcern throughputs
-        System.out.print("[WriteConcern TPS] ");
-        for (int wc = 1; wc <= majority; wc++) {
-            System.out.printf("W:%d=%.2f TPS | ", wc, wcTpsMap.get(wc));
-        }
-        System.out.println();
+    //     // Print individual writeConcern throughputs
+    //     System.out.print("[WriteConcern TPS] ");
+    //     for (int wc = 1; wc <= majority; wc++) {
+    //         System.out.printf("W:%d=%.2f TPS | ", wc, wcTpsMap.get(wc));
+    //     }
+    //     System.out.println();
 
-        // Step 3: Check if we can execute all
-        if (avgTPS >= MIN_TPS) {
-            // Execute all transactions
-            for (int i = 0; i < n; i++) {
-                profit += batch.get(i).baseProfit;
-            }
+    //     // Step 3: Check if we can execute all
+    //     if (avgTPS >= MIN_TPS) {
+    //         // Execute all transactions
+    //         for (int i = 0; i < n; i++) {
+    //             profit += batch.get(i).baseProfit;
+    //         }
 
-            // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
-                if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD
-                    && backLogTransactions.isEmpty()
-                    && currentTPS > MIN_TPS
-                    && !isInUpgradeWarmupPhase()) {
+    //         // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
+    //             if (avgTPS >= MIN_TPS * UPGRADE_THRESHOLD
+    //                 && backLogTransactions.isEmpty()
+    //                 && currentTPS > MIN_TPS
+    //                 && !isInUpgradeWarmupPhase()) {
                 
-                // Build priority queue for upgrades (best profit/tps-cost ratio first)
-                PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
-                        (a, b) -> Double.compare(b.ratio, a.ratio)
-                );
+    //             // Build priority queue for upgrades (best profit/tps-cost ratio first)
+    //             PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+    //                     (a, b) -> Double.compare(b.ratio, a.ratio)
+    //             );
 
-                for (int i = 0; i < n; i++) {
-                    int currentWC = consistencyLevels[i];
-                    if (currentWC < majority) {
-                        TransactionOption tx = batch.get(i);
-                        double tpsDrop = getMaxTPS(currentWC, wcTpsMap) - getMaxTPS(currentWC + 1, wcTpsMap);
-                        double nextProfit = (currentWC + 1 == majority)
-                                ? tx.extraMajorityProfit
-                                : tx.extraIntermediateProfit;
-                        double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
-                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, tpsDrop, nextProfit, ratio));
-                    }
-                }
+    //             for (int i = 0; i < n; i++) {
+    //                 int currentWC = consistencyLevels[i];
+    //                 if (currentWC < majority) {
+    //                     TransactionOption tx = batch.get(i);
+    //                     double tpsDrop = getMaxTPS(currentWC, wcTpsMap) - getMaxTPS(currentWC + 1, wcTpsMap);
+    //                     double nextProfit = (currentWC + 1 == majority)
+    //                             ? tx.extraMajorityProfit
+    //                             : tx.extraIntermediateProfit;
+    //                     double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
+    //                     pq.add(new UpgradeOption(i, currentWC, currentWC + 1, tpsDrop, nextProfit, ratio));
+    //                 }
+    //             }
 
-                // Step 5: Upgrade while avgTPS stays >= minTPS * 1.10
-                while (!pq.isEmpty()) {
-                    UpgradeOption opt = pq.poll();
+    //             // Step 5: Upgrade while avgTPS stays >= minTPS * 1.10
+    //             while (!pq.isEmpty()) {
+    //                 UpgradeOption opt = pq.poll();
 
-                    if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
+    //                 if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
 
-                    // Simulate upgrade
+    //                 // Simulate upgrade
 
-                    // we want to upgrade the transactions consistency level to opt.toWC
-                    avgTPS = (avgTPS * (n + 1) - getMaxTPS(opt.fromWC, wcTpsMap) + getMaxTPS(opt.toWC, wcTpsMap)) / (n + 1);
-                    // int[] tempLevels = consistencyLevels.clone();
-                    // tempLevels[opt.txIndex] = opt.toWC;
-                    // double newAvgTPS = calculateAvgTPS(currentTPS, tempLevels, wcTpsMap);
+    //                 // we want to upgrade the transactions consistency level to opt.toWC
+    //                 avgTPS = (avgTPS * (n + 1) - getMaxTPS(opt.fromWC, wcTpsMap) + getMaxTPS(opt.toWC, wcTpsMap)) / (n + 1);
+    //                 // int[] tempLevels = consistencyLevels.clone();
+    //                 // tempLevels[opt.txIndex] = opt.toWC;
+    //                 // double newAvgTPS = calculateAvgTPS(currentTPS, tempLevels, wcTpsMap);
 
-                    if (avgTPS >= MIN_TPS * UPGRADE_FLOOR) {
-                        // Safe to upgrade
-                        consistencyLevels[opt.txIndex] = opt.toWC;
-                        profit += opt.additionalProfit;
-                        transactionsUpgraded++;
+    //                 if (avgTPS >= MIN_TPS * UPGRADE_FLOOR) {
+    //                     // Safe to upgrade
+    //                     consistencyLevels[opt.txIndex] = opt.toWC;
+    //                     profit += opt.additionalProfit;
+    //                     transactionsUpgraded++;
 
-                        // Add next upgrade level if possible
-                        if (opt.toWC < majority) {
-                            TransactionOption tx = batch.get(opt.txIndex);
-                            double tpsDrop = getMaxTPS(opt.toWC, wcTpsMap) - getMaxTPS(opt.toWC + 1, wcTpsMap);
-                            double nextProfit = (opt.toWC + 1 == majority)
-                                    ? tx.extraMajorityProfit
-                                    : tx.extraIntermediateProfit;
-                            double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
-                            pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, tpsDrop, nextProfit, ratio));
-                        }
-                    }
-                }
-            }
-            logFinalBatchAvgTps(avgTPS);
-            // Build result
-            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+    //                     // Add next upgrade level if possible
+    //                     if (opt.toWC < majority) {
+    //                         TransactionOption tx = batch.get(opt.txIndex);
+    //                         double tpsDrop = getMaxTPS(opt.toWC, wcTpsMap) - getMaxTPS(opt.toWC + 1, wcTpsMap);
+    //                         double nextProfit = (opt.toWC + 1 == majority)
+    //                                 ? tx.extraMajorityProfit
+    //                                 : tx.extraIntermediateProfit;
+    //                         double ratio = (tpsDrop > EPS) ? nextProfit / tpsDrop : Double.MAX_VALUE;
+    //                         pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, tpsDrop, nextProfit, ratio));
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         logFinalBatchAvgTps(avgTPS);
+    //         // Build result
+    //         BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
             
-            HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
-            System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
-                    wcMix, transactionsUpgraded, backLogTransactions.size(), avgTPS);
+    //         HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
+    //         System.out.printf("[TPS Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
+    //                 wcMix, transactionsUpgraded, backLogTransactions.size(), avgTPS);
 
-            return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
-        }
-        // Step 6: avgTPS < minTPS → process from weakest first
-        else {
-            // Sort by: 1) retryCount DESC (prioritize retried transactions)
-            //          2) minRequiredConsistency ASC (weakest first)
-            List<Integer> indices = new ArrayList<>();
-            for (int i = 0; i < n; i++) indices.add(i);
-            indices.sort((a, b) -> {
-                TransactionOption txA = batch.get(a);
-                TransactionOption txB = batch.get(b);
-                // First: higher retry count has priority
-                if (txA.retryCount != txB.retryCount) {
-                    return Integer.compare(txB.retryCount, txA.retryCount); // DESC
-                }
-                // Second: lower consistency (W:1 before W:2)
-                return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
-            });
+    //         return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
+    //     }
+    //     // Step 6: avgTPS < minTPS → process from weakest first
+    //     else {
+    //         // Sort by: 1) retryCount DESC (prioritize retried transactions)
+    //         //          2) minRequiredConsistency ASC (weakest first)
+    //         List<Integer> indices = new ArrayList<>();
+    //         for (int i = 0; i < n; i++) indices.add(i);
+    //         indices.sort((a, b) -> {
+    //             TransactionOption txA = batch.get(a);
+    //             TransactionOption txB = batch.get(b);
+    //             // First: higher retry count has priority
+    //             if (txA.retryCount != txB.retryCount) {
+    //                 return Integer.compare(txB.retryCount, txA.retryCount); // DESC
+    //             }
+    //             // Second: lower consistency (W:1 before W:2)
+    //             return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
+    //         });
 
-            // Reset consistency levels
-            for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
+    //         // Reset consistency levels
+    //         for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
 
-            // Minimum transactions to process (80% of batch)
-            int minToProcess = Math.max(1, (int) (n * 0.7));
+    //         // Minimum transactions to process (80% of batch)
+    //         int minToProcess = Math.max(1, (int) (n * 0.7));
 
-            int processed = 0;
-            double tpsSum = currentTPS;
-            for (int idx : indices) {
-                TransactionOption tx = batch.get(idx);
+    //         int processed = 0;
+    //         double tpsSum = currentTPS;
+    //         for (int idx : indices) {
+    //             TransactionOption tx = batch.get(idx);
                 
-                // Force execute transactions that have been deferred too many times (retryCount >= 2)
-                boolean mustExecute = tx.retryCount >= 2;
+    //             // Force execute transactions that have been deferred too many times (retryCount >= 2)
+    //             boolean mustExecute = tx.retryCount >= 2;
 
-                // System.out.printf("[TPS Heuristic] Considering Tx ID=%s | MinWC=%d | RetryCount=%d | MustExecute=%b%n",
-                //         tx.id, tx.minRequiredConsistency, tx.retryCount, mustExecute);
+    //             // System.out.printf("[TPS Heuristic] Considering Tx ID=%s | MinWC=%d | RetryCount=%d | MustExecute=%b%n",
+    //             //         tx.id, tx.minRequiredConsistency, tx.retryCount, mustExecute);
                 
-                // Try adding this transaction
-                consistencyLevels[idx] = tx.minRequiredConsistency;
-                tpsSum += getMaxTPS(tx.minRequiredConsistency, wcTpsMap);
-                double newAvgTPS = tpsSum / (processed + 1);
+    //             // Try adding this transaction
+    //             consistencyLevels[idx] = tx.minRequiredConsistency;
+    //             tpsSum += getMaxTPS(tx.minRequiredConsistency, wcTpsMap);
+    //             double newAvgTPS = tpsSum / (processed + 1);
 
-                // Execute if: forced (retry >= 2), below minimum threshold, or TPS allows
-                if (mustExecute || processed < minToProcess || newAvgTPS >= MIN_TPS) {
-                    // Must process (retried too many times / below minimum) or can process (TPS allows)
-                    profit += tx.baseProfit;
-                    processed++;
-                } else {
-                    // Would drop below minTPS and we've hit minimum, skip it
-                    consistencyLevels[idx] = 0;
-                }
-            }
+    //             // Execute if: forced (retry >= 2), below minimum threshold, or TPS allows
+    //             if (mustExecute || processed < minToProcess || newAvgTPS >= MIN_TPS) {
+    //                 // Must process (retried too many times / below minimum) or can process (TPS allows)
+    //                 profit += tx.baseProfit;
+    //                 processed++;
+    //             } else {
+    //                 // Would drop below minTPS and we've hit minimum, skip it
+    //                 consistencyLevels[idx] = 0;
+    //             }
+    //         }
 
-            finalBatchAvgTps = tpsSum / (processed + 1);
+    //         finalBatchAvgTps = tpsSum / (processed + 1);
 
-            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+    //         BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
-            logFinalBatchAvgTps(finalBatchAvgTps);
-            System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
-                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgTps);
+    //         logFinalBatchAvgTps(finalBatchAvgTps);
+    //         System.out.printf("[TPS Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgTPS=%.0f%n",
+    //                 processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgTps);
 
-            return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
-        }
-    }
+    //         return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+    //     }
+    // }
 
 
-    public ProcessResult processWithLatencyHeuristic(
-        List<TransactionOption> batch,
-        double currentLatency,
-        HashMap<Integer, Double> wcLatencyMap,
-        HashMap<Integer, Double> wcTpsMap,
-        int incomingRateOfTransactions,
-        Set<String> backLogTransactions, boolean isBackLogIncreasing) {
+    // public ProcessResult processWithLatencyHeuristic(
+    //     List<TransactionOption> batch,
+    //     double currentLatency,
+    //     HashMap<Integer, Double> wcLatencyMap,
+    //     HashMap<Integer, Double> wcTpsMap,
+    //     int incomingRateOfTransactions,
+    //     Set<String> backLogTransactions, boolean isBackLogIncreasing) {
 
-        int n = batch.size();
-        double finalBatchAvgLatency;
+    //     int n = batch.size();
+    //     double finalBatchAvgLatency;
 
-        if (n == 0) {
-            return new ProcessResult(new ArrayList<>(), 0, 0, 0);
-        }
+    //     if (n == 0) {
+    //         return new ProcessResult(new ArrayList<>(), 0, 0, 0);
+    //     }
 
-        int majority = (NUM_OF_SERVERS / 2) + 1;
-        int[] consistencyLevels = new int[n];
-        double profit = 0;
-        int transactionsUpgraded = 0;
+    //     int majority = (NUM_OF_SERVERS / 2) + 1;
+    //     int[] consistencyLevels = new int[n];
+    //     double profit = 0;
+    //     int transactionsUpgraded = 0;
 
-        // Step 1: Initialize all at minimum consistency
-        for (int i = 0; i < n; i++) {
-            consistencyLevels[i] = batch.get(i).minRequiredConsistency;
-        }
+    //     // Step 1: Initialize all at minimum consistency
+    //     for (int i = 0; i < n; i++) {
+    //         consistencyLevels[i] = batch.get(i).minRequiredConsistency;
+    //     }
 
-        // Step 2: Calculate avgLatency with all transactions at min consistency
-        double avgLatency = calculateAvgLatency(currentLatency, consistencyLevels, wcLatencyMap);
+    //     // Step 2: Calculate avgLatency with all transactions at min consistency
+    //     double avgLatency = calculateAvgLatency(currentLatency, consistencyLevels, wcLatencyMap);
 
-        System.out.printf("[LATENCY Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
-                currentLatency, avgLatency, MAX_LATENCY);
+    //     System.out.printf("[LATENCY Heuristic] currentLatency=%.2f | avgLatency=%.2f | maxLatency=%.2f\n",
+    //             currentLatency, avgLatency, MAX_LATENCY);
 
-        // Print individual writeConcern latencies
-        System.out.print("[WriteConcern Latency] ");
-        for (int wc = 1; wc <= majority; wc++) {
-            System.out.printf("W:%d=%.2f ms | ", wc, wcLatencyMap.get(wc));
-        }
-        System.out.println();
+    //     // Print individual writeConcern latencies
+    //     System.out.print("[WriteConcern Latency] ");
+    //     for (int wc = 1; wc <= majority; wc++) {
+    //         System.out.printf("W:%d=%.2f ms | ", wc, wcLatencyMap.get(wc));
+    //     }
+    //     System.out.println();
 
-        // Step 3: Check if we can execute all
-        if (avgLatency <= MAX_LATENCY) {
-            // Execute all transactions
-            for (int i = 0; i < n; i++) {
-                profit += batch.get(i).baseProfit;
-            }
+    //     // Step 3: Check if we can execute all
+    //     if (avgLatency <= MAX_LATENCY) {
+    //         // Execute all transactions
+    //         for (int i = 0; i < n; i++) {
+    //             profit += batch.get(i).baseProfit;
+    //         }
 
-            // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
-            // ** very important **
-            // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
+    //         // Step 4: Check if we can upgrade (need 15% headroom and no backlog)
+    //         // ** very important **
+    //         // we can add that if tps falls then we expect latency to rise and stop the upgrades, or we can add a check if the current tps of the majority is lower than the load then we can stop the upgrades for sure
             
-            boolean canUpgrade = false;
-                if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
-                    && backLogTransactions.isEmpty()
-                    && currentLatency < MAX_LATENCY
-                    && !isBackLogIncreasing
-                    && !isInUpgradeWarmupPhase()) {
-                // Build priority queue for upgrades (best profit/latency-cost ratio first)
-                PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
-                        (a, b) -> Double.compare(b.ratio, a.ratio)
-                );
+    //         boolean canUpgrade = false;
+    //             if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_THRESHOLD
+    //                 && backLogTransactions.isEmpty()
+    //                 && currentLatency < MAX_LATENCY
+    //                 && !isBackLogIncreasing
+    //                 && !isInUpgradeWarmupPhase()) {
+    //             // Build priority queue for upgrades (best profit/latency-cost ratio first)
+    //             PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+    //                     (a, b) -> Double.compare(b.ratio, a.ratio)
+    //             );
 
-                for (int i = 0; i < n; i++) {
-                    int currentWC = consistencyLevels[i];
-                    if (currentWC < majority) {
-                        TransactionOption tx = batch.get(i);
-                        double latencyInc = getMaxLatency(currentWC + 1, wcLatencyMap) - getMaxLatency(currentWC, wcLatencyMap);
-                        double nextProfit = (currentWC + 1 == majority)
-                                ? tx.extraMajorityProfit
-                                : tx.extraIntermediateProfit;
-                        double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
-                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, latencyInc, nextProfit, ratio));
-                    }
-                }
+    //             for (int i = 0; i < n; i++) {
+    //                 int currentWC = consistencyLevels[i];
+    //                 if (currentWC < majority) {
+    //                     TransactionOption tx = batch.get(i);
+    //                     double latencyInc = getMaxLatency(currentWC + 1, wcLatencyMap) - getMaxLatency(currentWC, wcLatencyMap);
+    //                     double nextProfit = (currentWC + 1 == majority)
+    //                             ? tx.extraMajorityProfit
+    //                             : tx.extraIntermediateProfit;
+    //                     double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
+    //                     pq.add(new UpgradeOption(i, currentWC, currentWC + 1, latencyInc, nextProfit, ratio));
+    //                 }
+    //             }
 
-                // Step 5: Upgrade while avgLatency stays <= maxLatency * 1.10
-                while (!pq.isEmpty()) {
-                    UpgradeOption opt = pq.poll();
+    //             // Step 5: Upgrade while avgLatency stays <= maxLatency * 1.10
+    //             while (!pq.isEmpty()) {
+    //                 UpgradeOption opt = pq.poll();
 
-                    if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
+    //                 if (opt.fromWC != consistencyLevels[opt.txIndex]) continue;
 
-                    // Simulate upgrade
-                    avgLatency = (avgLatency * (n + 1) - getMaxLatency(opt.fromWC, wcLatencyMap) + getMaxLatency(opt.toWC, wcLatencyMap)) / (n + 1);
+    //                 // Simulate upgrade
+    //                 avgLatency = (avgLatency * (n + 1) - getMaxLatency(opt.fromWC, wcLatencyMap) + getMaxLatency(opt.toWC, wcLatencyMap)) / (n + 1);
 
-                    if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_FLOOR) {
-                        // Safe to upgrade
-                        consistencyLevels[opt.txIndex] = opt.toWC;
-                        profit += opt.additionalProfit;
-                        transactionsUpgraded++;
-                        // Add next upgrade level if possible
-                        if (opt.toWC < majority) {
-                            TransactionOption tx = batch.get(opt.txIndex);
-                            double latencyInc = getMaxLatency(opt.toWC + 1, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
-                            double nextProfit = (opt.toWC + 1 == majority)
-                                    ? tx.extraMajorityProfit
-                                    : tx.extraIntermediateProfit;
-                            double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
-                            pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, latencyInc, nextProfit, ratio));
-                        }
-                    }
-                }
-            }
-            // logFinalBatchAvgLatency(avgLatency);
-            // Build result
-            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+    //                 if (avgLatency <= MAX_LATENCY * UPGRADE_LATENCY_FLOOR) {
+    //                     // Safe to upgrade
+    //                     consistencyLevels[opt.txIndex] = opt.toWC;
+    //                     profit += opt.additionalProfit;
+    //                     transactionsUpgraded++;
+    //                     // Add next upgrade level if possible
+    //                     if (opt.toWC < majority) {
+    //                         TransactionOption tx = batch.get(opt.txIndex);
+    //                         double latencyInc = getMaxLatency(opt.toWC + 1, wcLatencyMap) - getMaxLatency(opt.toWC, wcLatencyMap);
+    //                         double nextProfit = (opt.toWC + 1 == majority)
+    //                                 ? tx.extraMajorityProfit
+    //                                 : tx.extraIntermediateProfit;
+    //                         double ratio = (latencyInc > EPS) ? nextProfit / latencyInc : Double.MAX_VALUE;
+    //                         pq.add(new UpgradeOption(opt.txIndex, opt.toWC, opt.toWC + 1, latencyInc, nextProfit, ratio));
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         // logFinalBatchAvgLatency(avgLatency);
+    //         // Build result
+    //         BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
-            HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
-            System.out.printf("[LATENCY Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
-                    wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency);
+    //         HashMap<Integer, Integer> wcMix = countByWriteConcern(consistencyLevels);
+    //         System.out.printf("[LATENCY Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
+    //                 wcMix, transactionsUpgraded, backLogTransactions.size(), avgLatency);
 
-            return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
-        }
-        // Step 6: avgLatency > maxLatency → process from weakest first
-        else {
-            // Sort by: 1) retryCount DESC (prioritize retried transactions)
-            //          2) minRequiredConsistency ASC (weakest first)
-            List<Integer> indices = new ArrayList<>();
-            for (int i = 0; i < n; i++) indices.add(i);
-            indices.sort((a, b) -> {
-                TransactionOption txA = batch.get(a);
-                TransactionOption txB = batch.get(b);
-                // First: higher retry count has priority
-                if (txA.retryCount != txB.retryCount) {
-                    return Integer.compare(txB.retryCount, txA.retryCount); // DESC
-                }
-                // Second: lower consistency (W:1 before W:2)
-                return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
-            });
+    //         return new ProcessResult(buildResult.executed, n, profit, transactionsUpgraded, buildResult.deferred);
+    //     }
+    //     // Step 6: avgLatency > maxLatency → process from weakest first
+    //     else {
+    //         // Sort by: 1) retryCount DESC (prioritize retried transactions)
+    //         //          2) minRequiredConsistency ASC (weakest first)
+    //         List<Integer> indices = new ArrayList<>();
+    //         for (int i = 0; i < n; i++) indices.add(i);
+    //         indices.sort((a, b) -> {
+    //             TransactionOption txA = batch.get(a);
+    //             TransactionOption txB = batch.get(b);
+    //             // First: higher retry count has priority
+    //             if (txA.retryCount != txB.retryCount) {
+    //                 return Integer.compare(txB.retryCount, txA.retryCount); // DESC
+    //             }
+    //             // Second: lower consistency (W:1 before W:2)
+    //             return Integer.compare(txA.minRequiredConsistency, txB.minRequiredConsistency);
+    //         });
 
-            // Reset consistency levels
-            for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
+    //         // Reset consistency levels
+    //         for (int i = 0; i < n; i++) consistencyLevels[i] = 0;
 
-            // Minimum transactions to process (70% of batch)
-            int minToProcess = Math.max(1, (int) (n * 0.7));
+    //         // Minimum transactions to process (70% of batch)
+    //         int minToProcess = Math.max(1, (int) (n * 0.7));
 
-            int processed = 0;
-            double latencySum = currentLatency;
-            for (int idx : indices) {
-                TransactionOption tx = batch.get(idx);
+    //         int processed = 0;
+    //         double latencySum = currentLatency;
+    //         for (int idx : indices) {
+    //             TransactionOption tx = batch.get(idx);
 
-                // Force execute transactions that have been deferred too many times (retryCount >= 2)
-                boolean mustExecute = tx.retryCount >= 2;
+    //             // Force execute transactions that have been deferred too many times (retryCount >= 2)
+    //             boolean mustExecute = tx.retryCount >= 2;
 
-                // Try adding this transaction
-                consistencyLevels[idx] = tx.minRequiredConsistency;
-                latencySum += getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
-                double newAvgLatency = latencySum / (processed + 1);
+    //             // Try adding this transaction
+    //             consistencyLevels[idx] = tx.minRequiredConsistency;
+    //             latencySum += getMaxLatency(tx.minRequiredConsistency, wcLatencyMap);
+    //             double newAvgLatency = latencySum / (processed + 1);
 
-                // Execute if: forced (retry >= 2), below minimum threshold, or latency allows
-                if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY || wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
-                    profit += tx.baseProfit;
-                    processed++;
-                } else {
-                    consistencyLevels[idx] = 0;
-                }
-            }
+    //             // Execute if: forced (retry >= 2), below minimum threshold, or latency allows
+    //             if (mustExecute || processed < minToProcess || newAvgLatency <= MAX_LATENCY || wcTpsMap.get((NUM_OF_SERVERS) / 2 + 1) > MIN_TPS_OF_MAJORITY) {
+    //                 profit += tx.baseProfit;
+    //                 processed++;
+    //             } else {
+    //                 consistencyLevels[idx] = 0;
+    //             }
+    //         }
 
-            finalBatchAvgLatency = latencySum / (processed + 1);
+    //         finalBatchAvgLatency = latencySum / (processed + 1);
 
-            BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
+    //         BuildResult buildResult = buildResultMessages(batch, consistencyLevels, backLogTransactions);
 
-            // logFinalBatchAvgLatency(finalBatchAvgLatency);
-            System.out.printf("[LATENCY Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
-                    processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgLatency);
+    //         // logFinalBatchAvgLatency(finalBatchAvgLatency);
+    //         System.out.printf("[LATENCY Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | FinalAvgLatency=%.2f\n",
+    //                 processed, n, buildResult.deferred.size(), backLogTransactions.size(), finalBatchAvgLatency);
 
-            return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
-        }
-    }
+    //         return new ProcessResult(buildResult.executed, processed, profit, 0, buildResult.deferred);
+    //     }
+    // }
 
 
     public ProcessResult processWithLatencyApplicationBasedHeuristic(
@@ -632,7 +632,7 @@ public class BatchProcessor {
     int n = batch.size();
 
     if (n == 0) {
-        return new ProcessResult(new ArrayList<>(), 0, 0, 0);
+        return new ProcessResult(new ArrayList<>(), 0, 0, 0, 0);
     }
 
     int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -724,7 +724,7 @@ public class BatchProcessor {
     // In no-pressure mode, base token cost is assumed to be already paid.
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
     boolean skipBaseTokenGate = !pressureModeEnabled;
-    MAX_LATENCY = isLeader ?  50 : 50;
+    MAX_LATENCY = isLeader ?  60 : 50;
     if (avgLatency <= MAX_LATENCY && (skipBaseTokenGate || totalTokenCost <= currentTokens)) {
 
         for (int i = 0; i < n; i++) {
@@ -981,7 +981,7 @@ public class BatchProcessor {
         // System.out.printf("[APP Heuristic] EXECUTED ALL | Mix=%s | Upgraded=%d | Backlog=%d | FinalAvgLatency=%.2f | TokensUsed=%.2f\n",
         //         wcMix, transactionsUpgraded, deferredQueue.size(), avgLatency, finalTokenCost);
 
-        return new ProcessResult(buildResult.executed, tokensUsedForResult, profit, transactionsUpgraded, buildResult.deferred);
+        return new ProcessResult(buildResult.executed, tokensUsedForResult, profit, transactionsUpgraded, buildResult.deferred, finalTokenCost);
     }
 
     // Step 8: avgLatency > maxLatency — pressure path, token-budget based
@@ -990,9 +990,11 @@ public class BatchProcessor {
             for (int i = 0; i < n; i++) {
                 profit += batch.get(i).baseProfit;
             }
+
+            double finalTokenCost = calculateTotalTokenCost(batch, assignments);
             double tokensUsed = 0.0;
             BuildResult buildResult = buildResultMessages(batch, assignments, backLogTransactions, null);
-            return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, List.of());
+            return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, List.of(), finalTokenCost);
         }
 
         // Reset all assignments to deferred
@@ -1089,7 +1091,7 @@ public class BatchProcessor {
         // System.out.printf("[APP Heuristic] UNDER PRESSURE | Processed=%d/%d | Deferred=%d | Backlog=%d | TokensUsed=%.2f\n",
         //         processed, n, buildResult.deferred.size(), deferredQueue.size(), tokensUsed);
 
-        return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, buildResult.deferred);
+        return new ProcessResult(buildResult.executed, tokensUsed, profit, 0, buildResult.deferred, tokensUsed);
     }
 }
 
@@ -1417,308 +1419,308 @@ static class AppUpgradeOption {
      * Phase 2: Only if ALL transactions were processed, use remaining budget to upgrade
      * transactions up to majority level to maximize profit
      */
-    public ProcessResult processForThroughputThenProfit(
-            List<TransactionOption> transactions,
-            double budget,
-            double currentTokens,
-            boolean allowUpgrades,
-            HashMap<Integer, Double> writeConcernCosts) {
+    // public ProcessResult processForThroughputThenProfit(
+    //         List<TransactionOption> transactions,
+    //         double budget,
+    //         double currentTokens,
+    //         boolean allowUpgrades,
+    //         HashMap<Integer, Double> writeConcernCosts) {
 
-        double usedBudget = 0.0;
-        double profit = 0.0;
-        List<ClientMessage> result = new ArrayList<>();
-        int majority = (NUM_OF_SERVERS / 2) + 1;
-        int n = transactions.size();
+    //     double usedBudget = 0.0;
+    //     double profit = 0.0;
+    //     List<ClientMessage> result = new ArrayList<>();
+    //     int majority = (NUM_OF_SERVERS / 2) + 1;
+    //     int n = transactions.size();
 
-        int[] consistencyLevels = new int[n];
+    //     int[] consistencyLevels = new int[n];
 
-        // Sort by minimum consistency first, then by profit
-        transactions.sort((a, b) -> {
-            if (a.minRequiredConsistency == b.minRequiredConsistency) {
-                return Double.compare(b.baseProfit, a.baseProfit);
-            }
-            return a.minRequiredConsistency - b.minRequiredConsistency;
-        });
+    //     // Sort by minimum consistency first, then by profit
+    //     transactions.sort((a, b) -> {
+    //         if (a.minRequiredConsistency == b.minRequiredConsistency) {
+    //             return Double.compare(b.baseProfit, a.baseProfit);
+    //         }
+    //         return a.minRequiredConsistency - b.minRequiredConsistency;
+    //     });
 
-        // Phase 1: Execute all transactions at minimum consistency + free upgrades
-        boolean allTransactionsProcessed = true;
-        for (int i = 0; i < n; i++) {
-            TransactionOption tx = transactions.get(i);
-            int currentWC = tx.minRequiredConsistency;
-            double txProfit = tx.baseProfit;
+    //     // Phase 1: Execute all transactions at minimum consistency + free upgrades
+    //     boolean allTransactionsProcessed = true;
+    //     for (int i = 0; i < n; i++) {
+    //         TransactionOption tx = transactions.get(i);
+    //         int currentWC = tx.minRequiredConsistency;
+    //         double txProfit = tx.baseProfit;
 
-            // Apply free upgrades immediately and accumulate profit
-            while (currentWC < majority) {
-                double currentCost = writeConcernCosts.get(currentWC);
-                double nextCost = writeConcernCosts.get(currentWC + 1);
+    //         // Apply free upgrades immediately and accumulate profit
+    //         while (currentWC < majority) {
+    //             double currentCost = writeConcernCosts.get(currentWC);
+    //             double nextCost = writeConcernCosts.get(currentWC + 1);
 
-                // Use relative epsilon for comparison: |a - b| <= eps * max(|a|, |b|)
-                double maxCost = Math.max(Math.abs(currentCost), Math.abs(nextCost));
-                double relativeEps = EPS * Math.max(1.0, maxCost);
+    //             // Use relative epsilon for comparison: |a - b| <= eps * max(|a|, |b|)
+    //             double maxCost = Math.max(Math.abs(currentCost), Math.abs(nextCost));
+    //             double relativeEps = EPS * Math.max(1.0, maxCost);
 
-                if (nextCost <= currentCost + relativeEps) {
-                    currentWC++;
-                    // Add profit for each upgrade step
-                    txProfit += (currentWC == majority)
-                            ? tx.extraMajorityProfit
-                            : tx.extraIntermediateProfit;
-                } else {
-                    break;
-                }
-            }
+    //             if (nextCost <= currentCost + relativeEps) {
+    //                 currentWC++;
+    //                 // Add profit for each upgrade step
+    //                 txProfit += (currentWC == majority)
+    //                         ? tx.extraMajorityProfit
+    //                         : tx.extraIntermediateProfit;
+    //             } else {
+    //                 break;
+    //             }
+    //         }
 
-            double cost = writeConcernCosts.get(currentWC);
+    //         double cost = writeConcernCosts.get(currentWC);
 
-            // Check if we can afford this transaction (with tolerance)
-            double availableBudget = budget - usedBudget;
-            double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(availableBudget), Math.abs(cost)));
+    //         // Check if we can afford this transaction (with tolerance)
+    //         double availableBudget = budget - usedBudget;
+    //         double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(availableBudget), Math.abs(cost)));
 
-            if (cost <= availableBudget + relativeEps) {
-                usedBudget += cost;
-                profit += txProfit;
-                consistencyLevels[i] = currentWC;
-            } else {
-                allTransactionsProcessed = false;
-                break;
-            }
-        }
+    //         if (cost <= availableBudget + relativeEps) {
+    //             usedBudget += cost;
+    //             profit += txProfit;
+    //             consistencyLevels[i] = currentWC;
+    //         } else {
+    //             allTransactionsProcessed = false;
+    //             break;
+    //         }
+    //     }
 
-        double remainingBudget = budget - usedBudget;
-        int transactionsUpgraded = 0;
+    //     double remainingBudget = budget - usedBudget;
+    //     int transactionsUpgraded = 0;
 
-        // Phase 2: Upgrade transactions using remaining budget (greedy)
-        if (allTransactionsProcessed && remainingBudget > EPS && allowUpgrades) {
-            PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
-                    (a, b) -> Double.compare(b.ratio, a.ratio)
-            );
+    //     // Phase 2: Upgrade transactions using remaining budget (greedy)
+    //     if (allTransactionsProcessed && remainingBudget > EPS && allowUpgrades) {
+    //         PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+    //                 (a, b) -> Double.compare(b.ratio, a.ratio)
+    //         );
 
-            // Initialize possible upgrades from actual current level
-            for (int i = 0; i < n; i++) {
-                TransactionOption tx = transactions.get(i);
-                int currentWC = consistencyLevels[i];
+    //         // Initialize possible upgrades from actual current level
+    //         for (int i = 0; i < n; i++) {
+    //             TransactionOption tx = transactions.get(i);
+    //             int currentWC = consistencyLevels[i];
 
-                if (currentWC < majority) {
-                    double currentCost = writeConcernCosts.get(currentWC);
-                    double nextCost = writeConcernCosts.get(currentWC + 1);
-                    double upgradeCost = nextCost - currentCost;
+    //             if (currentWC < majority) {
+    //                 double currentCost = writeConcernCosts.get(currentWC);
+    //                 double nextCost = writeConcernCosts.get(currentWC + 1);
+    //                 double upgradeCost = nextCost - currentCost;
 
-                    // Skip if upgrade cost is negative or negligible
-                    if (upgradeCost > EPS) {
-                        double nextProfit = (currentWC + 1 == majority)
-                                ? tx.extraMajorityProfit
-                                : tx.extraIntermediateProfit;
-                        double ratio = nextProfit / upgradeCost;
-                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
-                    }
-                }
-            }
+    //                 // Skip if upgrade cost is negative or negligible
+    //                 if (upgradeCost > EPS) {
+    //                     double nextProfit = (currentWC + 1 == majority)
+    //                             ? tx.extraMajorityProfit
+    //                             : tx.extraIntermediateProfit;
+    //                     double ratio = nextProfit / upgradeCost;
+    //                     pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
+    //                 }
+    //             }
+    //         }
 
-            // Greedy upgrading loop
-            while (!pq.isEmpty() && remainingBudget > EPS) {
-                UpgradeOption opt = pq.poll();
+    //         // Greedy upgrading loop
+    //         while (!pq.isEmpty() && remainingBudget > EPS) {
+    //             UpgradeOption opt = pq.poll();
 
-                // Check if upgrade is still valid and affordable
-                if (opt.toWC > consistencyLevels[opt.txIndex]) {
-                    double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(remainingBudget), Math.abs(opt.upgradeCost)));
+    //             // Check if upgrade is still valid and affordable
+    //             if (opt.toWC > consistencyLevels[opt.txIndex]) {
+    //                 double relativeEps = EPS * Math.max(1.0, Math.max(Math.abs(remainingBudget), Math.abs(opt.upgradeCost)));
 
-                    if (opt.upgradeCost <= remainingBudget + relativeEps) {
-                        remainingBudget -= opt.upgradeCost;
-                        usedBudget += opt.upgradeCost;
-                        profit += opt.additionalProfit;
-                        consistencyLevels[opt.txIndex] = opt.toWC;
-                        transactionsUpgraded++;
+    //                 if (opt.upgradeCost <= remainingBudget + relativeEps) {
+    //                     remainingBudget -= opt.upgradeCost;
+    //                     usedBudget += opt.upgradeCost;
+    //                     profit += opt.additionalProfit;
+    //                     consistencyLevels[opt.txIndex] = opt.toWC;
+    //                     transactionsUpgraded++;
 
-                        // Generate the next upgrade for this transaction (if possible)
-                        if (opt.toWC < majority) {
-                            int nextWC = opt.toWC + 1;
-                            double currentCost = writeConcernCosts.get(opt.toWC);
-                            double nextCost = writeConcernCosts.get(nextWC);
-                            double nextUpgradeCost = nextCost - currentCost;
+    //                     // Generate the next upgrade for this transaction (if possible)
+    //                     if (opt.toWC < majority) {
+    //                         int nextWC = opt.toWC + 1;
+    //                         double currentCost = writeConcernCosts.get(opt.toWC);
+    //                         double nextCost = writeConcernCosts.get(nextWC);
+    //                         double nextUpgradeCost = nextCost - currentCost;
 
-                            // Only add if cost increase is meaningful
-                            if (nextUpgradeCost > EPS) {
-                                double nextProfit = (nextWC == majority)
-                                        ? transactions.get(opt.txIndex).extraMajorityProfit
-                                        : transactions.get(opt.txIndex).extraIntermediateProfit;
-                                double nextRatio = nextProfit / (nextUpgradeCost + EPS);
-                                pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    //                         // Only add if cost increase is meaningful
+    //                         if (nextUpgradeCost > EPS) {
+    //                             double nextProfit = (nextWC == majority)
+    //                                     ? transactions.get(opt.txIndex).extraMajorityProfit
+    //                                     : transactions.get(opt.txIndex).extraIntermediateProfit;
+    //                             double nextRatio = nextProfit / (nextUpgradeCost + EPS);
+    //                             pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        // Generate final result messages after upgrades
-        for (int i = 0; i < n; i++) {
-            TransactionOption tx = transactions.get(i);
-            int wc = consistencyLevels[i];
-            // skip the unprocessed transactions
-            if (wc == 0) continue;
-            ClientMessage msg = ClientMessage.newBuilder()
-                    .setT(tx.clientMessage.getT())
-                    .setWriteConcern(wc)
-                    .build();
-            result.add(msg);
-        }
+    //     // Generate final result messages after upgrades
+    //     for (int i = 0; i < n; i++) {
+    //         TransactionOption tx = transactions.get(i);
+    //         int wc = consistencyLevels[i];
+    //         // skip the unprocessed transactions
+    //         if (wc == 0) continue;
+    //         ClientMessage msg = ClientMessage.newBuilder()
+    //                 .setT(tx.clientMessage.getT())
+    //                 .setWriteConcern(wc)
+    //                 .build();
+    //         result.add(msg);
+    //     }
 
-        return new ProcessResult(result, usedBudget, profit, transactionsUpgraded);
-    }
+    //     return new ProcessResult(result, usedBudget, profit, transactionsUpgraded);
+    // }
 
-    public ProcessResult processTransactionUnderutilised(List<TransactionOption> transactions, double budget, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
+    // public ProcessResult processTransactionUnderutilised(List<TransactionOption> transactions, double budget, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
 
-        int noOfTransactions = transactions.size();
-        int tokensUsed = noOfTransactions;
-        int majority = (NUM_OF_SERVERS / 2) + 1;
-        int transactionsUpgraded = 0;
+    //     int noOfTransactions = transactions.size();
+    //     int tokensUsed = noOfTransactions;
+    //     int majority = (NUM_OF_SERVERS / 2) + 1;
+    //     int transactionsUpgraded = 0;
 
-        List<ClientMessage> result = new ArrayList<>();
+    //     List<ClientMessage> result = new ArrayList<>();
 
-        int[] consistencyLevels = new int[noOfTransactions];
+    //     int[] consistencyLevels = new int[noOfTransactions];
 
-        double profit = 0;
-        for(int i = 0; i < noOfTransactions; i++) {
-            TransactionOption tx = transactions.get(i);
-            consistencyLevels[i] = tx.minRequiredConsistency;
-            profit += tx.baseProfit;
-        }
-
-
-        if(allowUpgrades) {
-            PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
-                    (a, b) -> Double.compare(b.ratio, a.ratio)
-            );
-
-            // Initialize possible upgrades from actual current level
-            for (int i = 0; i < noOfTransactions; i++) {
-                TransactionOption tx = transactions.get(i);
-                int currentWC = consistencyLevels[i];
-
-                if (currentWC < majority) {
-                    double currentCost = writeConcernCosts.get(currentWC);
-                    double nextCost = writeConcernCosts.get(currentWC + 1);
-                    double upgradeCost = nextCost - currentCost;
-
-                    // Skip if upgrade cost is negative or negligible
-                        double nextProfit = (currentWC + 1 == majority)
-                                ? tx.extraMajorityProfit
-                                : tx.extraIntermediateProfit;
-                        double ratio = nextProfit / (upgradeCost + EPS);
-                        pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
-                }
-            }
-
-            boolean[] upgraded = new boolean[noOfTransactions];
-
-            // Greedy upgrading loop
-            while (!pq.isEmpty() &&  budget > EPS) {
-
-                UpgradeOption opt = pq.poll();
-
-                // Check if upgrade is still valid and affordable
-                if (opt.toWC > consistencyLevels[opt.txIndex] && opt.fromWC == consistencyLevels[opt.txIndex]){
-
-                    if (opt.upgradeCost <= budget + EPS) {
-                        budget -= opt.upgradeCost;
-                        profit += opt.additionalProfit;
-                        consistencyLevels[opt.txIndex] = opt.toWC;
-                        if(!upgraded[opt.txIndex]) {
-                            transactionsUpgraded++;
-                        }
-                        upgraded[opt.txIndex] = true;
+    //     double profit = 0;
+    //     for(int i = 0; i < noOfTransactions; i++) {
+    //         TransactionOption tx = transactions.get(i);
+    //         consistencyLevels[i] = tx.minRequiredConsistency;
+    //         profit += tx.baseProfit;
+    //     }
 
 
-                        // Generate the next upgrade for this transaction (if possible)
-                        if (opt.toWC < majority) {
-                            int nextWC = opt.toWC + 1;
-                            double currentCost = writeConcernCosts.get(opt.toWC);
-                            double nextCost = writeConcernCosts.get(nextWC);
-                            double nextUpgradeCost = nextCost - currentCost;
+    //     if(allowUpgrades) {
+    //         PriorityQueue<UpgradeOption> pq = new PriorityQueue<>(
+    //                 (a, b) -> Double.compare(b.ratio, a.ratio)
+    //         );
 
-                            // Only add if cost increase is meaningful
-                                double nextProfit = (nextWC == majority)
-                                        ? transactions.get(opt.txIndex).extraMajorityProfit
-                                        : transactions.get(opt.txIndex).extraIntermediateProfit;
-                                double nextRatio = nextProfit / (nextUpgradeCost + EPS);
-                                pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));}
-                    }
-                }
-            }
-            System.out.println("budget left: " + budget);
-        }
+    //         // Initialize possible upgrades from actual current level
+    //         for (int i = 0; i < noOfTransactions; i++) {
+    //             TransactionOption tx = transactions.get(i);
+    //             int currentWC = consistencyLevels[i];
 
-        HashMap<Integer,Integer> map = new HashMap<>();
+    //             if (currentWC < majority) {
+    //                 double currentCost = writeConcernCosts.get(currentWC);
+    //                 double nextCost = writeConcernCosts.get(currentWC + 1);
+    //                 double upgradeCost = nextCost - currentCost;
+
+    //                 // Skip if upgrade cost is negative or negligible
+    //                     double nextProfit = (currentWC + 1 == majority)
+    //                             ? tx.extraMajorityProfit
+    //                             : tx.extraIntermediateProfit;
+    //                     double ratio = nextProfit / (upgradeCost + EPS);
+    //                     pq.add(new UpgradeOption(i, currentWC, currentWC + 1, upgradeCost, nextProfit, ratio));
+    //             }
+    //         }
+
+    //         boolean[] upgraded = new boolean[noOfTransactions];
+
+    //         // Greedy upgrading loop
+    //         while (!pq.isEmpty() &&  budget > EPS) {
+
+    //             UpgradeOption opt = pq.poll();
+
+    //             // Check if upgrade is still valid and affordable
+    //             if (opt.toWC > consistencyLevels[opt.txIndex] && opt.fromWC == consistencyLevels[opt.txIndex]){
+
+    //                 if (opt.upgradeCost <= budget + EPS) {
+    //                     budget -= opt.upgradeCost;
+    //                     profit += opt.additionalProfit;
+    //                     consistencyLevels[opt.txIndex] = opt.toWC;
+    //                     if(!upgraded[opt.txIndex]) {
+    //                         transactionsUpgraded++;
+    //                     }
+    //                     upgraded[opt.txIndex] = true;
 
 
-        // Generate final result messages after upgrades
-        for (int i = 0; i < noOfTransactions; i++) {
-            TransactionOption tx = transactions.get(i);
-            int wc = consistencyLevels[i];
-            if(tx.minRequiredConsistency != wc) {
-                map.put(wc, map.getOrDefault(wc,0)+1);
-            }
-            // skip the unprocessed transactions
-            if (wc == 0) continue;
-            ClientMessage msg = ClientMessage.newBuilder()
-                    .setT(tx.clientMessage.getT())
-                    .setWriteConcern(wc)
-                    .setCallbackHost(tx.clientHost)
-                    .setCallbackPort(tx.clientPort)
-                    .build();
-            result.add(msg);
-        }
-        System.out.println("Upgrade map: " + map.toString());
-        return new ProcessResult(result, tokensUsed, profit, transactionsUpgraded);
-    }
+    //                     // Generate the next upgrade for this transaction (if possible)
+    //                     if (opt.toWC < majority) {
+    //                         int nextWC = opt.toWC + 1;
+    //                         double currentCost = writeConcernCosts.get(opt.toWC);
+    //                         double nextCost = writeConcernCosts.get(nextWC);
+    //                         double nextUpgradeCost = nextCost - currentCost;
 
-    public ProcessResult processTransactions(List<TransactionOption> batch, double budget, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
-        // Calculate total cost of processing all transactions at minimum consistency
-        double totalMinCost = 0;
-        // for testing
+    //                         // Only add if cost increase is meaningful
+    //                             double nextProfit = (nextWC == majority)
+    //                                     ? transactions.get(opt.txIndex).extraMajorityProfit
+    //                                     : transactions.get(opt.txIndex).extraIntermediateProfit;
+    //                             double nextRatio = nextProfit / (nextUpgradeCost + EPS);
+    //                             pq.add(new UpgradeOption(opt.txIndex, opt.toWC, nextWC, nextUpgradeCost, nextProfit, nextRatio));}
+    //                 }
+    //             }
+    //         }
+    //         System.out.println("budget left: " + budget);
+    //     }
 
-        // writeConcernCosts.put(1,1.0);
-        // writeConcernCosts.put(2,1.0);
+    //     HashMap<Integer,Integer> map = new HashMap<>();
+
+
+    //     // Generate final result messages after upgrades
+    //     for (int i = 0; i < noOfTransactions; i++) {
+    //         TransactionOption tx = transactions.get(i);
+    //         int wc = consistencyLevels[i];
+    //         if(tx.minRequiredConsistency != wc) {
+    //             map.put(wc, map.getOrDefault(wc,0)+1);
+    //         }
+    //         // skip the unprocessed transactions
+    //         if (wc == 0) continue;
+    //         ClientMessage msg = ClientMessage.newBuilder()
+    //                 .setT(tx.clientMessage.getT())
+    //                 .setWriteConcern(wc)
+    //                 .setCallbackHost(tx.clientHost)
+    //                 .setCallbackPort(tx.clientPort)
+    //                 .build();
+    //         result.add(msg);
+    //     }
+    //     System.out.println("Upgrade map: " + map.toString());
+    //     return new ProcessResult(result, tokensUsed, profit, transactionsUpgraded);
+    // }
+
+    // public ProcessResult processTransactions(List<TransactionOption> batch, double budget, double currentTokens, boolean allowUpgrades, HashMap<Integer, Double> writeConcernCosts) {
+    //     // Calculate total cost of processing all transactions at minimum consistency
+    //     double totalMinCost = 0;
+    //     // for testing
+
+    //     // writeConcernCosts.put(1,1.0);
+    //     // writeConcernCosts.put(2,1.0);
         
-        for (TransactionOption tx : batch) {
-            totalMinCost += writeConcernCosts.get(tx.minRequiredConsistency);
-        }
+    //     for (TransactionOption tx : batch) {
+    //         totalMinCost += writeConcernCosts.get(tx.minRequiredConsistency);
+    //     }
         
-        // If total cost exceeds budget, process subset of transactions
-        if (totalMinCost > budget + EPS) {
-            double profit = 0;
-            double usedBudget = 0;
-            // Sort by minimum consistency to process cheaper transactions first
-            Collections.sort(batch, Comparator.comparingInt(a -> a.minRequiredConsistency));
+    //     // If total cost exceeds budget, process subset of transactions
+    //     if (totalMinCost > budget + EPS) {
+    //         double profit = 0;
+    //         double usedBudget = 0;
+    //         // Sort by minimum consistency to process cheaper transactions first
+    //         Collections.sort(batch, Comparator.comparingInt(a -> a.minRequiredConsistency));
             
-            List<ClientMessage> result = new ArrayList<>();
-            List<TransactionOption> toProcess = new ArrayList<>();
+    //         List<ClientMessage> result = new ArrayList<>();
+    //         List<TransactionOption> toProcess = new ArrayList<>();
             
-            // Process transactions until budget is exhausted
-            for (TransactionOption tx : batch) {
-                double txCost = writeConcernCosts.get(tx.minRequiredConsistency);
-                if (usedBudget + txCost <= budget + EPS) {
-                    usedBudget += txCost;
-                    profit += tx.baseProfit;
-                    toProcess.add(tx);
-                    ClientMessage msg = ClientMessage.newBuilder()
-                            .setT(tx.clientMessage.getT())
-                            .setWriteConcern(tx.minRequiredConsistency)
-                            .setCallbackHost(tx.clientHost)
-                            .setCallbackPort(tx.clientPort)
-                            .build();
-                    result.add(msg);
-                } else {
-                    break; // Budget exhausted
-                }
-            }
+    //         // Process transactions until budget is exhausted
+    //         for (TransactionOption tx : batch) {
+    //             double txCost = writeConcernCosts.get(tx.minRequiredConsistency);
+    //             if (usedBudget + txCost <= budget + EPS) {
+    //                 usedBudget += txCost;
+    //                 profit += tx.baseProfit;
+    //                 toProcess.add(tx);
+    //                 ClientMessage msg = ClientMessage.newBuilder()
+    //                         .setT(tx.clientMessage.getT())
+    //                         .setWriteConcern(tx.minRequiredConsistency)
+    //                         .setCallbackHost(tx.clientHost)
+    //                         .setCallbackPort(tx.clientPort)
+    //                         .build();
+    //                 result.add(msg);
+    //             } else {
+    //                 break; // Budget exhausted
+    //             }
+    //         }
             
-            System.out.println("Budget exceeded: processed " + toProcess.size() + "/" + batch.size() + " transactions, used budget: " + usedBudget);
-            return new ProcessResult(result, toProcess.size(), profit, 0);
-        } else {
-            // Budget sufficient for all transactions at min consistency + upgrades
-            return processTransactionUnderutilised(batch, budget, false, writeConcernCosts);
-        }
-    }
+    //         System.out.println("Budget exceeded: processed " + toProcess.size() + "/" + batch.size() + " transactions, used budget: " + usedBudget);
+    //         return new ProcessResult(result, toProcess.size(), profit, 0);
+    //     } else {
+    //         // Budget sufficient for all transactions at min consistency + upgrades
+    //         return processTransactionUnderutilised(batch, budget, false, writeConcernCosts);
+    //     }
+    // }
     /**
      * Helper class to represent an upgrade opportunity
      */

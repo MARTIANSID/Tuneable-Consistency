@@ -1985,7 +1985,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 profit += option.clientMessage.getT().getBaseProfit();
             }
         }
-        return new ProcessResult(messages, tokensUsed, profit, 0, List.of());
+        return new ProcessResult(messages, tokensUsed, profit, 0, List.of(), tokensUsed);
     }
 
     private void recordSystemTpsIfLeader(double currentTps) {
@@ -2714,7 +2714,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // Write data row
                 out.printf("%d,%.2f,%.2f,%.2f,%.2f,%d%n",
                         System.currentTimeMillis(),
-                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.tokensUsed,
+                        result.profit, snapshot.currentServerThroughput, snapshot.currentTokens, result.totalTokensUsed,
                         result.transactionsUpgraded);
             } catch (IOException e) {
                 e.printStackTrace();

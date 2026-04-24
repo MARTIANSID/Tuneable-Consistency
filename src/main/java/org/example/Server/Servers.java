@@ -38,7 +38,7 @@ public class Servers{
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
     // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = false;
+    private static final boolean UPGRADE_TRANSACTIONS = true;
     // Toggle pressure mode in BatchProcessor flow.
     // true => direct admission + pressure-aware processing/deferral path.
     // false => keep current no-pressure flow (base token prepay at admission + upgrade differential later).
