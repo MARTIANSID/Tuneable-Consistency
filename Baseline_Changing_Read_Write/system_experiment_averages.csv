@@ -1,2 +1,0 @@
-SystemAvgCurrentTPS,SystemAvgTokensUsed,SystemAvgProfit,SystemTotalTransactionsUpgraded,SystemAvgLatency_ms_unweighted,SystemAvgLatency_ms_tps_weighted,ServersIncluded,WarmupExcluded_s,ExperimentDuration_s,BinMs
-29014.037869822485,7219.056982248521,2166.298224852071,0.0,62.40359665918023,342.0484582318218,3,10.0,252.13,250
