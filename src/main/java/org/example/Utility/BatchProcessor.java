@@ -50,7 +50,8 @@ public class BatchProcessor {
         put(2, 12000.0);
     }};
     
-    private static final double writeCost = 22;
+    private static final double writeCost = 15;
+    // write cost = 22 (for good results)
 
     private static final HashMap<Integer, Double> MIN_LATENCY_MAP = new HashMap<>() {{
         put(1, 80.0);  // 50 ms for W:1
@@ -72,7 +73,9 @@ public class BatchProcessor {
         put(RC_KEY_EVENTUAL_ALL, 1.0);
         put(RC_KEY_CAUSAL_LOCAL, 1.54);
         put(RC_KEY_CAUSAL_MAJORITY, 2.0);
-        put(RC_KEY_LINEARIZABLE_ALL, 15.0);
+        put(RC_KEY_LINEARIZABLE_ALL, 11.0);
+
+        // linearizable cost : 15
     }};
 
     private int getReadLatencyKey(ReadConcern readConcern, ReadLevel readLevel) {
@@ -1349,7 +1352,7 @@ static class AppUpgradeOption {
                 }
                 deferred.add(tx);
                 if (deferredQueue != null) {
-                    if(deferredQueue.size() < 0) { // prevent unbounded growth
+                    if(deferredQueue.size() < 100) { // prevent unbounded growth
                     deferredQueue.add(tx);
                     }
                 }
