@@ -1,0 +1,51 @@
+# Budget RL Model Configuration
+
+# Model Hyperparameters
+state_dim: 5
+action_dim: 7
+hidden_dim: 128
+
+# Training Parameters
+learning_rate: 0.001
+gamma: 0.99  # Discount factor
+epsilon_start: 1.0
+epsilon_end: 0.01
+epsilon_decay: 0.995
+memory_size: 10000
+batch_size: 64
+target_update_freq: 100
+
+# Reward Function Parameters
+alpha: 1.0   # Throughput weight
+beta: 0.5    # Backlog penalty weight
+gamma_reward: 0.1   # Budget cost penalty weight
+
+# Budget Actions (discretized)
+budget_actions:
+  - 0
+  - 2500
+  - 5000
+  - 7500
+  - 10000
+  - 15000
+  - 20000
+
+# Training Settings
+episodes: 1000
+save_frequency: 100
+evaluation_frequency: 50
+
+# Server Settings
+server_host: "0.0.0.0"
+server_port: 5000
+request_timeout_ms: 5000
+
+# Model Paths
+checkpoint_dir: "./checkpoints"
+training_data: "../rl_training_data.csv"
+test_data: "../rl_test_data.csv"
+model_filename: "budget_model_epfinal.pth"
+
+# Fallback Settings
+fallback_enabled: true
+fallback_budget: 10000.0

@@ -1,470 +1,283 @@
-//package org.example.Client;
-//
-//import com.google.protobuf.ByteString;
-//import io.grpc.ManagedChannel;
-//import io.grpc.ManagedChannelBuilder;
-//import io.grpc.Server;
-//import io.grpc.ServerBuilder;
-//import io.grpc.stub.StreamObserver;
-//import org.ds.paxos.*;
-////import org.example.Keys.KeyGeneration;
-//import org.example.Server.ServerImpl;
-//import org.example.Timer.CustomTimer;
-//
-//import javax.imageio.IIOException;
-//import java.io.BufferedReader;
-//import java.io.FileReader;
-//import java.io.IOException;
-//import java.security.PrivateKey;
-//import java.security.PublicKey;
-//import java.security.Signature;
-//import java.time.LocalDateTime;
-//import java.time.format.DateTimeFormatter;
-//import java.util.*;
-//import java.util.concurrent.*;
-//
-//public class ClientServerImpl extends PbftGrpc.PbftImplBase {
-//    ConcurrentHashMap<String, List<Reply>> repliesReceived;
-//    static ConcurrentHashMap<String, CustomTimer> timers;
-//
-//    ConcurrentHashMap<String, Client> currentClientRequest;
-//
-//    static ConcurrentHashMap<Integer, Integer> viewNoOfEachClient;
-//
-//    static ConcurrentHashMap<String, Client> clientRequests;
-//
-//    ConcurrentHashMap<String, Integer> processedRequests;
-//
-//
-//    static ConcurrentHashMap<String, CountDownLatch> latchesOfEachClient;
-//
-//    static ConcurrentHashMap<String,ConcurrentHashMap<String, List<Reply>>> repliesForEachClientAtDifferentTimeStamp;
-//
-//
-//    static PbftGrpc.PbftStub[] stubs;
-//
-//    public ClientServerImpl() {
-//
-//        this.repliesReceived = new ConcurrentHashMap<>();
-//        this.timers = new ConcurrentHashMap<>();
-//        this.viewNoOfEachClient = new ConcurrentHashMap<>();
-//        this.clientRequests = new ConcurrentHashMap<>();
-//        latchesOfEachClient = new ConcurrentHashMap<>();
-//        this.processedRequests = new ConcurrentHashMap<>();
-//        repliesForEachClientAtDifferentTimeStamp = new ConcurrentHashMap<>();
-//        stubs = new PbftGrpc.PbftStub[13];
-//
-//        for (int i = 0; i <= 12; i++) {
-//            if (i == 0) {
-//                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9000).usePlaintext().build();
-//                stubs[i] = PbftGrpc.newStub(channel);
-//            } else {
-//                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + i).usePlaintext().build();
-//                stubs[i] = PbftGrpc.newStub(channel);
-//            }
-//        }
-//
-////        for (int i = 1; i <= 3000; i++) {
-////            final int id = i;
-////            timers.put(i, new CustomTimer(() -> multiCastClientRequest(id), 8, TimeUnit.SECONDS));
-////            viewNoOfEachClient.put(i, 0);
-////        }
-//    }
-//
-//    @Override
-//    public void sendReplyToClient(Reply reply, StreamObserver<Empty> streamObserver) {
-//
-//        try {
-//            Thread.sleep(new Random().nextInt(40));
-//        } catch (InterruptedException e) {
-//            throw new RuntimeException(e);
-//        }
-//        int clientId = reply.getClientId();
-//        String timestamp = reply.getTimestamp();
-//
-//        String key = clientId + "." + timestamp;
-//
-//
-//        if (processedRequests.containsKey(key)) {
-//            streamObserver.onNext(Empty.newBuilder().build());
-//            streamObserver.onCompleted();
-//        } else {
-//            handleReplyLogic(reply, streamObserver);
-//        }
-//    }
-//
-//    public synchronized void handleReplyLogic(Reply reply, StreamObserver<Empty> streamObserver) {
-//        int clientId = reply.getClientId();
-//        String timestamp = reply.getTimestamp();
-//
-//        String key = clientId + "." + timestamp;
-//
-//        repliesReceived.putIfAbsent(key, new ArrayList<>());
-//        repliesReceived.get(key).add(reply);
-//
-//        List<Reply> replies = repliesReceived.get(key);
-//
-//        int sameReplyCount = 0;
-//
-//        for (Reply r : replies) {
-//            if (reply.getTimestamp().equals(r.getTimestamp()) && r.getResult() == r.getResult()) {
-//                sameReplyCount++;
-//            }
-//        }
-//
-//        System.out.println(sameReplyCount);
-//
-//        if (sameReplyCount >= 3) {
-//            processedRequests.put(key, 1);
-//            repliesForEachClientAtDifferentTimeStamp.putIfAbsent(key, new ConcurrentHashMap<>());
-//            repliesForEachClientAtDifferentTimeStamp.get(key).putIfAbsent(reply.getTimestamp(), new ArrayList<>());
-//            repliesForEachClientAtDifferentTimeStamp.get(key).get(reply.getTimestamp()).addAll(replies);
-////            viewNoOfEachClient.put(key, Math.max(reply.getViewNo(), viewNoOfEachClient.get(clientId)));
-//            latchesOfEachClient.get(key).countDown();
-//            System.out.println("Sufficient Replies Received");
-//            timers.get(key).stop();
-//        }
-//
-//        streamObserver.onNext(Empty.newBuilder().build());
-//        streamObserver.onCompleted();
-//    }
-//
-//    private static int getClusterIndex(int clientId) {
-//        if (clientId >= 1 && clientId <= 1000) return 1;
-//
-//        if (clientId >= 1001 && clientId <= 2000) return 2;
-//
-//        if (clientId >= 2001 && clientId <= 3000) return 3;
-//
-//        return -1;
-//    }
-//
-//    public static void multiCastClientRequest(String clientKey) {
-//        Client message = clientRequests.get(clientKey);
-//
-//        System.out.println("Have to multicast");
-//
-//        Transaction t = message.getT();
-//
-//        int sender = t.getSenderId(), receiver = t.getReceiverId(), senderCluster = getClusterIndex(sender), receiverCluster = getClusterIndex(receiver), start = 1;
-//
-//        if(senderCluster == 1) {
-//            start = 1;
-//        } else if(senderCluster == 2) {
-//            start = 5;
-//        } else {
-//            start = 9;
-//        }
-//
-////        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000).usePlaintext().build();
-//        for (int i = start; i <= (start+3); i++) {
-////             channel = ManagedChannelBuilder.forAddress("localhost", 8000 + i).usePlaintext().build();
-////
-////            PbftGrpc.PbftStub asyncStub = PbftGrpc.newStub(channel);
-//
-//            stubs[i].clientRequest(message, new StreamObserver<Empty>() {
-//                @Override
-//                public void onNext(Empty empty) {
-//
-//                }
-//
-//                @Override
-//                public void onError(Throwable throwable) {
-//
-//                }
-//
-//                @Override
-//                public void onCompleted() {
-//
-//                }
-//            });
-//        }
-//        try {
-//            Thread.sleep(20);
-////            channel.shutdown();
-//            // resetting the timer
-//            timers.get(clientKey).reset();
-//        } catch (InterruptedException e) {
-//            throw new RuntimeException(e);
-//        }
-//    }
-//
-//    private int getCurrentLeader(Client c) {
-//        return (viewNoOfEachClient.get(c.getClientId()) % 7);
-//    }
-//
-//    static int getCurrentLeaderPortBasedOnClientId(String clientId) {
-//        return (8000 + (viewNoOfEachClient.get(clientId) % 7));
-//    }
-//
-//    static class CsvTransaction {
-//        int sender;
-//        int receiver;
-//        double amount;
-//
-//        CsvTransaction(int sender, int receiver, double amount) {
-//            this.sender = sender;
-//            this.receiver = receiver;
-//            this.amount = amount;
-//        }
-//
-//        @Override
-//        public String toString() {
-//            return sender + " " + receiver + " " + amount;
-//        }
-//
-//    }
-//
-//    static String getTimeStamp() {
-//        LocalDateTime now = LocalDateTime.now();
-//        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
-//        String timestamp = now.format(formatter);
-//        return timestamp;
-//    }
-//
-//    public static void main(String[] args) throws IOException, InterruptedException {
-//
-//        PrivateKey clientPrivateKey = KeyGeneration.privateKeys.get(13);
-//        PublicKey clientPublicKey = KeyGeneration.publicKeys.get(13);
-//
-////        HashMap<String, String> client = new HashMap<>();
-//
-//
-//
-//        Server clientServer = ServerBuilder.forPort(9000)
-//                .addService(new ClientServerImpl())
-//                .build()
-//                .start();
-//
-//        String inputFilePath = "/Users/sidbansal/Downloads/Lab4_Testset_1.csv";
-//        List<CsvTransaction> transactions = new ArrayList<>();
-//
-//        List<List<CsvTransaction>> setOfTransactions = new ArrayList<>();
-//        List<List<String>> setOfLiveServers = new ArrayList<>();
-//        List<List<String>> byzantineServers = new ArrayList<>();
-//
-//        try (BufferedReader br = new BufferedReader(new FileReader(inputFilePath))) {
-//            String line;
-//            while ((line = br.readLine()) != null) {
-//                String[] columns = line.split(",(?=(?:[^\\\"]*\\\"[^\\\"]*\\\")*[^\\\"]*$)");
-//
-//
-//                if (columns.length > 2) {
-//                    String servers = columns[2].replaceAll("[\\[\\]]", "").trim();
-//                    servers = servers.replaceAll("^\"|\"$", "").trim();
-//                    String[] liveServers = servers.split(",\\s*");
-//                    setOfTransactions.add(new ArrayList<>());
-//                    setOfLiveServers.add(Arrays.asList(liveServers));
-//                }
-//
-//                if (columns.length > 1) {
-//                    String transactionPart = columns[1].replaceAll("[\\\"()]", "").trim();
-//                    String[] transactionData = transactionPart.split(", ");
-//                    int source = Integer.parseInt(transactionData[0]);
-//                    int destination = Integer.parseInt(transactionData[1]);
-//                    double weight = Double.parseDouble(transactionData[2]);
-//                    // Add transaction to the list
-//                    setOfTransactions.get(setOfTransactions.size() - 1).add(new CsvTransaction(source, destination, weight));
-//                }
-//
-//                if (columns.length > 4) {
-//                    String servers = columns[4].replaceAll("[\\[\\]]", "").trim();
-//                    servers = servers.replaceAll("^\"|\"$", "").trim();
-//                    String[] byzantineNodes = servers.split(",\\s*");
-//                    byzantineServers.add(Arrays.asList(byzantineNodes));
-//                }
-//
-//
-//            }
-//        } catch (IOException e) {
-//        }
-//
-//
-//        int setIndex = 0;
-//        for (int j = 0; j <= 9; j++) {
-//            if(setIndex > 5) {
-//                System.out.println("Transactions sets done!");
-//                return;
-//            }
-//            List<CsvTransaction> csvTransactions  = setOfTransactions.get(setIndex);
-//            Scanner sys = new Scanner(System.in);
-//            System.out.println("Process Set: " + (setIndex +1));
-//
-//            boolean isProcess = sys.nextBoolean();
-//
-//            if(isProcess == false) return;
-//
-////            HashMap<String, List<CsvTransaction>> transactionsPerClient = new HashMap<>();
-//
-////            for (CsvTransaction t : csvTransactions) {
-////
-////                String sender = client.get(t.sender), receiver = client.get(t.receiver);
-////                double amount = t.amount;
-////                transactionsPerClient.putIfAbsent(sender, new ArrayList<>());
-////                transactionsPerClient.get(sender).add(new CsvTransaction(sender, receiver, amount));
-////            }
-//
-//            List<String> liveServers = setOfLiveServers.get(setIndex);
-//
-//            List<String> setOfByzantine = byzantineServers.get(setIndex++);
-//
-//
-//            HashSet<String> hashSetOfLiveServers = new HashSet<>();
-//
-//            HashSet<String> hashSetofByzantineServers = new HashSet<>();
-//
-//            for (String server : liveServers) {
-//                hashSetOfLiveServers.add(server.trim().toUpperCase());
-//            }
-//
-//            for (String server : setOfByzantine) {
-//                hashSetofByzantineServers.add(server.trim().toUpperCase());
-//            }
-//
-//
-//            for (int i = 1; i <= 12; i++) {
-//                String server = "S" + i;
-//                if (hashSetOfLiveServers.contains(server.trim().toUpperCase())) {
-//                    // turn on
-//                    ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i)).usePlaintext().build();
-//                    PbftGrpc.PbftBlockingStub blockingStubForSettingAliveStatus = PbftGrpc.newBlockingStub(channel);
-//                    blockingStubForSettingAliveStatus.setAlive(Alive.newBuilder().setIsAlive(true).build());
-//                } else {
-//                    // turn off
-//                    ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i)).usePlaintext().build();
-//                    PbftGrpc.PbftBlockingStub blockingStubForSettingAliveStatus = PbftGrpc.newBlockingStub(channel);
-//                    blockingStubForSettingAliveStatus.setAlive(Alive.newBuilder().setIsAlive(false).build());
-//                }
-//            }
-//
-//            for (int i = 1; i <= 12; i++) {
-//                String server = "S" + i;
-//                if (hashSetofByzantineServers.contains(server.trim().toUpperCase())) {
-//                    ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i)).usePlaintext().build();
-//                    PbftGrpc.PbftBlockingStub blockingStubForSettingByzantineStatus = PbftGrpc.newBlockingStub(channel);
-//                    blockingStubForSettingByzantineStatus.setByzantine(Byzantine.newBuilder().setIsByzantine(true).build());
-//
-//                } else {
-//                    ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i)).usePlaintext().build();
-//                    PbftGrpc.PbftBlockingStub blockingStubForSettingByzantineStatus = PbftGrpc.newBlockingStub(channel);
-//                    blockingStubForSettingByzantineStatus.setByzantine(Byzantine.newBuilder().setIsByzantine(false).build());
-//                }
-//            }
-//
-//            int index = 0;
-//
-//            for(CsvTransaction cvT : csvTransactions) {
-//                String timestampForThisTransaction = getTimeStamp();
-//                String key = 13+"."+timestampForThisTransaction;
-//                latchesOfEachClient.put(key, new CountDownLatch(1));
-//
-//                try {
-//                    Client message = sendClientMessageToServer(13, cvT.sender, cvT.receiver, cvT.amount, timestampForThisTransaction);
-//                    clientRequests.put(key, message);
-//                    timers.put(key, new CustomTimer(() -> multiCastClientRequest(key), 8, TimeUnit.SECONDS));
-//                    timers.get(key).start();
-//                } catch (Exception e) {
-//                    throw new RuntimeException(e);
-//                }
-//                index++;
-//            }
-//
-////            Set<String> clients = transactionsPerClient.keySet();
-////            int cnt = 0;
-////            List<ExecutorService> threadServices = new ArrayList<>();
-////            for (String c : clients) {
-////                ExecutorService executorService = Executors.newSingleThreadExecutor();
-////                threadServices.add(executorService);
-////                executorService.submit(() -> {
-////                    List<CsvTransaction> transactionsOfClient = transactionsPerClient.get(c);
-////                    for (CsvTransaction cvT : transactionsOfClient) {
-////                        String timestampForThisTransaction = getTimeStamp();
-////                        latchesOfEachClient.put(c + "." + timestampForThisTransaction, new CountDownLatch(1));
-////                        try {
-////                            Client message = sendClientMessageToServer(c, cvT.sender, cvT.receiver, cvT.amount, timestampForThisTransaction);
-////                            clientRequests.put(c+"."+timestampForThisTransaction, message);
-////                            timers.get(c).reset();
-////                            latchesOfEachClient.get(c + "." + timestampForThisTransaction).await();
-////                            timers.get(c).stop();
-////                            System.out.println("Sufficient Replies Received");
-////                        } catch (Exception e) {
-////                            throw new RuntimeException(e);
-////                        }
-////                    }
-////                });
-////                Thread.sleep(50);
-////            }
-////
-////            for (ExecutorService service : threadServices) {
-////                service.shutdown();
-////            }
-////            for(ExecutorService service : threadServices) {
-////                service.awaitTermination(1, TimeUnit.HOURS);
-////            }
-//
-//        }
-//        clientServer.awaitTermination();
-//
-//    }
-//
-//    public static Client sendClientMessageToServer(int clientId, int sender, int receiver, double amount, String timestamp) throws Exception {
-//        PrivateKey privateKey = KeyGeneration.privateKeys.get(13);
-//        PublicKey publicKey = KeyGeneration.publicKeys.get(13);
-//
-//        Client clientMessage = Client.newBuilder()
-//                .setTimestamp(timestamp)
-//                .setClientId(clientId)
-//                .setT(Transaction.newBuilder().setSenderId(sender).setReceiverId(receiver).setAmount(amount).build())
-//                .build();
-//
-//        byte[] signatureBytes = signMessage(clientMessage.toBuilder().clearSignature().build().toByteArray(), privateKey);
-//
-//        // Attach the signature to the Client message
-//        Client signedClientMessage = clientMessage.toBuilder()
-//                .setSignature(ByteString.copyFrom(signatureBytes))
-//                .build();
-//
-//        int portOfLeader = 1;
-//
-//        int senderCluster = getClusterIndex(sender);
-//
-//        if(senderCluster == 1) {
-//            portOfLeader = 1;
-//        } else if(senderCluster == 2) {
-//            portOfLeader = 5;
-//        } else {
-//            portOfLeader = 9;
-//        }
-//        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + portOfLeader).usePlaintext().build();
-//
-//        PbftGrpc.PbftStub asyncStub = PbftGrpc.newStub(channel);
-//        asyncStub.clientRequest(signedClientMessage, new StreamObserver<Empty>() {
-//            @Override
-//            public void onNext(Empty reply) {
-//
-//            }
-//
-//            @Override
-//            public void onError(Throwable throwable) {
-//
-//            }
-//
-//            @Override
-//            public void onCompleted() {
-//
-//            }
-//        });
-//
-//        Thread.sleep(200);
-//
-//        return signedClientMessage;
-//    }
-//
-//    public static byte[] signMessage(byte[] messageData, PrivateKey privateKey) throws Exception {
-//        Signature signature = Signature.getInstance("SHA256withRSA");
-//        signature.initSign(privateKey);
-//        signature.update(messageData);
-//        return signature.sign();
-//    }
-//
-//}
+package org.example.Client;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import org.ds.paxos.Ack;
+import org.ds.paxos.AckMessage;
+import org.ds.paxos.ClientReadRequest;
+import org.ds.paxos.Empty;
+import org.ds.paxos.RaftGrpc;
+import org.ds.paxos.ReadConcern;
+import org.ds.paxos.ReadLevel;
+import org.ds.paxos.TimeStampProto;
+import org.ds.paxos.Transaction;
+import org.example.Utility.HybridClock;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
+import io.grpc.stub.StreamObserver;
+
+public class ClientServerImpl extends RaftGrpc.RaftImplBase {
+
+    // --- Core State ---
+    private final ConcurrentHashMap<String, Boolean> ackReceived;
+    private final ReadWriteLock lock;
+    private final HybridClock hybridClock;
+    private HybridClock.TimeStamp lastTimeStamp;
+    private final RaftGrpc.RaftStub[] stubs;
+    private final int NUM_OF_SERVERS = 3;
+
+    private int currentLeader = 2;
+    private int totalTransactions = 0;
+    private long totalTime = 0;
+
+    public static final ConcurrentHashMap<String, Long> timeTakenForTransactionToBeExecuted = new ConcurrentHashMap<>();
+
+    // --- New: Latency tracking per ReadConcern ---
+    private final ConcurrentHashMap<ReadConcern, List<Long>> latencyPerConcern = new ConcurrentHashMap<>();
+
+    // --- Constructor ---
+    public ClientServerImpl() {
+        this.ackReceived = new ConcurrentHashMap<>();
+        this.lock = new ReentrantReadWriteLock();
+        this.hybridClock = new HybridClock();
+        this.lastTimeStamp = hybridClock.now();
+        this.stubs = new RaftGrpc.RaftStub[NUM_OF_SERVERS];
+        // initialize lists for each ReadConcern
+        for (ReadConcern rc : ReadConcern.values()) {
+            latencyPerConcern.put(rc, Collections.synchronizedList(new ArrayList<>()));
+        }
+    }
+
+    // --- Setup gRPC Stubs ---
+    // public void setUpStubs() {
+    //     for (int i = 0; i < NUM_OF_SERVERS; i++) {
+    //         ManagedChannel channel = ManagedChannelBuilder
+    //                 .forAddress("clnode063.clemson.cloudlab.us", 8000 + (i + 1))
+    //                 .enableRetry()
+    //                 .usePlaintext()
+    //                 .build();
+    //         stubs[i] = RaftGrpc.newStub(channel);
+    //     }
+    //     System.out.println("✅ Client connected to all " + NUM_OF_SERVERS + " Raft servers");
+    // }
+    public void setUpStubs() {
+    // CloudLab nodes participating in the cluster
+        String[] hosts = {
+            "clnode061.clemson.cloudlab.us",
+            "clnode046.clemson.cloudlab.us",
+            "clnode063.clemson.cloudlab.us"
+        };
+
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            int port = 8000; // 8001, 8002, 8003
+            ManagedChannel channel = ManagedChannelBuilder
+                    .forAddress(hosts[i], port)
+                    .enableRetry()
+                    .usePlaintext()
+                    .build();
+
+            stubs[i] = RaftGrpc.newStub(channel);
+                
+            }
+    }
+
+    // --- Handle ACKs from Raft servers ---
+    @Override
+    public void sendAckToClient(Ack ack, StreamObserver<Empty> responseObserver) {
+        responseObserver.onNext(Empty.newBuilder().build());
+        responseObserver.onCompleted();
+
+        for (AckMessage ackMessage : ack.getAckMessageList()) {
+            Transaction t = ackMessage.getT();
+            String id = t.getId();
+
+            // Only log successful reads and measure latency
+            if (t.getIsReadOnly()) {
+                Long start = timeTakenForTransactionToBeExecuted.get(id);
+                if (start != null) {
+                    long latency = System.currentTimeMillis() - start;
+                    latencyPerConcern.get(ReadConcern.LINEARIZABLE).add(latency);
+                }
+//                System.out.println("[READ SUCCESS] ID=" + id +
+//                        " | Concern=" + "LINEARIZABLE" +
+//                        " | Account=" + ackMessage.getAccName() +
+//                        " | Balance=" + ackMessage.getBalance() +
+//                        " | Leader=" + ackMessage.getCurrentLeader()
+//                        + " | Latency=" + latency + "ms"    );
+            }
+
+            if (ackReceived.containsKey(id)) continue;
+
+            totalTransactions++;
+            totalTime += System.currentTimeMillis() - t.getTransactionSendTimeInMs();
+            ackReceived.put(id, true);
+            currentLeader = ackMessage.getCurrentLeader();
+
+            // Update clock if timestamp present
+            if (ackMessage.hasTimStamp()) {
+                HybridClock.TimeStamp timeStamp = HybridClock.TimeStamp.convertToTimeStamp(ackMessage.getTimStamp());
+                hybridClock.update(timeStamp);
+                if (lastTimeStamp.compareTo(timeStamp) < 0) {
+                    lastTimeStamp = timeStamp;
+                }
+            }
+        }
+
+        // --- Compute average latency per ReadConcern ---
+        for (ReadConcern rc : latencyPerConcern.keySet()) {
+            List<Long> latencies = latencyPerConcern.get(rc);
+            if (!latencies.isEmpty()) {
+                double avg = latencies.stream().mapToLong(Long::longValue).average().orElse(0);
+                System.out.println("[AVG LATENCY] Concern=" + rc + " | AvgLatency=" + avg + "ms");
+            }
+        }
+    }
+
+    // --- Send Read Request (with optional provided ID) ---
+    public void sendReadRequest(String accName, ReadConcern readConcern, ReadLevel readLevel, String readId) {
+        String requestId = readId != null ? readId : UUID.randomUUID().toString();
+
+        ClientReadRequest request = ClientReadRequest.newBuilder()
+                .setAccNameToRead(accName)
+                .setReadConcern(readConcern)
+                .setReadLevel(readLevel)
+                .setTimeStamp(HybridClock.TimeStamp.convertToProto(lastTimeStamp))
+                .setId(requestId)
+                .build();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        RaftGrpc.RaftStub leaderStub;
+
+        lock.readLock().lock();
+        try {
+            if(readConcern == ReadConcern.LINEARIZABLE)
+                leaderStub = stubs[currentLeader];
+            else
+                leaderStub = stubs[new Random().nextInt(NUM_OF_SERVERS)];
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        long sendTime = System.currentTimeMillis();
+
+        leaderStub.sendReadRequest(request, new StreamObserver<>() {
+            @Override
+            public void onNext(Ack ack) {
+                for (AckMessage msg : ack.getAckMessageList()) {
+                    if (!msg.getFailure() && !msg.getResultNotReady()) {
+                        long latency = System.currentTimeMillis() - sendTime;
+                        latencyPerConcern.get(readConcern).add(latency);
+//                        System.out.println("[READ OK] ID=" + requestId +
+//                                " | Concern=" + readConcern +
+//                                " | Account=" + msg.getAccName() +
+//                                " | Balance=" + msg.getBalance() +
+//                                " | Latency=" + latency + "ms");
+                    }
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                latch.countDown();
+            }
+        });
+
+        try {
+            latch.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // --- Overload for standalone reads ---
+    public void sendReadRequest(String accName, ReadConcern readConcern, ReadLevel readLevel) {
+        sendReadRequest(accName, readConcern, readLevel, null);
+    }
+
+    // --- Expose latest ACK-updated timestamp for external injectors ---
+    public TimeStampProto getLastTimeStampProto() {
+        lock.readLock().lock();
+        try {
+            return HybridClock.TimeStamp.convertToProto(lastTimeStamp);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    // --- Main Method: Parallel Periodic Reads with unique IDs ---
+    public static void main(String[] args) throws IOException, InterruptedException {
+        ClientServerImpl clientServer = new ClientServerImpl();
+
+        Server server = ServerBuilder.forPort(9000)
+                .addService(clientServer)
+                .build()
+                .start();
+
+        System.out.println("🚀 Client server started on port 9000");
+        clientServer.setUpStubs();
+
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        String accountName = "AcctA";
+
+        // Schedule parallel read groups every 100ms
+        // Schedule a recurring task
+        scheduler.scheduleAtFixedRate(() -> {
+            System.out.println("\n=== 🧩 NEW READ GROUP ===");
+
+            int transactionCount = 10; // number of concurrent transactions
+            ExecutorService exec = Executors.newFixedThreadPool(transactionCount);
+
+            String id = UUID.randomUUID().toString();
+            timeTakenForTransactionToBeExecuted.put(id, System.currentTimeMillis());
+
+            // Submit 30 read requests in parallel
+            for (int i = 0; i < transactionCount; i++) {
+                int index = i; // capture loop variable
+                exec.submit(() -> {
+                    ReadConcern concern;
+                    ReadLevel level;
+                    if (index % 3 == 0) {
+                        concern = ReadConcern.EVENTUAL;
+                        level = ReadLevel.LOCAL;
+                    } else if (index % 3 == 1) {
+                        concern = ReadConcern.CAUSAL;
+                        level = ReadLevel.MAJORITY;
+                    } else {
+                        concern = ReadConcern.LINEARIZABLE;
+                        level = ReadLevel.MAJORITY;
+                    }
+                    concern = ReadConcern.LINEARIZABLE;
+                    level = ReadLevel.MAJORITY;
+
+                    clientServer.sendReadRequest(accountName, concern, level, id);
+                });
+            }
+
+            exec.shutdown();
+
+        }, 20, 20, TimeUnit.MILLISECONDS); // initial delay = 20ms, run every 1 second
+        System.out.println("⏱️ Parallel read groups scheduled every 100ms with unique IDs");
+        server.awaitTermination();
+    }
+}

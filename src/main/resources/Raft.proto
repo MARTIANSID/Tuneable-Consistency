@@ -7,28 +7,114 @@ service Raft {
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
   rpc printLog(Empty) returns (Empty);
+  rpc sendAckToClient(Ack) returns (Empty);
+  rpc sendAckToAllServers(Ack) returns(Empty);
+  rpc sendReadRequest(ClientReadRequest) returns (Ack);
 }
+
 
 message Empty{
   int32 data = 1;
 }
 
+message Balance {
+  double balance = 1;
+  string accName = 2;
+  bool failure = 3;
+  // for linearzable we the leader does not return the balance immediately but wait, when it is committed
+  bool resultNotReady = 4;
+}
+
+enum ReadConcern {
+  LINEARIZABLE = 0;
+  CAUSAL = 1;
+  EVENTUAL = 2;
+}
+enum ReadLevel {
+  LOCAL = 0;
+  MAJORITY = 1;
+}
+
+message AckMessage {
+  Transaction t = 1;
+  TimeStampProto timStamp = 2;
+  int32 currentLeader = 3;
+
+  // for read transactions
+  double balance = 4;
+  string accName = 5;
+  bool failure = 6;
+  bool resultNotReady = 7;
+  string id = 8;
+}
+
+message Ack {
+  // later on we can add more fields like timestamp for causal consistency
+  repeated AckMessage ackMessage = 1;
+}
+
 message ClientMessage {
   Transaction t = 1;
   int32 writeConcern = 2;
+  TimeStampProto timeStamp = 3;
+
+  string callbackHost = 4;
+  int32 callbackPort = 5;
 }
+
+message ClientReadRequest {
+  string accNameToRead = 1;
+  ReadConcern readConcern = 2;
+  TimeStampProto timeStamp = 3;
+  ReadLevel readLevel = 4;
+  string id = 5;
+
+  string callbackHost = 6;
+  int32 callbackPort = 7;
+}
+
+
 
 message Transaction {
   string sender = 1;
   string receiver = 2;
   double amount = 3;
   string id = 4;
+  int64 transactionSendTimeInMs = 5;
+  int32 minRequiredConsistency = 6;
+  double baseProfit = 7;
+  double extraProfitMajority = 8;
+  double extraIntermediateProfit = 9;
+  int32 writeConcern = 10;
+  // this is there to check in which batch this transaction was actually processed
+  int32 batchNo = 11;
+
+  // for read transactions
+  bool isReadOnly = 12;
+  string readRequestedId = 13;
+  string accNameToRead = 14;
+  ReadConcern readConcern = 15;
+  int32 applicationId = 16;
+  int64 transactionArrivalTimeOnLeader = 17;
+  ReadLevel readLevel = 18;
 }
 message LogEntryProto {
   int32 logIndex = 1;
   int32 term = 2;
   int32 writeConcern = 3;
   Transaction t = 4;
+  TimeStampProto timeStamp = 5;
+  repeated bool serversThatReplicatedThisEntry = 6;
+  int32 copyOfWriteConcern = 7;
+  string callbackHost = 8;
+  int32 callbackPort = 9;
+  int64 timeOfArrivalAtLeader = 10;
+
+}
+
+message TimeStampProto {
+  int64 p = 1;
+  int64 l = 2;
 }
 
 message Log {
@@ -43,6 +129,9 @@ message AppendEntriesArgument {
   Log entriesToAppend = 5;
   int32 leadersCommit = 6;
   int32 ackIndex = 7;
+  TimeStampProto timeStamp = 8;
+  double systemThroughput = 9;
+  bool systemThroughputIncluded = 10;
 }
 
 message RequestVoteArguments {
@@ -56,6 +145,9 @@ message AppendEntriesResult {
   int32 currentTerm = 1;
   bool isSuccessFull = 2;
   int32 followerId = 3;
+  TimeStampProto timeStamp = 4;
+  double followerReadThroughput = 5;
+  bool readThroughputIncluded = 6;
 }
 message RequestVoteResult {
   int32 currentTerm = 1;
