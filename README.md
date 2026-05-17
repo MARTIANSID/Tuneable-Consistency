@@ -48,13 +48,6 @@ mvn clean install
 ## Run `Servers.java`
 
 ```bash id="tk0g0n"
-mvn exec:java -Dexec.mainClass="org.example.Servers.java"
+mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
 ```
-
-If `Servers.java` belongs to a package, use the fully qualified class name:
-
-```bash id="6czlln"
-mvn exec:java -Dexec.mainClass="com.project.Servers"
-```
-
 ---
