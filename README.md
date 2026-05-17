@@ -1,18 +1,25 @@
+# Tuneable-Consistency Setup and Experiment Guide
+
+Repository: [Tuneable-Consistency GitHub Repository](https://github.com/MARTIANSID/Tuneable-Consistency?utm_source=chatgpt.com)
+
+---
+
 # Install Java 17
 
 ```bash
 sudo apt update
-sudo apt install openjdk-17-jdk maven -y
+sudo apt install openjdk-17-jdk -y
 ```
 
 ---
 
-# Verify Java + Maven
+# Verify Java Installation
 
 ```bash
 java -version
-mvn -v
 ```
+
+You should see Java 17.
 
 ---
 
@@ -33,7 +40,27 @@ source ~/.bashrc
 
 ---
 
+# Install Maven
+
+```bash
+sudo apt install maven -y
+```
+
+---
+
+# Verify Maven Installation
+
+```bash
+mvn -v
+```
+
+---
+
 # Install Redis
+
+The project uses Redis for the distributed token bucket implementation.
+
+Install Redis:
 
 ```bash
 sudo apt install redis-server -y
@@ -65,23 +92,22 @@ Expected output:
 PONG
 ```
 
----
+Redis runs on:
 
-# Redis Configuration Used by the Project
+| Service      | Port |
+| ------------ | ---- |
+| Redis Server | 6379 |
 
-The token bucket implementation connects to Redis using:
+The Java token bucket implementation connects to:
 
-```text
-Host: 127.0.0.1
-Port: 6379
+```java
+new Jedis(redisHost, redisPort)
 ```
 
-Make sure Redis is running on port `6379` before starting the experiment.
+using port:
 
-You can verify using:
-
-```bash
-redis-cli -p 6379 ping
+```text
+6379
 ```
 
 ---
@@ -96,44 +122,42 @@ mvn clean install
 
 ---
 
-`Servers.java` is the main entry point for running the full distributed consistency experiment framework in [Tuneable-Consistency](https://github.com/MARTIANSID/Tuneable-Consistency?utm_source=chatgpt.com).
-
-It automatically:
-
-* Starts multiple gRPC servers
-* Elects a leader
-* Injects transactions into the system
-* Runs workload phases (Light → Medium → Heavy → Light)
-* Collects TPS/latency/backlog CSV metrics
-* Simulates consistency upgrades
-* Optionally simulates node failures and geo latency
-
----
-
-# Run the Experiment
+# Run the Distributed Experiment Framework
 
 From the repository root:
 
 ```bash
-mvn clean install
 mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
 ```
 
 ---
 
-# What Happens When You Run It
+# What `Servers.java` Does
 
-## 1. Starts Multiple Servers
+`Servers.java` is the main distributed experiment runner for the system.
 
-This section:
+It automatically:
+
+* Starts multiple gRPC servers
+* Elects a Raft leader
+* Starts workload injection
+* Runs phased consistency experiments
+* Collects CSV metrics
+* Simulates failures
+* Simulates geo latency
+* Tests tunable consistency behavior
+
+---
+
+# Server Configuration
+
+This controls the cluster size:
 
 ```java
 public static final int NUM_OF_SERVERS = 3;
 ```
 
-creates 3 distributed servers.
-
-They run on:
+The servers run on:
 
 | Server  | Port |
 | ------- | ---- |
@@ -141,7 +165,7 @@ They run on:
 | Server1 | 8002 |
 | Server2 | 8003 |
 
-You will see:
+You will see logs like:
 
 ```text
 Server0 started on port 8001
@@ -151,7 +175,7 @@ Server2 started on port 8003
 
 ---
 
-## 2. Starts Client Callback Server
+# Client Callback Server
 
 The framework also starts a callback listener:
 
@@ -162,16 +186,16 @@ Client callback server started on port 9000
 This is used for:
 
 * ACK collection
-* latency tracking
+* latency measurement
 * timestamp synchronization
 
 ---
 
 # Workload Phases
 
-The experiment automatically changes workload over time.
+The framework automatically changes workload phases during execution.
 
-Defined here:
+Configured in:
 
 ```java
 PHASES.add(new Phase(...))
@@ -190,20 +214,21 @@ Current setup:
 
 # What Gets Tested
 
-The framework tests:
+The framework evaluates:
 
 * Tunable consistency
-* Dynamic transaction upgrades
-* Throughput under load
+* Dynamic consistency upgrades
+* Throughput under varying load
 * Latency behavior
 * Queue pressure
+* Token bucket admission control
 * Read/write consistency tradeoffs
 * Failure handling
-* Token bucket admission control
+* Leader re-election
 
 ---
 
-# Important Toggles
+# Important Experiment Toggles
 
 ## Transaction Upgrading
 
@@ -213,8 +238,8 @@ private static final boolean UPGRADE_TRANSACTIONS = true;
 
 When enabled:
 
-* transactions can be upgraded dynamically
-* stronger consistency may be applied during execution
+* transactions may dynamically upgrade consistency
+* stronger guarantees may be applied during execution
 
 ---
 
@@ -227,12 +252,12 @@ private static final boolean PRESSURE_MODE_ENABLED = false;
 Controls:
 
 * pressure-aware admission
-* deferrals
+* transaction deferrals
 * token bucket behavior
 
 ---
 
-## Node Failure Simulation
+## Simulated Node Failure
 
 Enable:
 
@@ -240,13 +265,13 @@ Enable:
 private static final boolean ENABLE_NODE_NETWORK_FAILURE = true;
 ```
 
-Then choose:
+Choose failed node:
 
 ```java
 private static final int FAILED_NODE_ID = 0;
 ```
 
-This simulates a failed node by dropping inter-server RPCs.
+This simulates node failure by dropping inter-server RPCs.
 
 ---
 
@@ -271,9 +296,9 @@ private static final int FAILURE_AFTER_SECONDS = 40;
 
 Useful for:
 
-* re-election testing
+* recovery testing
 * liveness evaluation
-* fault tolerance experiments
+* re-election experiments
 
 ---
 
@@ -285,13 +310,13 @@ Enable:
 private static final boolean ENABLE_GEO_SETTINGS = true;
 ```
 
-Uses:
+The framework uses:
 
 ```bash
 simulate_geo_latency.sh
 ```
 
-to inject artificial network delay using Linux `tc/netem`.
+to inject artificial WAN latency using Linux `tc/netem`.
 
 Example:
 
@@ -301,14 +326,15 @@ private static final int GEO_LATENCY_MS = 50;
 
 Useful for:
 
-* WAN simulations
-* geo-distributed consistency analysis
+* geo-distributed experiments
+* WAN consistency evaluation
+* latency amplification studies
 
 ---
 
 # Generated CSV Metrics
 
-The experiment automatically creates CSV files like:
+The framework automatically generates CSV files such as:
 
 | File                                   | Description           |
 | -------------------------------------- | --------------------- |
@@ -320,25 +346,26 @@ The experiment automatically creates CSV files like:
 | `process_batch_duration_0.csv`         | batch execution time  |
 | `incoming_transaction_rate_global.csv` | global injection rate |
 
-These are used later for plotting and analysis.
+These files are later used for plotting and analysis.
 
 ---
 
-# Transaction Types Generated
+# Transaction Types
 
-The framework injects:
+The framework injects both reads and writes.
 
 ## Writes
 
-With tunable:
-
-* write concern
-* consistency level
-
-Examples:
+Supports tunable write concerns such as:
 
 * W:1
 * majority
+
+Configured through:
+
+```java
+Map<Integer, Double> writeDistribution
+```
 
 ---
 
@@ -351,10 +378,10 @@ Supports:
 * CAUSAL_MAJORITY
 * LINEARIZABLE
 
-Configured in:
+Configured through:
 
 ```java
-Map<ReadClass, Double> ...
+Map<ReadClass, Double> readDistribution
 ```
 
 ---
@@ -372,25 +399,42 @@ The injector:
 * distributes reads/writes
 * routes linearizable reads to leader
 * routes weaker reads to followers
-* measures throughput continuously
+* continuously measures throughput
 
 ---
 
 # Typical Workflow
 
-## 1. Configure Experiment
+## 1. Configure the Experiment
 
-Edit:
+Modify:
 
 * TPS
-* phases
-* read/write ratios
+* workload phases
 * consistency distributions
+* read/write ratios
 * failure toggles
+* geo latency settings
 
 ---
 
-## 2. Run Servers.java
+## 2. Start Redis
+
+```bash
+sudo systemctl start redis-server
+```
+
+---
+
+## 3. Build the Project
+
+```bash
+mvn clean install
+```
+
+---
+
+## 4. Run the Experiment
 
 ```bash
 mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
@@ -398,30 +442,31 @@ mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
 
 ---
 
-## 3. Wait for Experiment Completion
+## 5. Wait for Completion
 
 The framework automatically:
 
-* cycles phases
+* cycles through phases
+* injects workloads
 * collects metrics
-* shuts down
+* shuts down at completion
 
 ---
 
-## 4. Plot Results
+## 6. Plot Results
 
-Use the Python plotting script to visualize:
+Use the plotting scripts to visualize:
 
 * TPS
 * latency
-* token usage
-* upgraded transactions
-* profit
 * backlog
+* consistency upgrades
+* throughput
+* token usage
 
 ---
 
-# Useful Places to Modify
+# Useful Configuration Locations
 
 ## Change Number of Servers
 
@@ -471,23 +516,24 @@ TOTAL_EXPERIMENT_DURATION_MS
 
 * Light load → eventual reads dominate
 * Heavy load → linearizable reads dominate
-* Measure latency + throughput
+* Measure latency vs throughput
 
 ---
 
-## Failure Recovery
+## Failure Recovery Experiment
 
 Enable timed leader failure:
 
-* observe re-election
-* measure TPS drop
+* observe leader re-election
+* measure TPS degradation
 * analyze recovery latency
 
 ---
 
-## Geo Distributed Experiment
+## Geo-Distributed Experiment
 
 Enable geo latency:
 
 * compare eventual vs linearizable performance
-* observe WAN latency amplification
+* study WAN latency amplification
+* analyze consistency costs under network delay
