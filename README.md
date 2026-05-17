@@ -1,31 +1,31 @@
-## Install Java 17
+# Install Java 17
 
-```bash id="7ehqgb"
+```bash
 sudo apt update
 sudo apt install openjdk-17-jdk maven -y
 ```
 
 ---
 
-## Verify Java + Maven
+# Verify Java + Maven
 
-```bash id="sgmbmw"
+```bash
 java -version
 mvn -v
 ```
 
 ---
 
-## Configure Java 17
+# Configure Java 17
 
-```bash id="l6tk3j"
+```bash
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export PATH=$JAVA_HOME/bin:$PATH
 ```
 
 Persist it:
 
-```bash id="w4jvs6"
+```bash
 echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> ~/.bashrc
 echo 'export PATH=$JAVA_HOME/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
@@ -33,17 +33,68 @@ source ~/.bashrc
 
 ---
 
-## Build the Project
+# Install Redis
 
-From the repository root:
-
-```bash id="n0u5rb"
-mvn clean install
+```bash
+sudo apt install redis-server -y
 ```
 
 ---
 
+# Start Redis Server
 
+```bash
+sudo systemctl start redis-server
+```
+
+Enable Redis on boot:
+
+```bash
+sudo systemctl enable redis-server
+```
+
+Verify Redis is running:
+
+```bash
+redis-cli ping
+```
+
+Expected output:
+
+```text
+PONG
+```
+
+---
+
+# Redis Configuration Used by the Project
+
+The token bucket implementation connects to Redis using:
+
+```text
+Host: 127.0.0.1
+Port: 6379
+```
+
+Make sure Redis is running on port `6379` before starting the experiment.
+
+You can verify using:
+
+```bash
+redis-cli -p 6379 ping
+```
+
+---
+
+# Build the Project
+
+From the repository root:
+
+```bash
+mvn clean install
+```
+
+---
 
 `Servers.java` is the main entry point for running the full distributed consistency experiment framework in [Tuneable-Consistency](https://github.com/MARTIANSID/Tuneable-Consistency?utm_source=chatgpt.com).
 
@@ -359,7 +410,7 @@ The framework automatically:
 
 ## 4. Plot Results
 
-Use the Python plotting script you wrote to visualize:
+Use the Python plotting script to visualize:
 
 * TPS
 * latency
@@ -440,4 +491,3 @@ Enable geo latency:
 
 * compare eventual vs linearizable performance
 * observe WAN latency amplification
-
