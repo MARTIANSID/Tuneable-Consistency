@@ -24,6 +24,7 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.example.Client.ClientMetricsTracker;
 import org.example.Client.ClientServerImpl;
+import org.example.Client.LatencyAwareRouter;
 import org.example.TokenBucket.TokenBucketImpl;
 import org.example.Utility.BatchProcessor;
 import org.example.Utility.ExperimentConfig;
@@ -246,6 +247,7 @@ public class Servers{
         ServerImpl.setPressureModeEnabled(PRESSURE_MODE_ENABLED);
         ServerImpl.setAdmissionControlEnabled(config.consistency.admissionControl);
         ClientMetricsTracker.configure(config);
+        LatencyAwareRouter.configure(config);
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
@@ -781,13 +783,26 @@ public class Servers{
         }
 
         TimeStampProto readAnchorTs = getLatestAckedTimestamp();
+        boolean latencyAware = LatencyAwareRouter.isEnabled();
         for (ReadClass readClass : readChoices) {
-            int targetServerId = selectReadTargetServerId(readClass, leaderId);
+            int applicationId = 1 + random.nextInt(3);
+            ReadClass chosenClass = readClass;
+            int targetServerId;
+            if (latencyAware) {
+                // The sampled class is the minimum requirement; the router may pick
+                // any node and any level >= it by expected profit vs the app deadline.
+                LatencyAwareRouter.Choice choice =
+                        LatencyAwareRouter.chooseRead(toRouterLevel(readClass), applicationId, leaderId);
+                chosenClass = fromRouterLevel(choice.level);
+                targetServerId = choice.nodeId;
+            } else {
+                targetServerId = selectReadTargetServerId(readClass, leaderId);
+            }
             ServerImpl targetServer = injector.getServerById(targetServerId);
             if (targetServer == null) {
                 continue;
             }
-            ClientMessage readMessage = generateReadTransaction(readAnchorTs, readClass);
+            ClientMessage readMessage = generateReadTransaction(readAnchorTs, chosenClass, applicationId);
             perServerBatch
                     .computeIfAbsent(targetServer, ignored -> new ArrayList<>())
                     .add(TransactionOption.fromClientMessage(readMessage));
@@ -869,7 +884,28 @@ public class Servers{
      * Generate a single read transaction with the given read concern distribution
      * and the timestamp of the last write (for causal ordering).
      */
-    private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs, ReadClass readClass) {
+    // ReadClass <-> router Level mapping (ReadClass declaration order differs
+    // from strength order, so an explicit switch on both sides).
+    private static LatencyAwareRouter.Level toRouterLevel(ReadClass readClass) {
+        return switch (readClass) {
+            case EVENTUAL -> LatencyAwareRouter.Level.EVENTUAL;
+            case CAUSAL_LOCAL -> LatencyAwareRouter.Level.CAUSAL_LOCAL;
+            case CAUSAL_MAJORITY -> LatencyAwareRouter.Level.CAUSAL_MAJORITY;
+            case LINEARIZABLE -> LatencyAwareRouter.Level.LINEARIZABLE;
+        };
+    }
+
+    private static ReadClass fromRouterLevel(LatencyAwareRouter.Level level) {
+        return switch (level) {
+            case EVENTUAL -> ReadClass.EVENTUAL;
+            case CAUSAL_LOCAL -> ReadClass.CAUSAL_LOCAL;
+            case CAUSAL_MAJORITY -> ReadClass.CAUSAL_MAJORITY;
+            case LINEARIZABLE -> ReadClass.LINEARIZABLE;
+        };
+    }
+
+    private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs, ReadClass readClass,
+            int applicationId) {
         String txId = UUID.randomUUID().toString();
         String accName = "user" + random.nextInt(100);
         long now = System.currentTimeMillis();
@@ -895,8 +931,6 @@ public class Servers{
                 readLevel = ReadLevel.LOCAL;
                 break;
         }
-
-        int applicationId = 1 + random.nextInt(3);
 
         // LINEARIZABLE reads must go through Raft with majority writeConcern
         int majority = (NUM_OF_SERVERS / 2) + 1;

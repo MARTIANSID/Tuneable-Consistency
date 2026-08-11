@@ -58,6 +58,12 @@
     "deadlinesMsByApp": { "1": 30, "2": 60, "3": 100 },
     "lostTimeoutMs": 10000
   },
+  "clientRouting": {
+    "mode": "PHASE_DISTRIBUTION",
+    "ewmaAlpha": 0.2,
+    "explorationRate": 0.05,
+    "baseWindowSize": 64
+  },
   "phases": [
     {
       "name": "Light",

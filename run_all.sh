@@ -52,7 +52,8 @@ if [[ "${1:-}" == "_experiment" ]]; then
     echo
 
     set +e
-    mvn -f "$REPO_DIR/pom.xml" exec:java -Dexec.mainClass="org.example.Server.Servers" \
+    mvn -f "$REPO_DIR/pom.xml" -Dbuild.dir=target-script exec:java \
+        -Dexec.mainClass="org.example.Server.Servers" \
         -Dexec.args="$CONFIG_PATH" 2>&1 | tee run.log
     RUN_EXIT=${PIPESTATUS[0]}
     set -e
@@ -122,8 +123,10 @@ else
 fi
 
 # --- Build (foreground: a build failure should stop everything, loudly) ---
+# Built into target-script/ (see pom build.dir property) so the IDE's
+# concurrent compilation into target/ can never corrupt what we run.
 echo "Building project..."
-mvn clean install
+mvn clean install -Dbuild.dir=target-script
 
 mkdir -p "$RUN_DIR"
 

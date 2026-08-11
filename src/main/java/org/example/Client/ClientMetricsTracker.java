@@ -171,6 +171,9 @@ public final class ClientMetricsTracker {
             }
             cell.latenciesMs.add(latency);
         }
+
+        // Feed the routing policy's estimator (no-op unless LATENCY_AWARE).
+        LatencyAwareRouter.onSample(p.nodeId, p.isRead, p.chosenLevel, executedLevel, latency);
     }
 
     // ------------------------------------------------------------------

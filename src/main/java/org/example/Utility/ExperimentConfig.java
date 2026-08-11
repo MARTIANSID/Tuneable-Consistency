@@ -39,6 +39,7 @@ public final class ExperimentConfig {
     public BatchProcessorTuning batchProcessor;
     public TokenBucket tokenBucket;
     public ClientMetrics clientMetrics;
+    public ClientRouting clientRouting;
     public List<PhaseConfig> phases;
 
     public static final class Cluster {
@@ -109,6 +110,13 @@ public final class ExperimentConfig {
     public static final class ClientMetrics {
         public Map<String, Integer> deadlinesMsByApp; // appId (as string) -> latency deadline in ms
         public Integer lostTimeoutMs;                 // no ACK within this -> scored as lost
+    }
+
+    public static final class ClientRouting {
+        public String mode;            // PHASE_DISTRIBUTION (sampled level, round-robin) or LATENCY_AWARE
+        public Double ewmaAlpha;       // smoothing for per-(node,level) latency deltas
+        public Double explorationRate; // epsilon-greedy random (node, level) picks
+        public Integer baseWindowSize; // sliding window of base (eventual) latencies per node
     }
 
     public static final class PhaseConfig {
@@ -307,6 +315,27 @@ public final class ExperimentConfig {
             requirePositive(e.getValue(), "clientMetrics.deadlinesMsByApp." + e.getKey());
         }
         requirePositive(clientMetrics.lostTimeoutMs, "clientMetrics.lostTimeoutMs");
+
+        require(clientRouting, "clientRouting");
+        require(clientRouting.mode, "clientRouting.mode");
+        if (!clientRouting.mode.equals("PHASE_DISTRIBUTION") && !clientRouting.mode.equals("LATENCY_AWARE")) {
+            throw new IllegalArgumentException("clientRouting.mode must be PHASE_DISTRIBUTION or LATENCY_AWARE, got '"
+                    + clientRouting.mode + "'");
+        }
+        requirePositive(clientRouting.ewmaAlpha, "clientRouting.ewmaAlpha");
+        if (clientRouting.ewmaAlpha > 1.0) {
+            throw new IllegalArgumentException("clientRouting.ewmaAlpha must be in (0, 1], got " + clientRouting.ewmaAlpha);
+        }
+        require(clientRouting.explorationRate, "clientRouting.explorationRate");
+        if (clientRouting.explorationRate < 0 || clientRouting.explorationRate >= 1) {
+            throw new IllegalArgumentException("clientRouting.explorationRate must be in [0, 1), got "
+                    + clientRouting.explorationRate);
+        }
+        requirePositive(clientRouting.baseWindowSize, "clientRouting.baseWindowSize");
+        if (clientRouting.baseWindowSize < 8) {
+            throw new IllegalArgumentException("clientRouting.baseWindowSize must be >= 8, got "
+                    + clientRouting.baseWindowSize);
+        }
 
         require(phases, "phases");
         if (phases.isEmpty()) {
