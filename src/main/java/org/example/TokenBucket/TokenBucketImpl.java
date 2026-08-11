@@ -13,13 +13,16 @@ public class TokenBucketImpl {
     private final String LAST_UPDATE_KEY;
     private final String CURRENT_TERM_KEY;
 
-    private static final double UNLIMITED_TOKENS = Double.MAX_VALUE; // for testing purposes, can be set to a very high value
-    private static final double UNLIMITED_REFILL_RATE = Double.MAX_VALUE; // for testing purposes, can be set to a very high value
-    // all these thing will be adjusted dynamically later on, right now it is made constant
+    // Bucket capacity and refill rate (from config; see ExperimentConfig.tokenBucket).
+    // Set both very high to effectively disable token limits.
+    private static volatile double MAX_TOKENS = 260000;
+    private static volatile double REFILL_RATE = 260000; // tokens per second
 
-    private static final boolean testing = false;
-    private static final double MAX_TOKENS =!testing ? 260000 : Double.MAX_VALUE;
-    private static final double REFILL_RATE = !testing ? 260000 : Double.MAX_VALUE; // tokens per second
+    /** Apply token bucket configuration. Must run before any TokenBucketImpl is constructed. */
+    public static void applyConfig(org.example.Utility.ExperimentConfig config) {
+        MAX_TOKENS = config.tokenBucket.maxTokens;
+        REFILL_RATE = config.tokenBucket.refillRatePerSecond;
+    }
 
     public TokenBucketImpl(String redisHost, int redisPort, int serverId) {
         // here first I connect to redis master

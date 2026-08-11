@@ -1,0 +1,94 @@
+{
+  "cluster": {
+    "numServers": 3,
+    "serverHosts": ["localhost", "localhost", "localhost"],
+    "serverBasePort": 8000,
+    "clientCallbackHost": "localhost",
+    "callbackPortRangeStart": 9000,
+    "callbackPortRangeEnd": 9100
+  },
+  "redis": {
+    "host": "127.0.0.1",
+    "port": 6379
+  },
+  "consistency": {
+    "upgradeTransactions": true,
+    "pressureMode": false
+  },
+  "nodeFailure": {
+    "enabled": false,
+    "failedNodeId": 0
+  },
+  "timedFailure": {
+    "enabled": false,
+    "targetRole": "FOLLOWER",
+    "afterSeconds": 40
+  },
+  "geo": {
+    "enabled": false,
+    "latencyMs": 50,
+    "includeClientCallbackLatency": false,
+    "scriptPath": "./simulate_geo_latency.sh",
+    "scriptTimeoutSeconds": 10,
+    "clearOnExit": true,
+    "useSudo": true
+  },
+  "experiment": {
+    "bufferSeconds": 20,
+    "runSinglePhase": false,
+    "singlePhaseIndex": 0,
+    "singlePhaseDurationSeconds": 60,
+    "injectionBatchSize": 1000
+  },
+  "serverTuning": {
+    "batchIntervalMs": 20,
+    "maxBatchSize": 20000,
+    "maxItemsPerCycle": 2000
+  },
+  "batchProcessor": {
+    "leaderMaxLatencyMs": 60.0,
+    "followerMaxLatencyMs": 50.0
+  },
+  "tokenBucket": {
+    "maxTokens": 260000,
+    "refillRatePerSecond": 260000
+  },
+  "phases": [
+    {
+      "name": "Light",
+      "durationSeconds": 70,
+      "totalTPS": 30000,
+      "readPercentage": 0.90,
+      "writePercentage": 0.10,
+      "readDistribution": { "EVENTUAL": 0.80, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
+      "writeDistribution": { "1": 0.80, "2": 0.20 }
+    },
+    {
+      "name": "Medium",
+      "durationSeconds": 60,
+      "totalTPS": 30000,
+      "readPercentage": 0.90,
+      "writePercentage": 0.10,
+      "readDistribution": { "EVENTUAL": 0.25, "CAUSAL_LOCAL": 0.25, "CAUSAL_MAJORITY": 0.25, "LINEARIZABLE": 0.25 },
+      "writeDistribution": { "1": 0.50, "2": 0.50 }
+    },
+    {
+      "name": "Heavy",
+      "durationSeconds": 60,
+      "totalTPS": 70000,
+      "readPercentage": 0.90,
+      "writePercentage": 0.10,
+      "readDistribution": { "EVENTUAL": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.10, "LINEARIZABLE": 0.70 },
+      "writeDistribution": { "1": 0.20, "2": 0.80 }
+    },
+    {
+      "name": "Recovery",
+      "durationSeconds": 60,
+      "totalTPS": 30000,
+      "readPercentage": 0.90,
+      "writePercentage": 0.10,
+      "readDistribution": { "EVENTUAL": 0.80, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
+      "writeDistribution": { "1": 0.80, "2": 0.20 }
+    }
+  ]
+}

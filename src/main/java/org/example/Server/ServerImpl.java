@@ -172,10 +172,27 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final Object incomingTransactionLock;
     private AtomicLong lastPrintTime;
 
-    // all the parameters for knapsack
-    private static final int BATCH_INTERVAL_MS = 20;
+    // Batch processing parameters (from config; see ExperimentConfig.serverTuning)
+    private static volatile int BATCH_INTERVAL_MS = 20;
     private static final int PROCESS_BATCH_TIME_BUDGET_MS = 15;
-    private static final int MAX_ITEMS_PER_CYCLE = 2000;
+    private static volatile int MAX_ITEMS_PER_CYCLE = 2000;
+
+    // Cluster/Redis wiring (from config; see ExperimentConfig.cluster/redis)
+    private static volatile String REDIS_HOST = "127.0.0.1";
+    private static volatile int REDIS_PORT = 6379;
+    private static volatile java.util.List<String> SERVER_HOSTS = java.util.List.of("localhost", "localhost", "localhost");
+    private static volatile int SERVER_BASE_PORT = 8000;
+
+    /** Apply cluster, redis, and tuning configuration. Must run before any ServerImpl is constructed. */
+    public static void applyConfig(org.example.Utility.ExperimentConfig config) {
+        BATCH_INTERVAL_MS = config.serverTuning.batchIntervalMs;
+        MAX_ITEMS_PER_CYCLE = config.serverTuning.maxItemsPerCycle;
+        MAX_BATCH_SIZE = config.serverTuning.maxBatchSize;
+        REDIS_HOST = config.redis.host;
+        REDIS_PORT = config.redis.port;
+        SERVER_HOSTS = List.copyOf(config.cluster.serverHosts);
+        SERVER_BASE_PORT = config.cluster.serverBasePort;
+    }
     private static final double BACKLOG_DRAIN_RATIO = 1.0;
     private static final int ACK_FUTURE_TIMEOUT_MS = 300;
 
@@ -319,7 +336,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.ackUpdateLock = new Object();
         this.peerData = new Object();
         this.redisLock = new ReentrantReadWriteLock();
-        this.tokenBucket = new TokenBucketImpl("127.0.0.1", 6379, serverId);
+        this.tokenBucket = new TokenBucketImpl(REDIS_HOST, REDIS_PORT, serverId);
         this.batchOfTransactions = new LinkedList<>();
         this.writeConcernCosts = new ConcurrentHashMap<>();
         // only one thread is required because I run a periodic batch job every 20ms
@@ -406,7 +423,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             // setting up the stubs
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 8000 + (i + 1)).enableRetry()
+                ManagedChannel channel = ManagedChannelBuilder
+                        .forAddress(SERVER_HOSTS.get(i), SERVER_BASE_PORT + (i + 1)).enableRetry()
                         .usePlaintext().build();
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
@@ -1589,7 +1607,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private static final int MAX_BATCH_SIZE = 20000;
+    private static volatile int MAX_BATCH_SIZE = 20000;
 
     private static final double TOKEN_COST_WRITE = 17.33;
     private static final double TOKEN_COST_READ_EVENTUAL = 1.0;

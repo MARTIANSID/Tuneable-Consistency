@@ -7,6 +7,7 @@ import java.io.InputStreamReader;
 import java.io.BufferedReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -22,6 +23,9 @@ import java.util.concurrent.TimeUnit;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.example.Client.ClientServerImpl;
+import org.example.TokenBucket.TokenBucketImpl;
+import org.example.Utility.BatchProcessor;
+import org.example.Utility.ExperimentConfig;
 import org.ds.paxos.ClientMessage;
 import org.ds.paxos.ReadConcern;
 import org.ds.paxos.ReadLevel;
@@ -31,35 +35,29 @@ import org.example.Utility.TransactionOption;
 
 public class Servers{
 
-    // set the number of servers from here
-    public static final int NUM_OF_SERVERS = 3;
+    // ===== Configuration =====
+    // All values below are loaded from the JSON config file at startup
+    // (see ExperimentConfig). Field names keep their historical constant-style
+    // names because they are referenced throughout this class.
+    public static int NUM_OF_SERVERS;
 
     // Toggle transaction upgrading (token-bucket based consistency tuning).
-    // false => execute batch at original consistency, no upgrades/deferrals.
-    private static final boolean UPGRADE_TRANSACTIONS = true;
+    private static boolean UPGRADE_TRANSACTIONS;
     // Toggle pressure mode in BatchProcessor flow.
-    // true => direct admission + pressure-aware processing/deferral path.
-    // false => keep current no-pressure flow (base token prepay at admission + upgrade differential later).
-    private static final boolean PRESSURE_MODE_ENABLED = false;
+    private static boolean PRESSURE_MODE_ENABLED;
 
     // Simulate node failure by dropping all inter-server network RPCs on one node.
-    // Set ENABLE_NODE_NETWORK_FAILURE=true and choose FAILED_NODE_ID.
-    private static final boolean ENABLE_NODE_NETWORK_FAILURE = false;
-    private static final int FAILED_NODE_ID = 0;
+    private static boolean ENABLE_NODE_NETWORK_FAILURE;
+    private static int FAILED_NODE_ID;
 
-    // Geo latency control from Java: if enabled, this class invokes simulate_geo_latency.sh
-    // using runtime values including the selected callback port.
-    private static final boolean ENABLE_GEO_SETTINGS = false;
-    private static final int GEO_LATENCY_MS = 50;
-    private static final int GEO_NUM_SERVERS = NUM_OF_SERVERS;
-    // true => also delay client callback/ack port; false => delay only server ports (8001..)
-    private static final boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = false;
-    private static final String GEO_SCRIPT_PATH = "./simulate_geo_latency.sh";
-    private static final int GEO_SCRIPT_TIMEOUT_SECONDS = 10;
-    private static final boolean CLEAR_GEO_SETTINGS_ON_EXIT = true;
-    // When true, run the geo script with "sudo -n" (no password prompt).
-    // Configure sudoers accordingly if passwordless sudo is required.
-    private static final boolean USE_SUDO_FOR_GEO_SCRIPT = true;
+    // Geo latency control (Linux tc/netem via simulate_geo_latency.sh).
+    private static boolean ENABLE_GEO_SETTINGS;
+    private static int GEO_LATENCY_MS;
+    private static boolean GEO_INCLUDE_CLIENT_CALLBACK_LATENCY;
+    private static String GEO_SCRIPT_PATH;
+    private static int GEO_SCRIPT_TIMEOUT_SECONDS;
+    private static boolean CLEAR_GEO_SETTINGS_ON_EXIT;
+    private static boolean USE_SUDO_FOR_GEO_SCRIPT;
 
     enum FailureTargetRole {
         LEADER,
@@ -67,11 +65,15 @@ public class Servers{
     }
 
     // Timed failure: fail one node N seconds after experiment start.
-    // Target can be LEADER or FOLLOWER at trigger time.
-    private static final boolean ENABLE_TIMED_NODE_FAILURE = false;
-    private static final FailureTargetRole FAILURE_TARGET_ROLE = FailureTargetRole.FOLLOWER;
-    private static final int FAILURE_AFTER_SECONDS = 40;
-    
+    private static boolean ENABLE_TIMED_NODE_FAILURE;
+    private static FailureTargetRole FAILURE_TARGET_ROLE;
+    private static int FAILURE_AFTER_SECONDS;
+
+    private static int SERVER_BASE_PORT;
+    private static String CLIENT_CALLBACK_HOST;
+    private static int CALLBACK_PORT_RANGE_START;
+    private static int CALLBACK_PORT_RANGE_END;
+
     // Static reference to TransactionInjector for testing
     public static TransactionInjector injector;
     // Tracks latest committed timestamp from ACKs sent by servers to client callback
@@ -85,12 +87,6 @@ public class Servers{
         CAUSAL_LOCAL,
         CAUSAL_MAJORITY,
         EVENTUAL
-    }
-
-    enum WorkloadProfile {
-        LIGHT,
-        MEDIUM,
-        HEAVY
     }
 
     static class Phase {
@@ -120,92 +116,33 @@ public class Servers{
     }
 
     private static final List<Phase> PHASES = new ArrayList<>();
-    static {
-        int majorityLevel = (NUM_OF_SERVERS / 2) + 1;
 
-        // Experiment 1: tunability under changing load
-        // Fixed R/W mix across all phases: 90% reads, 10% writes
-        // Sequence: Light -> Medium -> Heavy -> Light
-        Map<ReadClass, Double> lightReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.80,
-                ReadClass.CAUSAL_LOCAL, 0.10,
-                ReadClass.CAUSAL_MAJORITY, 0.05,
-                ReadClass.LINEARIZABLE, 0.05
-        );
-        Map<Integer, Double> lightWriteDist = Map.of(1, 0.80, 2, 0.20);
-
-        Map<ReadClass, Double> mediumReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.25,
-                ReadClass.CAUSAL_LOCAL, 0.25,
-                ReadClass.CAUSAL_MAJORITY, 0.25,
-                ReadClass.LINEARIZABLE, 0.25
-        );
-
-        Map<Integer, Double> mediumWriteDist = Map.of(1, 0.50, 2,0.50);
-
-        Map<ReadClass, Double> heavyReadDist = Map.of(
-                ReadClass.EVENTUAL, 0.10,
-                ReadClass.CAUSAL_LOCAL, 0.10,
-                ReadClass.CAUSAL_MAJORITY, 0.10,
-                ReadClass.LINEARIZABLE, 0.70
-        );
-
-        Map<Integer, Double> heavyWriteDist = Map.of(1, 0.20, 2, 0.80);
-
-        Map<Integer, Double> allMajority = Map.of(1, 0.0, 2, 1.0);
-
-        
-        Map<ReadClass, Double> allLinearizable = Map.of(
-                ReadClass.EVENTUAL, 0.0,
-                ReadClass.CAUSAL_LOCAL, 0.0,
-                ReadClass.CAUSAL_MAJORITY, 0.0,
-                ReadClass.LINEARIZABLE, 1.0
-        );
-
-        List<ReadClass> readLevelsLowToHigh = List.of(
-            ReadClass.EVENTUAL,
-            ReadClass.CAUSAL_LOCAL,
-            ReadClass.CAUSAL_MAJORITY,
-            ReadClass.LINEARIZABLE
-        );
-        List<Integer> writeLevelsLowToHigh = new ArrayList<>();
-        for (int wc = 1; wc <= majorityLevel; wc++) {
-            writeLevelsLowToHigh.add(wc);
-        }
-
-        double writeTailShare = getLightNonDominantShare(writeLevelsLowToHigh.size());
-        PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
-        PHASES.add(new Phase("Light", 60 ,70000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
-
-        PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-    }
-
-    // Phase execution mode
+    // Phase execution mode (from config)
     // true: run only one selected phase for the whole experiment
     // false: cycle through all phases sequentially
-    private static final boolean RUN_SINGLE_PHASE = false;
+    private static boolean RUN_SINGLE_PHASE;
     // 0-based phase index used when RUN_SINGLE_PHASE=true
-    private static final int SINGLE_PHASE_INDEX = 0;
-    
+    private static int SINGLE_PHASE_INDEX;
+
     // Track current phase index for sequential execution
     private static final AtomicInteger currentPhaseIndex = new AtomicInteger(0);
 
-    private static final int BATCH_SIZE = 1000;  // Transactions per batch (increased to reduce gRPC overhead)
+    private static int BATCH_SIZE;  // Transactions per injected batch (from config)
     private static final Random random = new Random();
 
     // Read transaction configuration is phase-driven via system-wide phase distributions.
     // Track last write timestamp for causal/linearizable reads
     private static volatile TimeStampProto lastWriteTimestamp = TimeStampProto.newBuilder()
             .setP(System.currentTimeMillis()).setL(0).build();
-    
-    // Experiment parameters
-    private static final long TOTAL_EXPERIMENT_DURATION_MS = 270000;  // 240 seconds total
+
+    // Experiment hard deadline: phase-duration sum (or single-phase duration)
+    // plus experiment.bufferSeconds, computed in applyConfig.
+    private static long TOTAL_EXPERIMENT_DURATION_MS;
     private static volatile long experimentStartTime;
     private static volatile boolean experimentRunning = true;
-    
-    // Current phase parameters (volatile for thread-safe reads)
-    private static volatile Phase currentPhase = PHASES.get(0);  // Start with Light (sequential phases override this)
+
+    // Current phase parameters (volatile for thread-safe reads; set once phases are loaded)
+    private static volatile Phase currentPhase = null;
     private static volatile long phaseEndTime = 0;
     private static final Object phaseLock = new Object();
     
@@ -216,7 +153,90 @@ public class Servers{
     private static final AtomicInteger anyServerReadCursor = new AtomicInteger(0);
     private static final AtomicInteger followerReadCursor = new AtomicInteger(0);
 
+    /**
+     * Apply the loaded configuration to this class: toggles, ports, phases,
+     * and the derived experiment deadline. Fails fast on invalid phase
+     * distribution keys (valid ones: ReadClass names / write concerns 1..majority).
+     */
+    static void applyConfig(ExperimentConfig config) {
+        NUM_OF_SERVERS = config.cluster.numServers;
+        SERVER_BASE_PORT = config.cluster.serverBasePort;
+        CLIENT_CALLBACK_HOST = config.cluster.clientCallbackHost;
+        CALLBACK_PORT_RANGE_START = config.cluster.callbackPortRangeStart;
+        CALLBACK_PORT_RANGE_END = config.cluster.callbackPortRangeEnd;
+
+        UPGRADE_TRANSACTIONS = config.consistency.upgradeTransactions;
+        PRESSURE_MODE_ENABLED = config.consistency.pressureMode;
+
+        ENABLE_NODE_NETWORK_FAILURE = config.nodeFailure.enabled;
+        FAILED_NODE_ID = config.nodeFailure.failedNodeId;
+
+        ENABLE_TIMED_NODE_FAILURE = config.timedFailure.enabled;
+        FAILURE_TARGET_ROLE = FailureTargetRole.valueOf(config.timedFailure.targetRole);
+        FAILURE_AFTER_SECONDS = config.timedFailure.afterSeconds;
+
+        ENABLE_GEO_SETTINGS = config.geo.enabled;
+        GEO_LATENCY_MS = config.geo.latencyMs;
+        GEO_INCLUDE_CLIENT_CALLBACK_LATENCY = config.geo.includeClientCallbackLatency;
+        GEO_SCRIPT_PATH = config.geo.scriptPath;
+        GEO_SCRIPT_TIMEOUT_SECONDS = config.geo.scriptTimeoutSeconds;
+        CLEAR_GEO_SETTINGS_ON_EXIT = config.geo.clearOnExit;
+        USE_SUDO_FOR_GEO_SCRIPT = config.geo.useSudo;
+
+        RUN_SINGLE_PHASE = config.experiment.runSinglePhase;
+        SINGLE_PHASE_INDEX = config.experiment.singlePhaseIndex;
+        BATCH_SIZE = config.experiment.injectionBatchSize;
+
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        PHASES.clear();
+        for (int i = 0; i < config.phases.size(); i++) {
+            ExperimentConfig.PhaseConfig p = config.phases.get(i);
+            Map<ReadClass, Double> readDist = new HashMap<>();
+            for (Map.Entry<String, Double> e : p.readDistribution.entrySet()) {
+                try {
+                    readDist.put(ReadClass.valueOf(e.getKey()), e.getValue());
+                } catch (IllegalArgumentException ex) {
+                    throw new IllegalArgumentException("phases[" + i + "].readDistribution has unknown read class '"
+                            + e.getKey() + "'. Valid: EVENTUAL, CAUSAL_LOCAL, CAUSAL_MAJORITY, LINEARIZABLE");
+                }
+            }
+            Map<Integer, Double> writeDist = new HashMap<>();
+            for (Map.Entry<String, Double> e : p.writeDistribution.entrySet()) {
+                int wc;
+                try {
+                    wc = Integer.parseInt(e.getKey());
+                } catch (NumberFormatException ex) {
+                    throw new IllegalArgumentException("phases[" + i + "].writeDistribution key '" + e.getKey()
+                            + "' is not an integer write concern");
+                }
+                if (wc < 1 || wc > majority) {
+                    throw new IllegalArgumentException("phases[" + i + "].writeDistribution write concern " + wc
+                            + " is out of range [1, " + majority + "] for " + NUM_OF_SERVERS + " servers");
+                }
+                writeDist.put(wc, e.getValue());
+            }
+            PHASES.add(new Phase(p.name, p.durationSeconds, p.totalTPS,
+                    p.readPercentage, p.writePercentage, readDist, writeDist));
+        }
+        currentPhase = PHASES.get(0);
+
+        long activeSeconds = RUN_SINGLE_PHASE
+                ? config.experiment.singlePhaseDurationSeconds
+                : PHASES.stream().mapToLong(p -> p.durationSeconds).sum();
+        TOTAL_EXPERIMENT_DURATION_MS = (activeSeconds + config.experiment.bufferSeconds) * 1000L;
+    }
+
     public static void main(String[] args) throws IOException{
+        // Load configuration (path from args[0], default ./config.json) and
+        // apply it everywhere before any server object is constructed.
+        Path configPath = Path.of(args.length > 0 ? args[0] : "config.json");
+        ExperimentConfig config = ExperimentConfig.load(configPath);
+        applyConfig(config);
+        ServerImpl.applyConfig(config);
+        BatchProcessor.applyConfig(config);
+        TokenBucketImpl.applyConfig(config);
+        System.out.println("Loaded config from " + configPath.toAbsolutePath());
+
         // Clear all CSV files at startup
         clearCSVFiles();
 
@@ -226,8 +246,8 @@ public class Servers{
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
-        clientCallbackPort = findAvailablePort(9000, 9100);
-        
+        clientCallbackPort = findAvailablePort(CALLBACK_PORT_RANGE_START, CALLBACK_PORT_RANGE_END);
+
         clientCallbackServer = ServerBuilder.forPort(clientCallbackPort)
             .addService(clientServerImpl)
             .build()
@@ -235,11 +255,11 @@ public class Servers{
         System.out.println("Client callback server started on port " + clientCallbackPort);
 
         applyGeoSettingsIfEnabled(clientCallbackPort);
-        
+
         List<Server> servers = new ArrayList<>();
         List<ServerImpl> serversImpl = new ArrayList<>();
         for (int i = 1; i <= NUM_OF_SERVERS; i++) {
-            int port = 8000 + i; // Ports 8000 to 8004
+            int port = SERVER_BASE_PORT + i;
             ServerImpl serverImpl = new ServerImpl(i - 1, NUM_OF_SERVERS);
             Server server = ServerBuilder.forPort(port)
                     .addService(serverImpl)
@@ -283,7 +303,7 @@ public class Servers{
             return;
         }
 
-        runGeoScript("apply", GEO_LATENCY_MS, GEO_NUM_SERVERS, callbackPort);
+        runGeoScript("apply", GEO_LATENCY_MS, NUM_OF_SERVERS, callbackPort);
 
         if (CLEAR_GEO_SETTINGS_ON_EXIT) {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -827,7 +847,7 @@ public class Servers{
                 .setT(transaction)
                 .setWriteConcern(minConsistency)
                 .setTimeStamp(ts)
-                .setCallbackHost("localhost")
+                .setCallbackHost(CLIENT_CALLBACK_HOST)
                 .setCallbackPort(clientCallbackPort)
                 .build();
     }
@@ -886,7 +906,7 @@ public class Servers{
                 .setT(transaction)
                 .setWriteConcern(writeConcern)
                 .setTimeStamp(lastWriteTs)
-                .setCallbackHost("localhost")
+                .setCallbackHost(CLIENT_CALLBACK_HOST)
                 .setCallbackPort(clientCallbackPort)
                 .build();
     }
@@ -977,14 +997,6 @@ public class Servers{
             return new ArrayList<>(result.subList(0, total));
         }
         return result;
-    }
-
-    private static double getLightNonDominantShare(int levelCount) {
-        if (levelCount <= 1) {
-            return 0.0;
-        }
-        // For larger clusters, shrink non-dominant shares so low consistency stays dominant.
-        return Math.min(0.10, 0.20 / (levelCount - 1));
     }
 
     private static int findLeaderId(ServerImpl leader) {

@@ -20,7 +20,10 @@
 # this script - it requires Linux tc/netem and ENABLE_GEO_SETTINGS is off anyway.
 #
 # Usage:
-#   ./run_all.sh [label]        e.g. ./run_all.sh upgrades-on
+#   ./run_all.sh [label] [config.json]     e.g. ./run_all.sh upgrades-on
+#                                               ./run_all.sh pressure my-config.json
+# The config file (default: repo config.json) is passed to the experiment and
+# archived alongside the results for provenance.
 #
 set -euo pipefail
 
@@ -37,14 +40,20 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 if [[ "${1:-}" == "_experiment" ]]; then
     LABEL="$2"
+    CONFIG_PATH="$3"
     RUN_DIR="$(pwd)"
+
+    # Archive the exact config used before the run, for provenance.
+    cp "$CONFIG_PATH" config.json
 
     echo "=== Experiment starting (label: $LABEL) ==="
     echo "=== Working directory: $RUN_DIR ==="
+    echo "=== Config: $CONFIG_PATH ==="
     echo
 
     set +e
-    mvn -f "$REPO_DIR/pom.xml" exec:java -Dexec.mainClass="org.example.Server.Servers" 2>&1 | tee run.log
+    mvn -f "$REPO_DIR/pom.xml" exec:java -Dexec.mainClass="org.example.Server.Servers" \
+        -Dexec.args="$CONFIG_PATH" 2>&1 | tee run.log
     RUN_EXIT=${PIPESTATUS[0]}
     set -e
 
@@ -61,13 +70,7 @@ if [[ "${1:-}" == "_experiment" ]]; then
         echo "git revision: $(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
         echo "git status:   $(git -C "$REPO_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ') modified/untracked files"
         echo "java:         $(java -version 2>&1 | head -1)"
-        echo
-        echo "--- key constants at time of run ---"
-        grep -E "NUM_OF_SERVERS|UPGRADE_TRANSACTIONS =|PRESSURE_MODE_ENABLED =|ENABLE_NODE_NETWORK_FAILURE =|ENABLE_TIMED_NODE_FAILURE =|ENABLE_GEO_SETTINGS =|TOTAL_EXPERIMENT_DURATION_MS|BATCH_SIZE =" \
-            "$REPO_DIR/src/main/java/org/example/Server/Servers.java" | sed 's/^ *//'
-        echo
-        echo "--- active phases ---"
-        grep -E "^\s*PHASES\.add" "$REPO_DIR/src/main/java/org/example/Server/Servers.java" | sed 's/^ *//'
+        echo "config:       $CONFIG_PATH (archived as config.json in this directory)"
     } > run_info.txt
 
     if [[ $RUN_EXIT -eq 0 ]]; then
@@ -89,6 +92,9 @@ fi
 # ---------------------------------------------------------------------------
 LABEL="${1:-run}"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label must match [A-Za-z0-9._-]+, got: $LABEL"
+CONFIG_PATH="${2:-$REPO_DIR/config.json}"
+CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found: ${2:-$REPO_DIR/config.json}"
+[[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
 STAMP="$(date '+%Y%m%d_%H%M%S')"
 RUN_DIR="$REPO_DIR/runs/${LABEL}_${STAMP}"
 cd "$REPO_DIR"
@@ -135,10 +141,10 @@ if [[ $REDIS_STARTED_BY_US -eq 1 ]]; then
     done
     echo "Redis started inside tmux (dies with the session)."
     tmux new-window -t "$SESSION" -n experiment -c "$RUN_DIR" \
-        "'$SCRIPT_PATH' _experiment '$LABEL'"
+        "'$SCRIPT_PATH' _experiment '$LABEL' '$CONFIG_PATH'"
 else
     tmux new-session -d -s "$SESSION" -n experiment -c "$RUN_DIR" \
-        "'$SCRIPT_PATH' _experiment '$LABEL'"
+        "'$SCRIPT_PATH' _experiment '$LABEL' '$CONFIG_PATH'"
 fi
 
 # Live metrics: file appears once the leader starts writing; tail -F waits for it.

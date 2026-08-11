@@ -26,10 +26,16 @@ public class BatchProcessor {
     private static volatile long systemStartTime = 0;
 
     // ========== TPS Constants (Heuristic) ==========
-    private static final double MIN_TPS = 30000.0;      // Minimum TPS to maintain
-    private static final double UPGRADE_THRESHOLD = 1.15;  // Need 15% headroom to start upgrading
-    private static final double UPGRADE_FLOOR = 1.10;      // Stop upgrading at 10% above minTPS
-    private static final double MIN_TPS_OF_MAJORITY = 10500.0; // Minimum TPS expected from majority writes
+    // Avg-latency caps for the execute/upgrade decision (from config; see
+    // ExperimentConfig.batchProcessor). Applied per batch depending on role.
+    private static volatile double LEADER_MAX_LATENCY_MS = 60.0;
+    private static volatile double FOLLOWER_MAX_LATENCY_MS = 50.0;
+
+    /** Apply tuning configuration. Must run before batch processing starts. */
+    public static void applyConfig(ExperimentConfig config) {
+        LEADER_MAX_LATENCY_MS = config.batchProcessor.leaderMaxLatencyMs;
+        FOLLOWER_MAX_LATENCY_MS = config.batchProcessor.followerMaxLatencyMs;
+    }
 
 
     public BatchProcessor(int numOfServers) {
@@ -371,7 +377,7 @@ public class BatchProcessor {
     // In no-pressure mode, base token cost is assumed to be already paid.
     double totalTokenCost = calculateTotalTokenCost(batch, assignments);
     boolean skipBaseTokenGate = !pressureModeEnabled;
-    MAX_LATENCY = isLeader ?  60 : 50;
+    MAX_LATENCY = isLeader ? LEADER_MAX_LATENCY_MS : FOLLOWER_MAX_LATENCY_MS;
     if (avgLatency <= MAX_LATENCY && (skipBaseTokenGate || totalTokenCost <= currentTokens)) {
 
         for (int i = 0; i < n; i++) {
