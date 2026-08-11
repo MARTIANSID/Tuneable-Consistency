@@ -120,7 +120,7 @@ public final class ClientMetricsTracker {
 
     /** Record a transaction refused at the admission gate (never enqueued). */
     public static void recordRejected(TransactionOption tx, int nodeId) {
-        Cell cell = cell(nodeId, chosenLevelLabel(tx));
+        Cell cell = cell(nodeId, chosenLevelLabel(tx), NOT_EXECUTED);
         synchronized (cell) {
             cell.rejected++;
         }
@@ -145,7 +145,7 @@ public final class ClientMetricsTracker {
         }
 
         if (ack.getFailure()) {
-            Cell cell = cell(p.nodeId, p.chosenLevel);
+            Cell cell = cell(p.nodeId, p.chosenLevel, NOT_EXECUTED);
             synchronized (cell) {
                 cell.lost++;
             }
@@ -161,7 +161,7 @@ public final class ClientMetricsTracker {
         }
         boolean hit = latency <= deadline;
 
-        Cell cell = cell(p.nodeId, executedLevel);
+        Cell cell = cell(p.nodeId, p.chosenLevel, executedLevel);
         synchronized (cell) {
             if (hit) {
                 cell.hits++;
@@ -177,8 +177,11 @@ public final class ClientMetricsTracker {
     // Internals
     // ------------------------------------------------------------------
 
-    private static Cell cell(int nodeId, String level) {
-        return interval.get().computeIfAbsent(nodeId + "," + level, k -> new Cell());
+    /** ExecutedLevel value for requests that never executed (rejected/lost). */
+    private static final String NOT_EXECUTED = "-";
+
+    private static Cell cell(int nodeId, String chosenLevel, String executedLevel) {
+        return interval.get().computeIfAbsent(nodeId + "," + chosenLevel + "," + executedLevel, k -> new Cell());
     }
 
     static String chosenLevelLabel(TransactionOption tx) {
@@ -241,7 +244,7 @@ public final class ClientMetricsTracker {
                 Pending p = it.next().getValue();
                 if (now - p.sendTimeMs >= lostTimeoutMs) {
                     it.remove();
-                    Cell cell = cell(p.nodeId, p.chosenLevel);
+                    Cell cell = cell(p.nodeId, p.chosenLevel, NOT_EXECUTED);
                     synchronized (cell) {
                         cell.lost++;
                     }
@@ -258,7 +261,7 @@ public final class ClientMetricsTracker {
             boolean writeHeader = !file.exists() || file.length() == 0;
             try (FileWriter fw = new FileWriter(CSV_PATH, true); PrintWriter out = new PrintWriter(fw)) {
                 if (writeHeader) {
-                    out.println("Timestamp,Node,Level,Hits,Misses,Rejected,Lost,Profit,MeanLatencyMs,P99LatencyMs");
+                    out.println("Timestamp,Node,ChosenLevel,ExecutedLevel,Hits,Misses,Rejected,Lost,Profit,MeanLatencyMs,P99LatencyMs");
                 }
                 for (Map.Entry<String, Cell> e : cells.entrySet()) {
                     Cell c = e.getValue();
