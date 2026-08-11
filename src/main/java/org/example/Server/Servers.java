@@ -18,12 +18,10 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import org.example.Client.ClientServerImpl;
-import org.ds.paxos.Ack;
 import org.ds.paxos.ClientMessage;
 import org.ds.paxos.ReadConcern;
 import org.ds.paxos.ReadLevel;
@@ -175,45 +173,12 @@ public class Servers{
             writeLevelsLowToHigh.add(wc);
         }
 
-        // Map<ReadClass, Double> lightReadDist = buildConsistencyDistribution(
-        //     readLevelsLowToHigh,
-        //     WorkloadProfile.LIGHT,
-        //     0.10);
-        // Map<ReadClass, Double> mediumReadDist = buildConsistencyDistribution(
-        //     readLevelsLowToHigh,
-        //     WorkloadProfile.MEDIUM,
-        //     0.10);
-        // Map<ReadClass, Double> heavyReadDist = buildConsistencyDistribution(
-        //     readLevelsLowToHigh,
-        //     WorkloadProfile.HEAVY,
-        //     0.10);
-
         double writeTailShare = getLightNonDominantShare(writeLevelsLowToHigh.size());
-        // Map<Integer, Double> lightWriteDist = buildConsistencyDistribution(
-        //     writeLevelsLowToHigh,
-        //     WorkloadProfile.LIGHT,
-        //     writeTailShare);
-
         PHASES.add(new Phase("Light", 70, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 30, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-
-        // PHASES.add(new Phase("Light", 60, 30000, 0.50, 0.50, lightReadDist, lightWriteDist));
-
-        // PHASES.add(new Phase("Light", 60, 50000, 0.10, 0.90, lightReadDist, lightWriteDist));
-
-        // PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
         PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, mediumReadDist, mediumWriteDist));
-        // // PHASES.add(new Phase("Light", 5, 210000, 0.90, 0.10, lightReadDist, lightWriteDist));
         PHASES.add(new Phase("Light", 60 ,70000, 0.90, 0.10, heavyReadDist, heavyWriteDist));
 
         PHASES.add(new Phase("Light", 60, 30000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 40, 40000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Medium", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Heavy", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
-        // PHASES.add(new Phase("Light", 60, 10000, 0.90, 0.10, lightReadDist, lightWriteDist));
     }
 
     // Phase execution mode
@@ -267,7 +232,6 @@ public class Servers{
             .addService(clientServerImpl)
             .build()
             .start();
-        clientServerImpl.setUpStubs();
         System.out.println("Client callback server started on port " + clientCallbackPort);
 
         applyGeoSettingsIfEnabled(clientCallbackPort);
@@ -670,68 +634,7 @@ public class Servers{
         System.out.printf("   Write Distribution: %s%n", newPhase.writeDistribution);
         System.out.println("========================================");
     }
-    
-    /**
-     * Robust batch injection - tries multiple servers if needed
-     */
-    private static boolean injectBatchRobust(List<ClientMessage> batch) {
-        // Convert ClientMessage list to TransactionOption list
-        List<TransactionOption> transactionOptions = batch.stream()
-                .map(TransactionOption::fromClientMessage)
-                .collect(Collectors.toList());
 
-        int dropped = 0;
-        
-        // First try: current leader
-        ServerImpl leader = injector.getLeader();
-        if (leader != null) {
-            int accepted = leader.enqueueWithoutDroppingExisting(transactionOptions);
-            dropped = Math.max(0, transactionOptions.size() - accepted);
-            if (accepted > 0) {
-                trackIncomingTransactions(accepted);
-                if (dropped > 0) {
-                    System.out.printf("⚠️ Rejected %d new transactions at leader enqueue (queue full)%n", dropped);
-                }
-                return true;
-            }
-        }
-
-        // Second try: followers can take only follower-safe reads.
-        List<TransactionOption> followerSafeReads = transactionOptions.stream()
-                .filter(tx -> tx != null
-                        && tx.clientMessage != null
-                        && tx.clientMessage.hasT()
-                        && tx.clientMessage.getT().getIsReadOnly()
-                        && tx.clientMessage.getT().getReadConcern() != ReadConcern.LINEARIZABLE)
-                .collect(Collectors.toList());
-
-        if (!followerSafeReads.isEmpty()) {
-            for (int i = 0; i < NUM_OF_SERVERS; i++) {
-                ServerImpl server = injector.getServerById(i);
-                if (server == null || server == leader) {
-                    continue;
-                }
-
-                int accepted = server.enqueueWithoutDroppingExisting(followerSafeReads);
-                if (accepted > 0) {
-                    trackIncomingTransactions(accepted);
-                    int remainingDropped = Math.max(0, transactionOptions.size() - accepted);
-                    if (remainingDropped > 0) {
-                        System.out.printf(
-                                "⚠️ Rejected %d transactions (writes/linearizable require leader or queue full)%n",
-                                remainingDropped);
-                    }
-                    return true;
-                }
-            }
-        }
-
-        if (dropped > 0) {
-            System.out.printf("⚠️ Rejected %d new transactions (all candidate queues full)%n", dropped);
-        }
-    
-        return false;
-    }
     
     /**
      * Tracks incoming transactions and logs the rate to CSV
@@ -1076,56 +979,6 @@ public class Servers{
         return result;
     }
 
-    private static <T> Map<T, Double> buildConsistencyDistribution(List<T> levelsLowToHigh,
-                                                                    WorkloadProfile profile,
-                                                                    double nonExtremesShare) {
-        Map<T, Double> distribution = new HashMap<>();
-        if (levelsLowToHigh == null || levelsLowToHigh.isEmpty()) {
-            return distribution;
-        }
-
-        int n = levelsLowToHigh.size();
-        if (profile == WorkloadProfile.MEDIUM) {
-            double equalShare = 1.0 / n;
-            for (T level : levelsLowToHigh) {
-                distribution.put(level, equalShare);
-            }
-            return distribution;
-        }
-
-        if (n == 1) {
-            distribution.put(levelsLowToHigh.get(0), 1.0);
-            return distribution;
-        }
-
-        double perNonExtreme = Math.max(0.0, nonExtremesShare);
-        if ((n - 1) * perNonExtreme > 1.0) {
-            // If there are too many levels for the requested fixed share,
-            // degrade safely to equal distribution.
-            double equalShare = 1.0 / n;
-            for (T level : levelsLowToHigh) {
-                distribution.put(level, equalShare);
-            }
-            return distribution;
-        }
-
-        double dominantShare = 1.0 - ((n - 1) * perNonExtreme);
-        T lowest = levelsLowToHigh.get(0);
-        T highest = levelsLowToHigh.get(n - 1);
-
-        for (T level : levelsLowToHigh) {
-            distribution.put(level, perNonExtreme);
-        }
-
-        if (profile == WorkloadProfile.HEAVY) {
-            distribution.put(highest, dominantShare);
-        } else {
-            distribution.put(lowest, dominantShare);
-        }
-
-        return distribution;
-    }
-
     private static double getLightNonDominantShare(int levelCount) {
         if (levelCount <= 1) {
             return 0.0;
@@ -1246,38 +1099,6 @@ public class Servers{
         return lastWriteTimestamp;
     }
 
-    /**
-     * Select read concern based on probability distribution
-     */
-    private static int selectReadConcern(Map<Integer, Double> distribution) {
-        double rand = random.nextDouble();
-        double cumulative = 0.0;
-        for (Map.Entry<Integer, Double> entry : distribution.entrySet()) {
-            cumulative += entry.getValue();
-            if (rand <= cumulative) {
-                return entry.getKey();
-            }
-        }
-        return 2; // default EVENTUAL
-    }
-
-    /**
-     * Select write concern based on probability distribution
-     */
-    private static int selectWriteConcern(Map<Integer, Double> distribution) {
-        double rand = random.nextDouble();
-        double cumulative = 0.0;
-
-        for (Map.Entry<Integer, Double> entry : distribution.entrySet()) {
-            cumulative += entry.getValue();
-            if (rand <= cumulative) {
-                return entry.getKey();
-            }
-        }
-
-        // Default to W:1 if distribution doesn't sum to 1
-        return 1;
-    }
     
     /**
      * Clear all CSV files at startup to ensure clean data collection

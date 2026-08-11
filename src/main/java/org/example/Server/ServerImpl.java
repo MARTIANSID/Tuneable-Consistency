@@ -1,7 +1,6 @@
 package org.example.Server;
 
 import io.grpc.*;
-import io.grpc.stub.AbstractStub;
 import io.grpc.stub.StreamObserver;
 
 import org.ds.paxos.*;
@@ -11,11 +10,9 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -27,17 +24,11 @@ import org.example.Utility.*;
 import org.example.Utility.ServerStatus.*;
 import org.example.TokenBucket.TokenBucketImpl.TokenBucketData;
 
-import java.lang.management.ManagementFactory;
 
 
 // import com.google.protobuf.Empty;
 
-import com.sun.management.OperatingSystemMXBean;
 
-import java.lang.management.MemoryMXBean;
-import java.lang.management.MemoryUsage;
-import java.util.prefs.PreferenceChangeEvent;
-import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -91,7 +82,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     AtomicLong totalLatency;
 
     ConcurrentHashMap<String, Boolean> ackSent;
-    RaftStub clientStub;
     AtomicLong ackTransactionCount;
 
     ReadWriteLock lock;
@@ -175,8 +165,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     Set<String> backLogTransactions;
 
-    // RL Model Client for budget prediction
-    RLModelGrpcClient rlModelClient;
     ProcessResult previousBatchResult;
 
     // For tracking incoming transactions per second
@@ -406,10 +394,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 writeConcernLatencyLocks.put(i, new Object());
             }
         }
-        // setting up the client stub
-        ManagedChannel channel = ManagedChannelBuilder.forAddress("localhost", 9001).usePlaintext().build();
-        clientStub = RaftGrpc.newStub(channel);
-
         batchProcessingTask = batchProcessor.scheduleWithFixedDelay(this::processBatchWithErrorHandling, 0,
                         BATCH_INTERVAL_MS,
                         TimeUnit.MILLISECONDS);
@@ -1114,30 +1098,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 synchronized (systemWideThroughput) {
                     recordThroughput(ackTransactionsTimeStamps, timeStampOfTransaction, true);
                 }
-                // *** this is the calculation of writeConcernLatency ***
-                // synchronized (writeConcernLatency) {
-                // // System.out.println("This is the writeConcern--" + entry.copyOfWriteConcern
-                // +"
-                // // replication---" + entry.serversThatReplicatedThisEntry);
-                // int writeConcernOfThisTransaction = entry.copyOfWriteConcern;
-                // Long arrivalTimeOfThisEntryOnLeader = entry.timeOfArrivalAtLeader;
-                // // this timeStampOfTransaction is the current time taken at the time of
-                // sending
-                // // ack
-                // Long currentLatency = (timeStampOfTransaction -
-                // arrivalTimeOfThisEntryOnLeader);
-                // Deque<Latency> latencies =
-                // writeConcernLatencies.get(writeConcernOfThisTransaction);
-                // while (!latencies.isEmpty() && (timeStampOfTransaction -
-                // latencies.peek().timestamp) >= 5000L) {
-                // Latency latency = latencies.poll();
-                // writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                // writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
-                // }
-                // latencies.add(new Latency(timeStampOfTransaction, currentLatency));
-                // writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                // writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
-                // }
             }
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             for (Map.Entry<String, List<AckMessage>> clientEntry : ackMessagesPerClient.entrySet()) {
@@ -1185,17 +1145,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
             return val;
         }
-    }
-
-    @Override
-    public void sendAckToAllServers(Ack ack, StreamObserver<Empty> responseObserver) {
-        if (shouldDropServerNetworkTraffic()) {
-            responseObserver.onError(Status.UNAVAILABLE
-                .withDescription("Node is configured as failed: sendAckToAllServers dropped")
-                .asRuntimeException());
-            return;
-        }
-        List<AckMessage> ackMessages = ack.getAckMessageList();
     }
 
     // inside lock
@@ -1396,89 +1345,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         return entries;
     }
 
-    // private void sendAppendEntries() {
-
-    // sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
-    // if (status != ServerCurrentStatus.LEADER) {
-    // return;
-    // }
-    // for (int i = 0; i < NUM_OF_SERVERS; i++) {
-
-    // if (i == serverId) continue;
-
-    // int matchIndexForFollower = -1, indexToSendFrom = log.size() - 1;
-
-    // AppendEntriesArgument appendEntriesArgument = null;
-
-    // lock.readLock().lock();
-    // try {
-    // long now = System.currentTimeMillis();
-    // if ((nextIndex.get(i) == log.size() - 1) && ((now - lastHeartBeatSent[i]) <
-    // 100) && (lastIndexSent[i] == nextIndex.get(i)))
-    // continue;
-    // // this check is to avoid race condition where in if leader, becomes follower
-    // it should not send the updated term to follower as this old leader is not a
-    // leader in the updated term
-    // if (status != ServerCurrentStatus.LEADER) return;
-    // // nextIndex tells us the nextIndex from which we need the entries
-    // indexToSendFrom = nextIndex.get(i);
-    // // prevEntry needed for comparison at the follower end
-    // LogEntry prevEntry = log.get(indexToSendFrom - 1);
-    // // all entries after this index
-    // List<LogEntryProto> entries =
-    // convertLogEntryToProto(log.logEntriesFromIndex(indexToSendFrom));
-    // // making the proto log object
-    // Log l = Log.newBuilder().addAllLog(entries).build();
-    // // making appendEntries proto object
-    // double combinedSystemThroughput = 0;
-    // boolean throughputIndcluded = false;
-    // if (now - lastThroughputSentTime >= 200) {
-    // lastThroughputSentTime = now;
-    // combinedSystemThroughput = combinedThroughputOfFollowers +
-    // getSystemWideThroughput();
-    // throughputIndcluded = true;
-    // }
-    // appendEntriesArgument =
-    // AppendEntriesArgument.newBuilder().setLeadersTerm(currentTerm.get()).setLeadersId(serverId).setLeadersCommit(commitIndex.get()).setPrevLogIndex(prevEntry.index).setPrevLogTerm(prevEntry.term).setEntriesToAppend(l).setTimeStamp(HybridClock.TimeStamp.convertToProto(hybridClock.now())).setSystemThroughputIncluded(throughputIndcluded).setSystemThroughput(combinedSystemThroughput).build();
-
-    // // if update of the followers log is successful what will be the new
-    // matchIndex of follower
-    // matchIndexForFollower = entries.size() + indexToSendFrom - 1;
-    // lastHeartBeatSent[i] = System.currentTimeMillis();
-    // lastIndexSent[i] = nextIndex.get(i);
-    // } finally {
-    // lock.readLock().unlock();
-    // }
-
-    // // index to send from
-    // int matchIndexFollowerTemp = matchIndexForFollower;
-    // int nextIndexTemp = indexToSendFrom;
-
-    // stubs[i].appendEntries(appendEntriesArgument, new
-    // StreamObserver<AppendEntriesResult>() {
-    // @Override
-    // public void onNext(AppendEntriesResult appendEntriesResult) {
-    // // this doesLeaderHasHighestTerm tells us if the follower has a higher term
-    // than this leader, if it is true then it will become follower
-    // doesLeaderHasHighestTerm.compareAndSet(true,
-    // handleAppendEntriesResult(appendEntriesResult, matchIndexFollowerTemp,
-    // nextIndexTemp));
-    // }
-
-    // @Override
-    // public void onError(Throwable throwable) {
-
-    // }
-
-    // @Override
-    // public void onCompleted() {
-
-    // }
-    // });
-    // if (!doesLeaderHasHighestTerm.get()) break;
-    // }
-    // }, 0, 80, TimeUnit.MILLISECONDS);
-    // }
     private void sendAppendEntries() {
 
         final int MAX_ENTRIES_PER_RPC = 7000;
@@ -1605,18 +1471,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // already in writeLock
     public void reinitialiseIndexes() {
 
-        // we traverse from commitIndex to log end to see if the writeConcern of the
-        // entries have been updated by this leader or not, because the log data is sent
-        // from the old leader so most likely it will not be updated
-        // I have removed this code because we can add it when the follower receives
-        // these entries
-        // for (int i = (commitIndex.get() + 1); i < log.size(); i++) {
-        // LogEntry logEntry = log.get(i);
-        // if (!logEntry.serversThatReplicatedThisEntry.get(serverId)) {
-        // log.updateWriteConcern(i, serverId);
-        // }
-        // }
-        // reinitialise the nextIndex and matchIndex
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             nextIndex.set(i, log.size());
             matchIndex.set(i, -1);
@@ -1671,36 +1525,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (sendAppendEntriesScheduler == null || sendAppendEntriesScheduler.isShutdown()) {
                 sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
             }
-            // if (batchProcessingTask == null || batchProcessor.isShutdown()) {
-            //     batchProcessingTask = batchProcessor.scheduleAtFixedRate(this::processBatchWithErrorHandling, 0,
-            //             BATCH_INTERVAL_MS,
-            //             TimeUnit.MILLISECONDS);
-            // }
-
-            // if (backLogScheuler == null || backLogScheuler.isShutdown()) {
-                
-            //     if(backLogScheuler == null) {
-            //         this.backLogScheuler = Executors.newScheduledThreadPool(1);
-            //     }
-                
-            //     backLogScheuler.scheduleAtFixedRate(() -> {
-            //         int currentBacklog;
-
-            //         // Read backlog under lock
-            //         batchLock.lock();
-            //         try {
-            //             currentBacklog = batchOfTransactions.size();
-            //         } finally {
-            //             batchLock.unlock();
-            //         }
-
-            //         backlogTracker.addSample(currentBacklog);
-
-            //         if (backlogTracker.isIncreasing()) {
-            //             System.out.println("Backlog trending up! Holding upgrades.");
-            //         }
-            //     }, 0, 100, TimeUnit.MILLISECONDS);
-            // }
         } finally {
             lock.writeLock().unlock();
         }
@@ -2135,32 +1959,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         recordBatchMixBeforeAfterUpgrade(currentBatch, transactionsToExecute);
 
         // Deferred transactions are already pushed to backlog queue inside BatchProcessor.
-        // batchLock.lock();
-        // try {
-        //     // Add in reverse order so the first deferred transaction ends up at the front
-        //     for (int i = result.deferredTransactions.size() - 1; i >= 0; i--) {
-        //         TransactionOption deferred = result.deferredTransactions.get(i);
-        //         batchOfTransactions.addFirst(deferred);
-        //     }
-
-        //     int backLog = backLogTransactions.size();
-
-        //     try (FileWriter fw = new FileWriter("backlog_" + serverId + ".csv", true); PrintWriter out = new PrintWriter(fw)) {
-        //         File file = new File("backlog_" + serverId + ".csv");
-        //         if (file.length() == 0) {
-        //             out.println("Timestamp,Backlog");
-        //         }
-        //         out.printf("%d,%d%n", System.currentTimeMillis(), backLog);
-        //     } catch (IOException e) {
-        //         e.printStackTrace();
-        //     }
-        //     System.out.println(
-        //             "The backlog is--" + backLog + " | Deferred this round: " + result.deferredTransactions.size());
-        // } finally {
-        //     batchLock.unlock();
-        // }
-
-        // Partition into reads and writes (lightweight — no processing yet)
         List<ClientMessage> readTransactions = new ArrayList<>();
         List<ClientMessage> writeTransactions = new ArrayList<>();
         for (ClientMessage cm : transactionsToExecute) {
@@ -2400,261 +2198,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         sb.append(",").append(mix.writeConcernOther);
     }
 
-    // private void printAllWriteConernsThroughputAndLatencies() {
-    // System.out.println("Printing Throughputs");
-    // for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-    // System.out.println(getWriteConcernThroughput(i));
-    // }
-    // synchronized (writeConcernLatency) {
-    // System.out.println("Printing Latencies");
-    // for (int i = 1; i <= ((NUM_OF_SERVERS / 2) + 1); i++) {
-    // System.out.println(writeConcernLatencies.get(i));
-    // }
-    // }
-    // }
-    // private void adjustTokenCostsBasedOnLatency() {
-    // final int MIN_COST = 1;
-    // final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
-    // int minTransactions = (int)Math.ceil(MIN_REQUIRED_THROUGHPUT *
-    // BATCH_INTERVAL_MS / 1000.0);
-    // double tuningFactor = 2.0;
-    // final double maxTokenCostPerTxn = TOKEN_CAPACITY / (minTransactions *
-    // tuningFactor);
-    //
-    // synchronized (writeConcernLatency) {
-    // // Filter out zero latencies and get max
-    // long maxLatency = writeConcernLatencies.values().stream()
-    // .mapToLong(l -> l)
-    // .max()
-    // .orElse(1L); // avoid divide by 0
-    //
-    // // Sort write concerns to enforce cost hierarchy
-    // List<Integer> writeConcerns = new
-    // ArrayList<>(writeConcernLatencies.keySet());
-    // Collections.sort(writeConcerns);
-    //
-    //
-    // double prevCost = MIN_COST;
-    // for (int wc : writeConcerns) {
-    // long latency = writeConcernLatencies.get(wc);
-    // // Apply EMA smoothing (optional)
-    // double smoothedLatency = smoothedLatencies.compute(wc,
-    // (k, oldVal) -> oldVal == null ? latency : 0.2 * latency + 0.8 * oldVal);
-    //
-    // // Scale cost proportionally to latency
-    // double scaledCost = (smoothedLatency / maxLatency) * maxTokenCostPerTxn;
-    // int tokenCost = (int) Math.ceil(scaledCost * scale);
-    // tokenCost = Math.max((int) prevCost, tokenCost); // Enforce hierarchy
-    //
-    // writeConcernCosts.put(wc, (double) tokenCost);
-    // prevCost = tokenCost;
-    // System.out.printf("[Cost Adjust] WC=%d | Latency=%dms | Cost=%d%n",
-    // wc, latency, tokenCost);
-    // }
-    // }
-    // }
-
-    // private void adjustTokenCostsBasedOnLatency() {
-    // final int MIN_COST = 1;
-    // final int MAX_COST = 50;
-    // final int HEALTHY_LATENCY = 20;
-    // final int MAX_LATENCY = 50;
-    // final double TOKEN_CAPACITY = tokenBucket.getMaxTokens();
-    //
-    // // Throughput sanity check
-    // int minTransactionsPerBatch = (int) Math.ceil(MIN_REQUIRED_THROUGHPUT *
-    // BATCH_INTERVAL_MS / 1000.0);
-    // if (MAX_COST * minTransactionsPerBatch > TOKEN_CAPACITY) {
-    // throw new IllegalStateException("Token capacity too low for minThroughput!");
-    // }
-    //
-    // synchronized (writeConcernLatencies) {
-    // // Sort write concerns to enforce hierarchy
-    // List<Integer> writeConcerns = new
-    // ArrayList<>(writeConcernLatencies.keySet());
-    // Collections.sort(writeConcerns);
-    //
-    // int prevCost = MIN_COST;
-    // for (int wc : writeConcerns) {
-    // long latency = writeConcernLatencies.get(wc);
-    //
-    // // Compute base cost (Step 1)
-    // double normalizedLatency = Math.min(1.0,
-    // Math.max(0.0, (double) (latency - HEALTHY_LATENCY) / (MAX_LATENCY -
-    // HEALTHY_LATENCY)));
-    // int tokenCost = MIN_COST + (int) Math.ceil(normalizedLatency * (MAX_COST -
-    // MIN_COST));
-    // tokenCost = Math.min(MAX_COST, Math.max(MIN_COST, tokenCost));
-    //
-    // // Enforce hierarchy (Step 2)
-    // tokenCost = Math.max(prevCost, tokenCost);
-    // writeConcernCosts.put(wc, (double) tokenCost);
-    // prevCost = tokenCost;
-    //
-    // System.out.printf("WC=%d | Latency=%dms | Cost=%d%n", wc, latency,
-    // tokenCost);
-    // }
-    // }
-    // }
-
-    // private void adjustTokenCostsBasedOnLatency() {
-    // final int MIN_COST = 1;
-    // final double STEP_FACTOR = 0.3; // half the fastest-latency
-    //
-    // // 1) Build per-WC average from your history buffers
-    // HashMap<Integer, Long> averageLatency = new HashMap<>();
-    // synchronized (writeConcernLatency) {
-    // double minLatency = 1.0;
-    // for (var entry : writeConcernLatencies.entrySet()) {
-    // int wc = entry.getKey();
-    // Long latency = getAverageLatency(wc);
-    // minLatency = Math.max(latency, minLatency);
-    // averageLatency.put(wc, Math.max(latency, 1));
-    // }
-    //
-    //
-    // double step = minLatency * STEP_FACTOR;
-    //
-    // try (FileWriter csvWriter = new FileWriter("token_costs.csv", true)) {
-    // for (var entry : averageLatency.entrySet()) {
-    // int wc = entry.getKey();
-    // Long lat = entry.getValue();
-    //
-    // double tokenCost = Math.ceil((double) lat / step);
-    // tokenCost = Math.max(tokenCost, MIN_COST);
-    //
-    // writeConcernCosts.put(wc, tokenCost);
-    //
-    // // Print to console
-    // System.out.printf(
-    // "[Cost Adjust] WC=%d | avgLatency=%dms | step=%.1f → cost=%.1f%n",
-    // wc, lat, step, tokenCost
-    // );
-    //
-    // // Append WC, Latency, TokenCost to CSV
-    // csvWriter.write(String.format("%d,%d,%.1f%n", wc, lat, tokenCost));
-    // }
-    //
-    // csvWriter.flush();
-    // } catch (IOException e) {
-    // e.printStackTrace();
-    // }
-    // }
-    //
-    // }
     private double blendedLatencyForWC(int wc) {
         // it is a 5 second window based latency so it works well directly
         return getAverageLatency(wc);
     }
-
-    // Map a smoothed latency to an integer cost via convex anchor curve and
-    // guardrails
-    // private double latencyToCost(double ewmaMs) {
-    // double tpsMin = Math.max(1.0, MIN_REQUIRED_THROUGHPUT);
-
-    // double costHealthy = 10;
-
-    // double costBad = 300;
-
-    // double Lmin = Math.max(1.0, 0.25 * L_HEALTHY_MS);
-    // if (ewmaMs <= L_HEALTHY_MS) {
-    // double denom = Math.max(1e-9, L_HEALTHY_MS - Lmin);
-    // double z = (ewmaMs - Lmin) / denom;
-    // z = Math.max(0.0, Math.min(1.0, z));
-    // double y = 1.0 * (1.0 - Math.pow(z, CONVEX_P)) + costHealthy * Math.pow(z,
-    // CONVEX_P);
-    // return Math.max(MIN_COST, y);
-    // }
-
-    // double x = ewmaMs >= L_BAD_MS ? 1.0 : (ewmaMs - L_HEALTHY_MS) / (L_BAD_MS -
-    // L_HEALTHY_MS);
-    // double blendedCost = costHealthy * (1.0 - Math.pow(x, CONVEX_P)) + costBad *
-    // Math.pow(x, CONVEX_P);
-
-    // return Math.max(MIN_COST, blendedCost);
-    // }
-
-    // // Main adjustment; currentTps provided by caller's sliding window
-    // private void adjustTokenCostsBasedOnLatency(double currentTps) {
-    // final double MIN_STEP_EPS = 0.05;
-
-    // long now = System.currentTimeMillis();
-
-    // synchronized (writeConcernLatency) {
-    // Long lastAny = lastUpdateAt.values().stream().findAny().orElse(0L);
-    // if (now - lastAny < MIN_UPDATE_PERIOD_MS)
-    // return;
-    // Map<Integer, Double> smoothed = new HashMap<>();
-    // double minSmoothed = Double.POSITIVE_INFINITY;
-
-    // double prevWriteConcernCost = 1;
-    // for (int i = 1; i <= (NUM_OF_SERVERS / 2 + 1); i++) {
-    // int wc = i;
-    // double blended = Math.max(1.0, blendedLatencyForWC(wc));
-    // double prev = ewmaLatency.getOrDefault(wc, blended);
-    // double ewma = ALPHA * blended + (1.0 - ALPHA) * prev;
-    // ewmaLatency.put(wc, ewma);
-    // smoothed.put(wc, ewma);
-    // if (ewma < minSmoothed)
-    // minSmoothed = ewma;
-    // }
-    // if (!Double.isFinite(minSmoothed) || minSmoothed <= 0.0)
-    // minSmoothed = 1.0;
-
-    // System.out.println(writeConcernCosts);
-    // System.out.println(ewmaLatency);
-
-    // try (FileWriter csv = new FileWriter("token_costs.csv", true)) {
-    // for (var e : smoothed.entrySet()) {
-    // int wc = e.getKey();
-    // double ewmaMs = e.getValue();
-
-    // double oldCost = writeConcernCosts.getOrDefault(wc, (double) MIN_COST);
-    // double proposed = latencyToCost(ewmaMs);
-
-    // try (FileWriter fw = new FileWriter("writeconcern.csv", true);
-    // PrintWriter out = new PrintWriter(fw)) {
-    // File file = new File("writeconcern.csv");
-    // if (file.length() == 0) {
-    // out.println("WriteConcern,Cost,Latency");
-    // }
-    // for (Integer level : writeConcernCosts.keySet()) {
-    // double cost = writeConcernCosts.get(level);
-    // double latency = smoothed.getOrDefault(level, Double.NaN);
-    // out.printf("%d,%.4f,%.2f%n", level, cost, latency);
-    // }
-    // } catch (IOException ex) {
-    // ex.printStackTrace();
-    // }
-
-    // double upCap = oldCost * (1.0 + MAX_STEP_UP);
-    // double downCap = oldCost * (1.0 - MAX_STEP_DOWN);
-    // double capped = proposed;
-
-    // if (proposed > oldCost) {
-    // double minUp = oldCost + MIN_STEP_EPS;
-    // capped = Math.min(proposed, Math.max(minUp, upCap));
-    // } else if (proposed < oldCost) {
-    // double maxDownAbs = oldCost - MIN_STEP_EPS;
-    // capped = Math.max(proposed, Math.min(maxDownAbs, downCap));
-    // }
-
-    // capped = Math.max(MIN_COST, capped);
-    // capped = Math.max(prevWriteConcernCost, capped);
-    // prevWriteConcernCost = capped;
-    // writeConcernCosts.put(wc, capped);
-
-    // csv.write(String.format("%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n", wc, ewmaMs,
-    // minSmoothed, oldCost,
-    // proposed, capped, now));
-    // lastUpdateAt.put(wc, now);
-    // }
-    // csv.flush();
-    // } catch (IOException ex) {
-    // ex.printStackTrace();
-    // }
-    // }
-    // }
 
     private ProcessResult handleTokenBucket(List<TransactionOption> currentBatch,
             double totalFollowerTps) {
@@ -2742,19 +2289,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return ackTransactionsTimeStamps.size() / 5;
         }
     }
-
-    // private double getWriteConcernThroughput(int writeConcern) {
-    // synchronized (writeConcernThroughput) {
-    // Long currentTimeStamp = System.currentTimeMillis();
-    // ConcurrentLinkedQueue<Long> writeConcernSpecificTimeStamps =
-    // ackTransactionTimeStampsForAllWriteConcerns
-    // .get(writeConcern);
-    // if (writeConcernSpecificTimeStamps != null) {
-    // recordThroughput(writeConcernSpecificTimeStamps, currentTimeStamp, false);
-    // }
-    // return writeConcernSpecificTimeStamps.size();
-    // }
-    // }
 
     private double getWriteConcernTPS(int writeConcern) {
         synchronized (writeConcernThroughputLocks.get(writeConcern)) {
@@ -3023,166 +2557,6 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             recordReadConcernLatency(readConcern, readLevel, arrivalTime);
             return getBalanceBasedOnReadLevel(readLevel, accName, id);
         }
-    }
-
-    // // need to review the logic
-    // @Override
-    // public void sendReadRequest(ClientReadRequest readRequest, StreamObserver<Ack> responseObserver) {
-    //     ReadConcern readConcern = readRequest.getReadConcern();
-
-    //     String accName = readRequest.getAccNameToRead();
-    //     ReadLevel readLevel = readRequest.getReadLevel();
-    //     String host = readRequest.getCallbackHost();
-    //     int port = readRequest.getCallbackPort();
-    //     String id = readRequest.getId();
-
-    //     int majority = (NUM_OF_SERVERS / 2) + 1;
-
-    //     if (readConcern == ReadConcern.CAUSAL) {
-    //         // causal consistency
-    //         HybridClock.TimeStamp timeStampRequestedByClient = HybridClock.TimeStamp
-    //                 .convertToTimeStamp(readRequest.getTimeStamp());
-
-    //         long startTime = System.nanoTime();
-    //         long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(100);
-    //         Runnable checkLogTask = new Runnable() {
-    //             @Override
-    //             public void run() {
-    //                 if (System.nanoTime() - startTime > maxWaitNanos) {
-    //                     responseObserver.onNext(Ack.newBuilder()
-    //                             .addAckMessage(
-    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-    //                             .build());
-    //                     responseObserver.onCompleted();
-    //                     return;
-    //                 }
-    //                 LogEntry entry = null;
-    //                 lock.readLock().lock();
-    //                 try {
-    //                     if (readLevel == ReadLevel.MAJORITY) {
-    //                         entry = log.get(commitIndex.get());
-    //                     } else {
-    //                         entry = log.get(log.size() - 1);
-    //                     }
-    //                 } finally {
-    //                     lock.readLock().unlock();
-    //                 }
-    //                 if (entry != null && entry.timeStamp.compareTo(timeStampRequestedByClient) >= 0) {
-    //                     synchronized (systemWideThroughput) {
-    //                         recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
-    //                     }
-    //                     // log has caught up, safe to read
-    //                     responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
-    //                     responseObserver.onCompleted();
-    //                 } else {
-    //                     // still behind, schedule again after a short delay
-    //                     causalReadScheduler.schedule(this, 20, TimeUnit.MILLISECONDS); // retry after 10ms
-    //                 }
-    //             }
-    //         };
-    //         causalReadScheduler.execute(checkLogTask);
-
-    //     } else if (readConcern == ReadConcern.LINEARIZABLE) {
-    //         // this readRequest should go to leader
-    //         // here we check if election is happening or not
-    //         // if election is happening send failure, client can try again
-    //         // this read lock is required because in isElection we are using shared
-    //         // variables and we do not wait for the rpc call to complete before releasing
-    //         // the lock it is async
-    //         lock.readLock().lock();
-    //         try {
-    //             if (status != ServerCurrentStatus.LEADER) {
-    //                 if (currentLeader == -1) {
-    //                     responseObserver.onNext(Ack.newBuilder()
-    //                             .addAckMessage(
-    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-    //                             .build());
-    //                     responseObserver.onCompleted();
-    //                 } else {
-    //                     // redirect to leader
-    //                     stubs[currentLeader].sendReadRequest(readRequest, new StreamObserver<Ack>() {
-    //                         @Override
-    //                         public void onNext(Ack ack) {
-    //                             responseObserver.onNext(ack);
-    //                         }
-
-    //                         @Override
-    //                         public void onError(Throwable throwable) {
-    //                             responseObserver.onNext(Ack.newBuilder().addAckMessage(
-    //                                     AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-    //                                     .build());
-    //                         }
-
-    //                         @Override
-    //                         public void onCompleted() {
-    //                             responseObserver.onCompleted();
-    //                         }
-    //                     });
-    //                 }
-    //                 return;
-    //             }
-    //         } finally {
-    //             lock.readLock().unlock();
-    //         }
-    //         batchLock.lock();
-    //         try {
-    //             ClientMessage clientMessage = ClientMessage.newBuilder().setWriteConcern(majority)
-    //                     .setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority)
-    //                             .setMinRequiredConsistency(majority).setAccNameToRead(accName).setId(id).build())
-    //                     .setCallbackHost(host).setCallbackPort(port).build();
-    //             batchOfTransactions.add(TransactionOption.fromClientMessage(clientMessage));
-    //         } finally {
-    //             batchLock.unlock();
-    //         }
-    //         // responseObserver.onNext(Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setFailure(false).setResultNotReady(true).setAccName(accName).setId(id).build()).build());
-    //         // responseObserver.onCompleted();
-    //         // if (!canServeLinearizableRead()) {
-    //         // responseObserver.onNext(Ack.newBuilder()
-    //         // .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
-    //         // .build());
-    //         // responseObserver.onCompleted();
-    //         // return;
-    //         // }
-    //         synchronized (systemWideThroughput) {
-    //             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
-    //         }
-    //         responseObserver.onNext(getBalanceBasedOnReadConcern(ReadLevel.MAJORITY, accName, id));
-    //         responseObserver.onCompleted();
-    //     } else {
-    //         // here the readConcern is just local
-    //         synchronized (systemWideThroughput) {
-    //             recordThroughput(ackTransactionsTimeStamps, System.currentTimeMillis(), true);
-    //         }
-    //         responseObserver.onNext(getBalanceBasedOnReadConcern(readLevel, accName, id));
-    //         responseObserver.onCompleted();
-    //     }
-    // }
-
-    // private Ack getBalanceBasedOnReadConcern(ReadLevel readLevel, String accName, String id) {
-    //     if (readLevel == ReadLevel.LOCAL) {
-    //         return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
-    //                 .setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
-    //     } else {
-    //         return Ack.newBuilder()
-    //                 .addAckMessage(AckMessage.newBuilder().setAccName(accName)
-    //                         .setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build())
-    //                 .build();
-    //     }
-    // }
-
-    @Override
-    public void printLog(Empty request, StreamObserver<Empty> responseObserver) {
-        // System.out.println("The commit index of this node is -- " + commitIndex.get());
-        // System.out.println("The size of log is ---" + log.size());
-        // System.out.println("The majority committed map -- " + clientBalancesMajorityCommitted);
-        // System.out.println("The latest map -- " + clientBalancesLatest);
-
-        // System.out.println(totalLatency.get());
-        // System.out.println("The latency of the system is in ms----" +
-        // (totalLatency.get() / (ackTransactionCount.get())));
-        // System.out.println("The current clock time of this node is----" +
-        // hybridClock.now());
-        // log.printLog();
     }
 
     // this resets and starts the timer again

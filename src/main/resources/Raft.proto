@@ -6,23 +6,12 @@ service Raft {
   rpc SendTransaction(ClientMessage) returns (Empty);
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
-  rpc printLog(Empty) returns (Empty);
   rpc sendAckToClient(Ack) returns (Empty);
-  rpc sendAckToAllServers(Ack) returns(Empty);
-  rpc sendReadRequest(ClientReadRequest) returns (Ack);
 }
 
 
 message Empty{
   int32 data = 1;
-}
-
-message Balance {
-  double balance = 1;
-  string accName = 2;
-  bool failure = 3;
-  // for linearzable we the leader does not return the balance immediately but wait, when it is committed
-  bool resultNotReady = 4;
 }
 
 enum ReadConcern {
@@ -61,19 +50,6 @@ message ClientMessage {
   string callbackHost = 4;
   int32 callbackPort = 5;
 }
-
-message ClientReadRequest {
-  string accNameToRead = 1;
-  ReadConcern readConcern = 2;
-  TimeStampProto timeStamp = 3;
-  ReadLevel readLevel = 4;
-  string id = 5;
-
-  string callbackHost = 6;
-  int32 callbackPort = 7;
-}
-
-
 
 message Transaction {
   string sender = 1;
