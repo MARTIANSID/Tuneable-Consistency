@@ -38,6 +38,7 @@ public final class ExperimentConfig {
     public ServerTuning serverTuning;
     public BatchProcessorTuning batchProcessor;
     public TokenBucket tokenBucket;
+    public ClientMetrics clientMetrics;
     public List<PhaseConfig> phases;
 
     public static final class Cluster {
@@ -103,6 +104,11 @@ public final class ExperimentConfig {
     public static final class TokenBucket {
         public Double maxTokens;
         public Double refillRatePerSecond;
+    }
+
+    public static final class ClientMetrics {
+        public Map<String, Integer> deadlinesMsByApp; // appId (as string) -> latency deadline in ms
+        public Integer lostTimeoutMs;                 // no ACK within this -> scored as lost
     }
 
     public static final class PhaseConfig {
@@ -285,6 +291,22 @@ public final class ExperimentConfig {
         require(tokenBucket, "tokenBucket");
         requirePositive(tokenBucket.maxTokens, "tokenBucket.maxTokens");
         requirePositive(tokenBucket.refillRatePerSecond, "tokenBucket.refillRatePerSecond");
+
+        require(clientMetrics, "clientMetrics");
+        require(clientMetrics.deadlinesMsByApp, "clientMetrics.deadlinesMsByApp");
+        if (clientMetrics.deadlinesMsByApp.isEmpty()) {
+            throw new IllegalArgumentException("clientMetrics.deadlinesMsByApp must not be empty");
+        }
+        for (Map.Entry<String, Integer> e : clientMetrics.deadlinesMsByApp.entrySet()) {
+            try {
+                Integer.parseInt(e.getKey());
+            } catch (NumberFormatException ex) {
+                throw new IllegalArgumentException("clientMetrics.deadlinesMsByApp key '" + e.getKey()
+                        + "' is not an integer applicationId");
+            }
+            requirePositive(e.getValue(), "clientMetrics.deadlinesMsByApp." + e.getKey());
+        }
+        requirePositive(clientMetrics.lostTimeoutMs, "clientMetrics.lostTimeoutMs");
 
         require(phases, "phases");
         if (phases.isEmpty()) {

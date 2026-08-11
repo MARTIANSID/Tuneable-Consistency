@@ -1015,8 +1015,11 @@ static class AppUpgradeOption {
                 // }
             }
 
+            // Reflect the executed (possibly upgraded) consistency in the embedded
+            // transaction too, so downstream ACKs report the truth to the client.
             Transaction updatedT = tx.clientMessage.getT().toBuilder()
                     .setReadConcern(assignment.readConcern)
+                    .setWriteConcern(assignment.writeConcern)
                     .build();
                 if (assignment.readLevel != null) {
                 updatedT = updatedT.toBuilder().setReadLevel(assignment.readLevel).build();

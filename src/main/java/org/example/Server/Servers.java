@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import org.example.Client.ClientMetricsTracker;
 import org.example.Client.ClientServerImpl;
 import org.example.TokenBucket.TokenBucketImpl;
 import org.example.Utility.BatchProcessor;
@@ -244,6 +245,7 @@ public class Servers{
         ServerImpl.setUpgradeTransactionsEnabled(UPGRADE_TRANSACTIONS);
         ServerImpl.setPressureModeEnabled(PRESSURE_MODE_ENABLED);
         ServerImpl.setAdmissionControlEnabled(config.consistency.admissionControl);
+        ClientMetricsTracker.configure(config);
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
@@ -802,6 +804,16 @@ public class Servers{
             int accepted = server.enqueueWithoutDroppingExisting(txs);
             injected += accepted;
             dropped += Math.max(0, txs.size() - accepted);
+
+            // Client-side ledger: admission accepts a prefix, so index < accepted
+            // is exactly the admitted set; the rest were rejected at the gate.
+            for (int i = 0; i < txs.size(); i++) {
+                if (i < accepted) {
+                    ClientMetricsTracker.register(txs.get(i), server.serverId);
+                } else {
+                    ClientMetricsTracker.recordRejected(txs.get(i), server.serverId);
+                }
+            }
         }
 
         if (injected > 0) {
@@ -1142,7 +1154,8 @@ public class Servers{
             "lab1_Test.csv",
             "final_batch_avg_tps_log.csv",
             "incoming_transaction_rate_global.csv",
-            "system_tps_global.csv"
+            "system_tps_global.csv",
+            "client_metrics_global.csv"
         };
 
         for (int sid = 0; sid < 30; sid++) {

@@ -1141,7 +1141,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                         ackTransactionCount.incrementAndGet();
                         AckMessage.Builder ackBuilder = AckMessage.newBuilder().setT(entry.t)
                                 .setTimStamp(HybridClock.TimeStamp.convertToProto(entry.timeStamp))
-                                .setCurrentLeader(serverId);
+                                .setCurrentLeader(serverId)
+                                .setExecutedLevelIncluded(true)
+                                // entry.writeConcern is decremented as replication acks arrive;
+                                // copyOfWriteConcern preserves the executed level.
+                                .setExecutedWriteConcern(entry.copyOfWriteConcern)
+                                .setExecutedReadConcern(entry.t.getReadConcern())
+                                .setExecutedReadLevel(entry.t.getReadLevel());
 
                         if (entry.t.getIsReadOnly()) {
                             ackBuilder.setId(id).setBalance(
@@ -2451,16 +2457,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private Ack getBalanceBasedOnReadLevel(ReadLevel readLevel, String accName, String id) {
-        if (readLevel == ReadLevel.LOCAL) {
-            return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
-                    .setBalance(clientBalancesLatest.getOrDefault(accName, 0.0)).setId(id).build()).build();
-        } else {
-            return Ack.newBuilder()
-                    .addAckMessage(AckMessage.newBuilder().setAccName(accName)
-                            .setBalance(clientBalancesMajorityCommitted.getOrDefault(accName, 0.0)).setId(id).build())
-                    .build();
-        }
+    private Ack getBalanceBasedOnReadLevel(ReadConcern readConcern, ReadLevel readLevel, String accName, String id) {
+        double balance = (readLevel == ReadLevel.LOCAL)
+                ? clientBalancesLatest.getOrDefault(accName, 0.0)
+                : clientBalancesMajorityCommitted.getOrDefault(accName, 0.0);
+        return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
+                .setBalance(balance).setId(id)
+                .setExecutedLevelIncluded(true)
+                .setExecutedReadConcern(readConcern)
+                .setExecutedReadLevel(readLevel)
+                .build()).build();
     }
 
     private Ack buildFailureAck(String accName, String id) {
@@ -2573,7 +2579,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             countOfSystemWideLatencies.incrementAndGet();
                         }
                         recordReadConcernLatency(readConcern, readLevel, arrivalTime);
-                        Ack ack = getBalanceBasedOnReadLevel(readLevel, accName, id);
+                        Ack ack = getBalanceBasedOnReadLevel(readConcern, readLevel, accName, id);
                         clientStub.sendAckToClient(ack, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}
@@ -2637,7 +2643,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 countOfSystemWideLatencies.incrementAndGet();
             }
             recordReadConcernLatency(readConcern, readLevel, arrivalTime);
-            return getBalanceBasedOnReadLevel(readLevel, accName, id);
+            return getBalanceBasedOnReadLevel(readConcern, readLevel, accName, id);
         }
     }
 

@@ -55,6 +55,9 @@ public class ClientServerImpl extends RaftGrpc.RaftImplBase {
         responseObserver.onCompleted();
 
         for (AckMessage ackMessage : ack.getAckMessageList()) {
+            // Resolve against the client-side ledger (idempotent per id).
+            ClientMetricsTracker.onAck(ackMessage);
+
             Transaction t = ackMessage.getT();
             String id = t.getId();
 

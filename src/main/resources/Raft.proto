@@ -35,6 +35,14 @@ message AckMessage {
   bool failure = 6;
   bool resultNotReady = 7;
   string id = 8;
+
+  // The consistency level the transaction actually executed at (after any
+  // server-side upgrade). executedLevelIncluded distinguishes "not reported"
+  // from proto3 defaults (ReadConcern LINEARIZABLE = 0, writeConcern 0).
+  bool executedLevelIncluded = 9;
+  ReadConcern executedReadConcern = 10;
+  ReadLevel executedReadLevel = 11;
+  int32 executedWriteConcern = 12;
 }
 
 message Ack {
