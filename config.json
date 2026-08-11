@@ -13,7 +13,8 @@
   },
   "consistency": {
     "upgradeTransactions": true,
-    "pressureMode": false
+    "pressureMode": false,
+    "admissionControl": true
   },
   "nodeFailure": {
     "enabled": false,

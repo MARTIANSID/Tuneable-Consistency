@@ -267,12 +267,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentLinkedQueue<TransactionOption> backLogQueue;
 
-    // ===== Transaction upgrade toggle =====
+    // ===== Consistency toggles =====
     // When false, the server will bypass handleTokenBucket() and execute the incoming
     // batch exactly as received (no upgrades, no deferrals).
     private static volatile boolean UPGRADE_TRANSACTIONS_ENABLED = false;
-    // When true, enable pressure-aware processing and bypass token-gated admission.
+    // When true, enable pressure-aware processing (token charge moves to batch time).
     private static volatile boolean PRESSURE_MODE_ENABLED = false;
+    // When true, charge the token bucket at enqueue time and reject what does not fit.
+    // Independent of upgrades; must not be combined with pressure mode (double charging) -
+    // enforced by ExperimentConfig validation.
+    private static volatile boolean ADMISSION_CONTROL_ENABLED = true;
 
     public static void setUpgradeTransactionsEnabled(boolean enabled) {
         UPGRADE_TRANSACTIONS_ENABLED = enabled;
@@ -280,6 +284,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     public static void setPressureModeEnabled(boolean enabled) {
         PRESSURE_MODE_ENABLED = enabled;
+    }
+
+    public static void setAdmissionControlEnabled(boolean enabled) {
+        ADMISSION_CONTROL_ENABLED = enabled;
     }
     public void setDropAllServerNetworkTraffic(boolean enabled) {
         this.dropAllServerNetworkTraffic = enabled;
@@ -693,41 +701,35 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             return 0;
         }
 
-        if (tokenBucket == null || !UPGRADE_TRANSACTIONS_ENABLED || PRESSURE_MODE_ENABLED) {
-            batchLock.lock();
-            try {
-                for (int i = 0; i < candidateCount; i++) {
-                    batchOfTransactions.addLast(transactions.get(i));
-                }
-                return candidateCount;
-            } finally {
-                batchLock.unlock();
-            }
-        }
-
         int accepted;
-        redisLock.writeLock().lock();
-        try {
-            TokenBucketData data = tokenBucket.getCurrentTokenBucketData();
-            double tokensRemaining = data.getTokenCount();
-            accepted = 0;
+        if (tokenBucket == null || !ADMISSION_CONTROL_ENABLED) {
+            accepted = candidateCount;
+        } else {
+            redisLock.writeLock().lock();
+            try {
+                TokenBucketData data = tokenBucket.getCurrentTokenBucketData();
+                double tokensRemaining = data.getTokenCount();
+                accepted = 0;
 
-            for (int i = 0; i < candidateCount; i++) {
-                TransactionOption tx = transactions.get(i);
-                double tokenCost = estimateTokenCostForAdmission(tx);
-                if (tokenCost <= tokensRemaining + 1e-9) {
-                    tokensRemaining -= tokenCost;
-                    accepted++;
-                } else {
-                    // Keep admission deterministic: stop admitting once budget is exhausted.
-                    break;
+                for (int i = 0; i < candidateCount; i++) {
+                    TransactionOption tx = transactions.get(i);
+                    double tokenCost = estimateTokenCostForAdmission(tx);
+                    if (tokenCost <= tokensRemaining + 1e-9) {
+                        tokensRemaining -= tokenCost;
+                        accepted++;
+                    } else {
+                        // Keep admission deterministic: stop admitting once budget is exhausted.
+                        break;
+                    }
                 }
-            }
 
-            tokenBucket.updateTokens(Math.max(0.0, tokensRemaining), data.getLastUpdateTime());
-        } finally {
-            redisLock.writeLock().unlock();
+                tokenBucket.updateTokens(Math.max(0.0, tokensRemaining), data.getLastUpdateTime());
+            } finally {
+                redisLock.writeLock().unlock();
+            }
         }
+
+        recordAdmissionFairness(transactions, accepted);
 
         if (accepted > 0) {
             batchLock.lock();
@@ -740,6 +742,68 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             }
         }
         return accepted;
+    }
+
+    // ===== Admission fairness metric =====
+    // Per consistency level: how many transactions were offered to this server's
+    // queue and how many the admission gate accepted. With admission control off,
+    // requested == admitted, which is exactly the baseline for fairness comparison.
+    private final ConcurrentHashMap<String, AtomicLong> fairnessRequestedByLevel = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> fairnessAdmittedByLevel = new ConcurrentHashMap<>();
+    private final AtomicLong fairnessLastFlushMs = new AtomicLong(0);
+    private static final long FAIRNESS_FLUSH_INTERVAL_MS = 1000;
+
+    private static String consistencyLevelLabel(TransactionOption tx) {
+        if (!tx.isReadOnly) {
+            return "W:" + tx.minRequiredConsistency;
+        }
+        if (tx.readConcern == ReadConcern.LINEARIZABLE) {
+            return "R:LINEARIZABLE";
+        }
+        if (tx.readConcern == ReadConcern.EVENTUAL) {
+            return "R:EVENTUAL";
+        }
+        return (tx.readLevel == ReadLevel.MAJORITY) ? "R:CAUSAL_MAJORITY" : "R:CAUSAL_LOCAL";
+    }
+
+    private void recordAdmissionFairness(List<TransactionOption> transactions, int accepted) {
+        // Admission accepts a prefix of the candidate list, so index < accepted
+        // is exactly the admitted set.
+        for (int i = 0; i < transactions.size(); i++) {
+            String level = consistencyLevelLabel(transactions.get(i));
+            fairnessRequestedByLevel.computeIfAbsent(level, k -> new AtomicLong()).incrementAndGet();
+            if (i < accepted) {
+                fairnessAdmittedByLevel.computeIfAbsent(level, k -> new AtomicLong()).incrementAndGet();
+            }
+        }
+
+        long now = System.currentTimeMillis();
+        long last = fairnessLastFlushMs.get();
+        if (now - last >= FAIRNESS_FLUSH_INTERVAL_MS && fairnessLastFlushMs.compareAndSet(last, now)) {
+            flushAdmissionFairness(now);
+        }
+    }
+
+    private void flushAdmissionFairness(long now) {
+        // Rows carry cumulative totals per level; consumers diff consecutive rows
+        // to get per-interval rates. Cumulative keeps the file lossless even if a
+        // flush interval is skipped.
+        String csvPath = "admission_fairness_" + serverId + ".csv";
+        File file = new File(csvPath);
+        boolean writeHeader = !file.exists() || file.length() == 0;
+        try (FileWriter fw = new FileWriter(csvPath, true); PrintWriter out = new PrintWriter(fw)) {
+            if (writeHeader) {
+                out.println("Timestamp,Level,RequestedTotal,AdmittedTotal,RejectedTotal");
+            }
+            for (Map.Entry<String, AtomicLong> e : fairnessRequestedByLevel.entrySet()) {
+                long requested = e.getValue().get();
+                AtomicLong admittedCounter = fairnessAdmittedByLevel.get(e.getKey());
+                long admitted = (admittedCounter == null) ? 0 : admittedCounter.get();
+                out.printf("%d,%s,%d,%d,%d%n", now, e.getKey(), requested, admitted, requested - admitted);
+            }
+        } catch (IOException e) {
+            System.err.println("Failed to write " + csvPath + ": " + e.getMessage());
+        }
     }
 
     @Override

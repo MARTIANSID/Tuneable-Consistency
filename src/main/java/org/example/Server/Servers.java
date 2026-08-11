@@ -243,6 +243,7 @@ public class Servers{
         // Set whether servers should upgrade/tune transaction consistency.
         ServerImpl.setUpgradeTransactionsEnabled(UPGRADE_TRANSACTIONS);
         ServerImpl.setPressureModeEnabled(PRESSURE_MODE_ENABLED);
+        ServerImpl.setAdmissionControlEnabled(config.consistency.admissionControl);
 
         // Start client callback endpoint so ACK timestamps can be consumed.
         clientServerImpl = new ClientServerImpl();
@@ -1130,7 +1131,8 @@ public class Servers{
             "backlog_samples_%d.csv",
             "read_latencies_%d.csv",
             "process_batch_duration_%d.csv",
-            "liveness_%d.csv"
+            "liveness_%d.csv",
+            "admission_fairness_%d.csv"
         };
 
         // Global (non-server-specific) CSV files

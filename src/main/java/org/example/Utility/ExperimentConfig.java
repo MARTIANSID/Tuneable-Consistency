@@ -57,6 +57,7 @@ public final class ExperimentConfig {
     public static final class Consistency {
         public Boolean upgradeTransactions; // enable token-bucket based consistency upgrades
         public Boolean pressureMode;        // pressure-aware batch processing + deferrals
+        public Boolean admissionControl;    // token-bucket admission at enqueue time
     }
 
     public static final class NodeFailure {
@@ -228,6 +229,13 @@ public final class ExperimentConfig {
         require(consistency, "consistency");
         require(consistency.upgradeTransactions, "consistency.upgradeTransactions");
         require(consistency.pressureMode, "consistency.pressureMode");
+        require(consistency.admissionControl, "consistency.admissionControl");
+        if (consistency.admissionControl && consistency.pressureMode) {
+            throw new IllegalArgumentException(
+                    "consistency.admissionControl and consistency.pressureMode cannot both be true: "
+                    + "admission control charges tokens at enqueue time while pressure mode charges them "
+                    + "at batch time, so enabling both would charge every transaction twice. Disable one.");
+        }
 
         require(nodeFailure, "nodeFailure");
         require(nodeFailure.enabled, "nodeFailure.enabled");
