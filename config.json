@@ -2,19 +2,13 @@
   "cluster": {
     "numServers": 3,
     "serverHosts": ["localhost", "localhost", "localhost"],
-    "serverBasePort": 8000,
-    "clientCallbackHost": "localhost",
-    "callbackPortRangeStart": 9000,
-    "callbackPortRangeEnd": 9100
+    "serverBasePort": 8000
   },
-  "redis": {
-    "host": "127.0.0.1",
-    "port": 6379
-  },
-  "consistency": {
-    "upgradeTransactions": true,
-    "pressureMode": false,
-    "admissionControl": true
+  "chameleon": {
+    "maxWaitMs": 400,
+    "clientLostTimeoutMs": 10000,
+    "rttWindowSize": 64,
+    "clientRetryLimit": 3
   },
   "nodeFailure": {
     "enabled": false,
@@ -28,7 +22,6 @@
   "geo": {
     "enabled": false,
     "latencyMs": 50,
-    "includeClientCallbackLatency": false,
     "scriptPath": "./simulate_geo_latency.sh",
     "scriptTimeoutSeconds": 10,
     "clearOnExit": true,
@@ -38,31 +31,7 @@
     "bufferSeconds": 20,
     "runSinglePhase": false,
     "singlePhaseIndex": 0,
-    "singlePhaseDurationSeconds": 60,
-    "injectionBatchSize": 1000
-  },
-  "serverTuning": {
-    "batchIntervalMs": 20,
-    "maxBatchSize": 20000,
-    "maxItemsPerCycle": 2000
-  },
-  "batchProcessor": {
-    "leaderMaxLatencyMs": 60.0,
-    "followerMaxLatencyMs": 50.0
-  },
-  "tokenBucket": {
-    "maxTokens": 260000,
-    "refillRatePerSecond": 260000
-  },
-  "clientMetrics": {
-    "deadlinesMsByApp": { "1": 30, "2": 60, "3": 100 },
-    "lostTimeoutMs": 10000
-  },
-  "clientRouting": {
-    "mode": "PHASE_DISTRIBUTION",
-    "ewmaAlpha": 0.2,
-    "explorationRate": 0.05,
-    "baseWindowSize": 64
+    "singlePhaseDurationSeconds": 60
   },
   "phases": [
     {
@@ -71,7 +40,7 @@
       "totalTPS": 30000,
       "readPercentage": 0.90,
       "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL": 0.80, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
+      "readDistribution": { "EVENTUAL_LOCAL": 0.70, "EVENTUAL_MAJORITY": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
       "writeDistribution": { "1": 0.80, "2": 0.20 }
     },
     {
@@ -80,7 +49,7 @@
       "totalTPS": 30000,
       "readPercentage": 0.90,
       "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL": 0.25, "CAUSAL_LOCAL": 0.25, "CAUSAL_MAJORITY": 0.25, "LINEARIZABLE": 0.25 },
+      "readDistribution": { "EVENTUAL_LOCAL": 0.20, "EVENTUAL_MAJORITY": 0.20, "CAUSAL_LOCAL": 0.20, "CAUSAL_MAJORITY": 0.20, "LINEARIZABLE": 0.20 },
       "writeDistribution": { "1": 0.50, "2": 0.50 }
     },
     {
@@ -89,7 +58,7 @@
       "totalTPS": 70000,
       "readPercentage": 0.90,
       "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.10, "LINEARIZABLE": 0.70 },
+      "readDistribution": { "EVENTUAL_LOCAL": 0.05, "EVENTUAL_MAJORITY": 0.05, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.10, "LINEARIZABLE": 0.70 },
       "writeDistribution": { "1": 0.20, "2": 0.80 }
     },
     {
@@ -98,7 +67,7 @@
       "totalTPS": 30000,
       "readPercentage": 0.90,
       "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL": 0.80, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
+      "readDistribution": { "EVENTUAL_LOCAL": 0.70, "EVENTUAL_MAJORITY": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
       "writeDistribution": { "1": 0.80, "2": 0.20 }
     }
   ]

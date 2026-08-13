@@ -40,11 +40,16 @@
             <version>${grpc.version}</version>
         </dependency>
 
-        <!-- Redis -->
+        <!-- Logging (was a transitive dependency of the removed jedis) -->
         <dependency>
-            <groupId>redis.clients</groupId>
-            <artifactId>jedis</artifactId>
-            <version>8.0.0</version>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.17</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.17</version>
         </dependency>
 
         <!-- Gson for JSON -->

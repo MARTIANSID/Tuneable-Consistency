@@ -29,37 +29,24 @@ public final class ExperimentConfig {
     // --- Schema (wrapper types so that missing keys are detectable as null) ---
 
     public Cluster cluster;
-    public Redis redis;
-    public Consistency consistency;
+    public Chameleon chameleon;
     public NodeFailure nodeFailure;
     public TimedFailure timedFailure;
     public Geo geo;
     public Experiment experiment;
-    public ServerTuning serverTuning;
-    public BatchProcessorTuning batchProcessor;
-    public TokenBucket tokenBucket;
-    public ClientMetrics clientMetrics;
-    public ClientRouting clientRouting;
     public List<PhaseConfig> phases;
 
     public static final class Cluster {
         public Integer numServers;
-        public List<String> serverHosts;      // one entry per server
-        public Integer serverBasePort;        // server i listens on basePort + i + 1
-        public String clientCallbackHost;     // host servers dial back for ACKs
-        public Integer callbackPortRangeStart; // first port tried for the callback server
-        public Integer callbackPortRangeEnd;   // last port tried (inclusive)
+        public List<String> serverHosts; // one entry per server
+        public Integer serverBasePort;   // server i listens on basePort + i + 1
     }
 
-    public static final class Redis {
-        public String host;
-        public Integer port;
-    }
-
-    public static final class Consistency {
-        public Boolean upgradeTransactions; // enable token-bucket based consistency upgrades
-        public Boolean pressureMode;        // pressure-aware batch processing + deferrals
-        public Boolean admissionControl;    // token-bucket admission at enqueue time
+    public static final class Chameleon {
+        public Integer maxWaitMs;          // bound on every server-side wait; expiry falls back to no-wait level
+        public Integer clientLostTimeoutMs; // no response within this -> the client scores the request as lost
+        public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
+        public Integer clientRetryLimit;   // redirect/failure resends before giving up on a request
     }
 
     public static final class NodeFailure {
@@ -76,7 +63,6 @@ public final class ExperimentConfig {
     public static final class Geo {
         public Boolean enabled;      // Linux tc/netem only
         public Integer latencyMs;
-        public Boolean includeClientCallbackLatency;
         public String scriptPath;
         public Integer scriptTimeoutSeconds;
         public Boolean clearOnExit;
@@ -88,35 +74,6 @@ public final class ExperimentConfig {
         public Boolean runSinglePhase;     // run one phase for the whole experiment
         public Integer singlePhaseIndex;   // 0-based, used when runSinglePhase
         public Integer singlePhaseDurationSeconds; // duration when runSinglePhase
-        public Integer injectionBatchSize; // transactions per injected batch
-    }
-
-    public static final class ServerTuning {
-        public Integer batchIntervalMs;   // batch processing cadence per server
-        public Integer maxBatchSize;      // hard cap on transactions pulled per cycle
-        public Integer maxItemsPerCycle;  // soft cap per cycle
-    }
-
-    public static final class BatchProcessorTuning {
-        public Double leaderMaxLatencyMs;   // avg-latency cap on the leader
-        public Double followerMaxLatencyMs; // avg-latency cap on followers
-    }
-
-    public static final class TokenBucket {
-        public Double maxTokens;
-        public Double refillRatePerSecond;
-    }
-
-    public static final class ClientMetrics {
-        public Map<String, Integer> deadlinesMsByApp; // appId (as string) -> latency deadline in ms
-        public Integer lostTimeoutMs;                 // no ACK within this -> scored as lost
-    }
-
-    public static final class ClientRouting {
-        public String mode;            // PHASE_DISTRIBUTION (sampled level, round-robin) or LATENCY_AWARE
-        public Double ewmaAlpha;       // smoothing for per-(node,level) latency deltas
-        public Double explorationRate; // epsilon-greedy random (node, level) picks
-        public Integer baseWindowSize; // sliding window of base (eventual) latencies per node
     }
 
     public static final class PhaseConfig {
@@ -125,8 +82,10 @@ public final class ExperimentConfig {
         public Integer totalTPS;
         public Double readPercentage;
         public Double writePercentage;
-        public Map<String, Double> readDistribution;  // keys: EVENTUAL, CAUSAL_LOCAL, CAUSAL_MAJORITY, LINEARIZABLE
-        public Map<String, Double> writeDistribution; // keys: write concern as string, "1".."majority"
+        // keys: EVENTUAL_LOCAL, EVENTUAL_MAJORITY, CAUSAL_LOCAL, CAUSAL_MAJORITY, LINEARIZABLE
+        public Map<String, Double> readDistribution;
+        // keys: write concern as string, "1".."majority"
+        public Map<String, Double> writeDistribution;
     }
 
     // --- Loading ---
@@ -229,27 +188,15 @@ public final class ExperimentConfig {
                     + cluster.numServers + ") entries, got " + cluster.serverHosts.size());
         }
         requirePositive(cluster.serverBasePort, "cluster.serverBasePort");
-        require(cluster.clientCallbackHost, "cluster.clientCallbackHost");
-        requirePositive(cluster.callbackPortRangeStart, "cluster.callbackPortRangeStart");
-        requirePositive(cluster.callbackPortRangeEnd, "cluster.callbackPortRangeEnd");
-        if (cluster.callbackPortRangeEnd < cluster.callbackPortRangeStart) {
-            throw new IllegalArgumentException("cluster.callbackPortRangeEnd must be >= cluster.callbackPortRangeStart");
-        }
 
-        require(redis, "redis");
-        require(redis.host, "redis.host");
-        requirePositive(redis.port, "redis.port");
-
-        require(consistency, "consistency");
-        require(consistency.upgradeTransactions, "consistency.upgradeTransactions");
-        require(consistency.pressureMode, "consistency.pressureMode");
-        require(consistency.admissionControl, "consistency.admissionControl");
-        if (consistency.admissionControl && consistency.pressureMode) {
-            throw new IllegalArgumentException(
-                    "consistency.admissionControl and consistency.pressureMode cannot both be true: "
-                    + "admission control charges tokens at enqueue time while pressure mode charges them "
-                    + "at batch time, so enabling both would charge every transaction twice. Disable one.");
+        require(chameleon, "chameleon");
+        requirePositive(chameleon.maxWaitMs, "chameleon.maxWaitMs");
+        requirePositive(chameleon.clientLostTimeoutMs, "chameleon.clientLostTimeoutMs");
+        requirePositive(chameleon.rttWindowSize, "chameleon.rttWindowSize");
+        if (chameleon.rttWindowSize < 8) {
+            throw new IllegalArgumentException("chameleon.rttWindowSize must be >= 8, got " + chameleon.rttWindowSize);
         }
+        requirePositive(chameleon.clientRetryLimit, "chameleon.clientRetryLimit");
 
         require(nodeFailure, "nodeFailure");
         require(nodeFailure.enabled, "nodeFailure.enabled");
@@ -269,7 +216,6 @@ public final class ExperimentConfig {
         require(geo, "geo");
         require(geo.enabled, "geo.enabled");
         requirePositive(geo.latencyMs, "geo.latencyMs");
-        require(geo.includeClientCallbackLatency, "geo.includeClientCallbackLatency");
         require(geo.scriptPath, "geo.scriptPath");
         requirePositive(geo.scriptTimeoutSeconds, "geo.scriptTimeoutSeconds");
         require(geo.clearOnExit, "geo.clearOnExit");
@@ -282,59 +228,8 @@ public final class ExperimentConfig {
         }
         require(experiment.runSinglePhase, "experiment.runSinglePhase");
         require(experiment.singlePhaseIndex, "experiment.singlePhaseIndex");
-        requirePositive(experiment.injectionBatchSize, "experiment.injectionBatchSize");
         if (experiment.runSinglePhase) {
             requirePositive(experiment.singlePhaseDurationSeconds, "experiment.singlePhaseDurationSeconds");
-        }
-
-        require(serverTuning, "serverTuning");
-        requirePositive(serverTuning.batchIntervalMs, "serverTuning.batchIntervalMs");
-        requirePositive(serverTuning.maxBatchSize, "serverTuning.maxBatchSize");
-        requirePositive(serverTuning.maxItemsPerCycle, "serverTuning.maxItemsPerCycle");
-
-        require(batchProcessor, "batchProcessor");
-        requirePositive(batchProcessor.leaderMaxLatencyMs, "batchProcessor.leaderMaxLatencyMs");
-        requirePositive(batchProcessor.followerMaxLatencyMs, "batchProcessor.followerMaxLatencyMs");
-
-        require(tokenBucket, "tokenBucket");
-        requirePositive(tokenBucket.maxTokens, "tokenBucket.maxTokens");
-        requirePositive(tokenBucket.refillRatePerSecond, "tokenBucket.refillRatePerSecond");
-
-        require(clientMetrics, "clientMetrics");
-        require(clientMetrics.deadlinesMsByApp, "clientMetrics.deadlinesMsByApp");
-        if (clientMetrics.deadlinesMsByApp.isEmpty()) {
-            throw new IllegalArgumentException("clientMetrics.deadlinesMsByApp must not be empty");
-        }
-        for (Map.Entry<String, Integer> e : clientMetrics.deadlinesMsByApp.entrySet()) {
-            try {
-                Integer.parseInt(e.getKey());
-            } catch (NumberFormatException ex) {
-                throw new IllegalArgumentException("clientMetrics.deadlinesMsByApp key '" + e.getKey()
-                        + "' is not an integer applicationId");
-            }
-            requirePositive(e.getValue(), "clientMetrics.deadlinesMsByApp." + e.getKey());
-        }
-        requirePositive(clientMetrics.lostTimeoutMs, "clientMetrics.lostTimeoutMs");
-
-        require(clientRouting, "clientRouting");
-        require(clientRouting.mode, "clientRouting.mode");
-        if (!clientRouting.mode.equals("PHASE_DISTRIBUTION") && !clientRouting.mode.equals("LATENCY_AWARE")) {
-            throw new IllegalArgumentException("clientRouting.mode must be PHASE_DISTRIBUTION or LATENCY_AWARE, got '"
-                    + clientRouting.mode + "'");
-        }
-        requirePositive(clientRouting.ewmaAlpha, "clientRouting.ewmaAlpha");
-        if (clientRouting.ewmaAlpha > 1.0) {
-            throw new IllegalArgumentException("clientRouting.ewmaAlpha must be in (0, 1], got " + clientRouting.ewmaAlpha);
-        }
-        require(clientRouting.explorationRate, "clientRouting.explorationRate");
-        if (clientRouting.explorationRate < 0 || clientRouting.explorationRate >= 1) {
-            throw new IllegalArgumentException("clientRouting.explorationRate must be in [0, 1), got "
-                    + clientRouting.explorationRate);
-        }
-        requirePositive(clientRouting.baseWindowSize, "clientRouting.baseWindowSize");
-        if (clientRouting.baseWindowSize < 8) {
-            throw new IllegalArgumentException("clientRouting.baseWindowSize must be >= 8, got "
-                    + clientRouting.baseWindowSize);
         }
 
         require(phases, "phases");

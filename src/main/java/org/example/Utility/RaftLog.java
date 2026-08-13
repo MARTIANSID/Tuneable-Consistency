@@ -1,31 +1,24 @@
 package org.example.Utility;
 
-import org.example.raft.Log;
-import org.example.raft.LogEntryProto;
-import org.example.raft.TimeStampProto;
-
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.example.raft.LogEntryProto;
+
+/**
+ * The Raft log: an in-memory, 0-indexed list of KV write entries. Thread safe
+ * via an internal read-write lock; the owning ServerImpl additionally orders
+ * append/truncate against its own consensus lock.
+ */
 public class RaftLog {
     private final ArrayList<LogEntry> log;
     private final ReentrantReadWriteLock lock;
 
-    private int NUM_OF_SERVERS;
-
-    public RaftLog(int NUM_OF_SERVERS) {
+    public RaftLog() {
         this.log = new ArrayList<>();
         this.lock = new ReentrantReadWriteLock();
-        this.NUM_OF_SERVERS = NUM_OF_SERVERS;
-    }
-
-    public List<LogEntry> logEntriesFromIndex(int start, int end) {
-        if (start >= log.size()) {
-            return Collections.emptyList();
-        }
-        return new ArrayList<>(log.subList(start, end));
     }
 
     public void append(LogEntry entry) {
@@ -37,84 +30,24 @@ public class RaftLog {
         }
     }
 
-    public int getCurrentReplicationStatus(int index) {
-        int count = 0;
-        lock.readLock().lock();
-        try {
-            for (boolean isReplicated : log.get(index).serversThatReplicatedThisEntry) {
-                if (isReplicated) {
-                    count++;
-                }
-            }
-        } finally {
-            lock.readLock().unlock();
-        }
-        return count;
-    }
-
-    public void updateWriteConcern(int index, int serverId,
-            ConcurrentHashMap<Integer, ConcurrentLinkedQueue<Long>> ackTransactionTimeStampsForAllWriteConcerns,
-            ConcurrentHashMap<Integer, Object> writeConcernThroughputLocks,
-            ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks,
-            ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies,
-            ConcurrentHashMap<Integer, Long> writeConcernLatencySum) {
+    /** Append entries received from the leader (already consistency-checked); returns them. */
+    public List<LogEntry> appendProtoEntries(List<LogEntryProto> entries) {
         lock.writeLock().lock();
         try {
-            if (log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0
-                    && !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
-                log.get(index).writeConcern = log.get(index).writeConcern - 1;
+            List<LogEntry> appended = new ArrayList<>(entries.size());
+            for (LogEntryProto entry : entries) {
+                LogEntry logEntry = new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getKey(),
+                        entry.getValue(), entry.getOpId());
+                log.add(logEntry);
+                appended.add(logEntry);
             }
-
-            if(!log.get(index).serversThatReplicatedThisEntry.get(serverId)){
-                log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
-                int numberOfServersThisEntryGotReplicatedTo = getCurrentReplicationStatus(index);
-
-                if (numberOfServersThisEntryGotReplicatedTo == (NUM_OF_SERVERS / 2) + 1)
-                    return;
-                
-                synchronized (writeConcernThroughputLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
-                    ConcurrentLinkedQueue<Long> queue = ackTransactionTimeStampsForAllWriteConcerns
-                            .get(numberOfServersThisEntryGotReplicatedTo);
-                    Long currentTime = System.currentTimeMillis();
-                    while (!queue.isEmpty() && currentTime - queue.peek() >= 5000L) {
-                        queue.poll();
-                    }
-                    queue.add(currentTime);
-                }
-                calculateLatencyForWriteConcern(numberOfServersThisEntryGotReplicatedTo, index, writeConcernLatencies,
-                        writeConcernLatencySum, writeConcernLatencyLocks);
-            }
+            return appended;
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    private void calculateLatencyForWriteConcern(int numberOfServersThisEntryGotReplicatedTo, int index,
-            ConcurrentHashMap<Integer, Deque<Latency>> writeConcernLatencies,
-            ConcurrentHashMap<Integer, Long> writeConcernLatencySum,
-            ConcurrentHashMap<Integer, Object> writeConcernLatencyLocks) {
-        synchronized (writeConcernLatencyLocks.get(numberOfServersThisEntryGotReplicatedTo)) {
-            int writeConcernOfThisTransaction = numberOfServersThisEntryGotReplicatedTo;
-            Long timeStampOfTransaction = System.currentTimeMillis();
-            Long arrivalTimeOfThisEntryOnLeader = log.get(index).timeOfArrivalAtLeader;
-
-            Long currentLatency = (timeStampOfTransaction - arrivalTimeOfThisEntryOnLeader);
-            Deque<Latency> latencies = writeConcernLatencies.get(writeConcernOfThisTransaction);
-            while (!latencies.isEmpty() && (timeStampOfTransaction - latencies.peek().timestamp) >= 5000L) {
-                Latency latency = latencies.poll();
-                writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                        writeConcernLatencySum.get(writeConcernOfThisTransaction) - latency.latency);
-            }
-            latencies.add(new Latency(timeStampOfTransaction, currentLatency));
-            writeConcernLatencySum.put(writeConcernOfThisTransaction,
-                    writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
-        }
-    }
-
     public LogEntry get(int index) {
-        if (index < 0) {
-            return new LogEntry(-1, -1, null, -1, new HybridClock.TimeStamp(0L, 0L), new ArrayList<>(), 0, "", -1, -1);
-        }
         lock.readLock().lock();
         try {
             return log.get(index);
@@ -123,15 +56,22 @@ public class RaftLog {
         }
     }
 
-    public List<LogEntry> getEntries(int start, int end) {
+    /** Copy of entries in [start, end); clamped to the log size. */
+    public List<LogEntry> entriesInRange(int start, int end) {
         lock.readLock().lock();
         try {
-            return log.subList(start, end + 1);
+            int from = Math.max(0, start);
+            int to = Math.min(end, log.size());
+            if (from >= to) {
+                return Collections.emptyList();
+            }
+            return new ArrayList<>(log.subList(from, to));
         } finally {
             lock.readLock().unlock();
         }
     }
 
+    /** Remove entries from index (inclusive) to the end. */
     public void truncateAfter(int index) {
         lock.writeLock().lock();
         try {
@@ -168,80 +108,10 @@ public class RaftLog {
         }
     }
 
-    public List<LogEntry> logEntriesFromIndex(int index) {
-        lock.readLock().lock();
-        try {
-            return new ArrayList<>(log.subList(index, log.size()));
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
     public boolean checkIfPrevLogIndexHasPrevLogTerm(int prevLogIndex, int prevLogTerm) {
         lock.readLock().lock();
-
-        boolean check = false;
         try {
-            if (prevLogIndex == -1 || (prevLogIndex < log.size() && log.get(prevLogIndex).term == prevLogTerm)) {
-                check = true;
-            }
-        } finally {
-            lock.readLock().unlock();
-            return check;
-        }
-    }
-
-    // we expect a serverId because we want which server has replicated these
-    // entries
-    public void appendEntries(Log leadersEntries, int serverId) {
-
-        lock.writeLock().lock();
-
-        try {
-            List<LogEntryProto> entries = leadersEntries.getLogList();
-
-            for (LogEntryProto entry : entries) {
-
-                // I use new ArrayList here because for some reason the list returned from
-                // protobuf is immutable
-                log.add(new LogEntry(entry.getLogIndex(), entry.getTerm(), entry.getT(), entry.getWriteConcern(),
-                        HybridClock.TimeStamp.convertToTimeStamp(entry.getTimeStamp()),
-                        new ArrayList<>(entry.getServersThatReplicatedThisEntryList()), entry.getCopyOfWriteConcern(),
-                        entry.getCallbackHost(), entry.getCallbackPort(), entry.getTimeOfArrivalAtLeader())); // Ensure
-                                                                                                              // it's
-                                                                                                              // mutable
-
-                // here I update the writeConcern as well, but this method does not acquire lock
-                // and is private, this when followers add the entries sent from the leader
-                updateWriteConcernInternal(log.size() - 1, serverId);
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    private void updateWriteConcernInternal(int index, int serverId) {
-        if (log.get(index).writeConcern <= (NUM_OF_SERVERS / 2) && log.get(index).writeConcern > 0 &&
-                !log.get(index).serversThatReplicatedThisEntry.get(serverId)) {
-            log.get(index).writeConcern = log.get(index).writeConcern - 1;
-            log.get(index).serversThatReplicatedThisEntry.set(serverId, true);
-        }
-    }
-
-    public void clear() {
-        lock.writeLock().lock();
-        try {
-            log.clear();
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    public void printLog() {
-        lock.readLock().lock();
-
-        try {
-            System.out.println(log);
+            return prevLogIndex == -1 || (prevLogIndex < log.size() && log.get(prevLogIndex).term == prevLogTerm);
         } finally {
             lock.readLock().unlock();
         }

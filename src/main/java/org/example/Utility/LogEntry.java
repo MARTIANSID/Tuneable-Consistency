@@ -1,80 +1,28 @@
 package org.example.Utility;
 
-import org.example.raft.Transaction;
+/**
+ * One replicated KV write. Reads never enter the log (linearizable reads use
+ * ReadIndex), so entries carry only the write payload plus Raft bookkeeping.
+ * Write-concern acknowledgment tracking lives in the leader's wait
+ * registries, not in the entry.
+ */
+public final class LogEntry {
+    public final int index;
+    public final int term;
+    public final String key;
+    public final String value;
+    public final String opId;
 
-import java.util.HashSet;
-import java.util.*;
-
-public class LogEntry {
-    public int index;
-    public int term;
-    public Transaction t;
-    public int writeConcern = 2;
-    boolean ackSent;
-    public HybridClock.TimeStamp timeStamp;
-
-    public List<Boolean> serversThatReplicatedThisEntry;
-
-    public int copyOfWriteConcern;
-
-
-    // now if this timestamp is used at the follower end, there will some miscalculations for follower (this can only happen when leader fails and is not able to replicate to majority of servers, and on of the servers which have this entry becomes the leader). These little bit of miscalculations are fine as we only use them to adjust the writeConcern costs (this will ideally have the same effect for all)
-    public Long timeOfArrivalAtLeader;
-
-    public String clientHost;
-    public int clientPort;
-
-    // this constructor is for the leader
-    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, int NUM_OF_SERVERS, long timeOfArrivalAtLeader, String clientHost, int clientPort) {
+    public LogEntry(int index, int term, String key, String value, String opId) {
         this.index = index;
         this.term = term;
-        this.t = t;
-        this.writeConcern = writeConcern;
-        this.ackSent = false;
-        this.timeStamp = timeStamp;
-        this.serversThatReplicatedThisEntry = new ArrayList<>();
-        // it is expected that the server does not deduct the write concern before adding it in log
-        // this copy is used at the time of ack to compute the throughput for individual writeConcerns
-        this.copyOfWriteConcern = writeConcern;
-        this.timeOfArrivalAtLeader = timeOfArrivalAtLeader;
-        this.clientHost = clientHost;
-        this.clientPort = clientPort;
-
-        for(int i = 0 ; i < NUM_OF_SERVERS; i ++) {
-            // false means that this entry was not replicated on this server
-            serversThatReplicatedThisEntry.add(false);
-        }
-    }
-    // this constructor is for the follower to use
-    public LogEntry(int index, int term, Transaction t, int writeConcern, HybridClock.TimeStamp timeStamp, List<Boolean> serversThatReplicatedThisEntry, int copyOfWriteConcern, String clientHost, int clientPort, long timeOfArrivalAtLeader){
-        this.index = index;
-        this.term = term;
-        this.t = t;
-        this.writeConcern = writeConcern;
-        this.ackSent = false;
-        this.timeStamp = timeStamp;
-        this.serversThatReplicatedThisEntry = serversThatReplicatedThisEntry;
-        this.copyOfWriteConcern = copyOfWriteConcern;
-        this.clientHost = clientHost;
-        this.clientPort = clientPort;
-        this.timeOfArrivalAtLeader = timeOfArrivalAtLeader;
-
-//        for(int i = 0 ; i < 5; i ++) {
-//            serversThatReplicatedThisEntry.set(i, serversThatReplicatedThisEntry.get(i));
-//            // false means that this entry was not replicated on this server
-//        }
+        this.key = key;
+        this.value = value;
+        this.opId = opId;
     }
 
-
-    public LogEntry(int index, int term, Transaction t) {
-        this.index = index;
-        this.term = term;
-        this.t = t;
-        this.writeConcern = 2;
-        this.ackSent = false;
-    }
     @Override
     public String toString() {
-        return "The Transaction is: " + t + " The time stamp is" + timeStamp + "The servers that replicated the entry are --" +serversThatReplicatedThisEntry.toString();
+        return "LogEntry{index=" + index + ", term=" + term + ", key=" + key + "}";
     }
 }

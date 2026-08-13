@@ -2,12 +2,11 @@
 #
 # run_all.sh - all-in-one local experiment runner.
 #
-#   1. Preflight checks (java 17+, maven, redis, tmux) - fails fast, no silent fallbacks
+#   1. Preflight checks (java 17+, maven, tmux) - fails fast, no silent fallbacks
 #   2. Builds the project (foreground, so build errors stop everything immediately)
 #   3. Runs the experiment inside a detached tmux session "tuneable":
-#        redis      - redis-server (only if one is not already running on 6379)
 #        experiment - the run itself
-#        metrics    - live tail of system_tps_global.csv
+#        metrics    - live tail of client_metrics_global.csv
 #   4. The experiment executes with runs/<label>_<timestamp>/ as its working
 #      directory, so every CSV plus run.log and run_info.txt is written there
 #      directly and the repo root stays clean.
@@ -30,7 +29,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$REPO_DIR/run_all.sh"
 SESSION="tuneable"
-REDIS_PORT=6379
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -75,9 +73,8 @@ if [[ "${1:-}" == "_experiment" ]]; then
     } > run_info.txt
 
     if [[ $RUN_EXIT -eq 0 ]]; then
-        # Success: nothing to inspect, take the whole session down (this also
-        # stops redis if this script started it). This kills our own pane, so
-        # it must be the last statement.
+        # Success: nothing to inspect, take the whole session down. This kills
+        # our own pane, so it must be the last statement.
         tmux kill-session -t "$SESSION"
     else
         echo
@@ -113,15 +110,6 @@ JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/
 tmux has-session -t "$SESSION" 2>/dev/null && \
     die "tmux session '$SESSION' already exists (previous run?). Inspect or remove it: tmux kill-session -t $SESSION"
 
-# --- Redis ---
-REDIS_STARTED_BY_US=0
-if command -v redis-cli >/dev/null && [[ "$(redis-cli -p $REDIS_PORT ping 2>/dev/null)" == "PONG" ]]; then
-    echo "Redis already running on port $REDIS_PORT - using it (will not be stopped by this script)."
-else
-    command -v redis-server >/dev/null || die "redis-server not found and no Redis running on port $REDIS_PORT. Install: brew install redis"
-    REDIS_STARTED_BY_US=1
-fi
-
 # --- Build (foreground: a build failure should stop everything, loudly) ---
 # Built into target-script/ (see pom build.dir property) so the IDE's
 # concurrent compilation into target/ can never corrupt what we run.
@@ -133,26 +121,12 @@ mkdir -p "$RUN_DIR"
 # --- tmux session (detached; the calling terminal is never attached) ---
 echo "Creating tmux session '$SESSION'..."
 
-if [[ $REDIS_STARTED_BY_US -eq 1 ]]; then
-    tmux new-session -d -s "$SESSION" -n redis -c "$REPO_DIR" \
-        "redis-server --port $REDIS_PORT --save '' --appendonly no"
-    # Wait until Redis answers before the experiment tries to use it.
-    for i in $(seq 1 20); do
-        [[ "$(redis-cli -p $REDIS_PORT ping 2>/dev/null)" == "PONG" ]] && break
-        [[ $i -eq 20 ]] && die "Redis did not respond on port $REDIS_PORT within 10s (see tmux window 'redis')"
-        sleep 0.5
-    done
-    echo "Redis started inside tmux (dies with the session)."
-    tmux new-window -t "$SESSION" -n experiment -c "$RUN_DIR" \
-        "'$SCRIPT_PATH' _experiment '$LABEL' '$CONFIG_PATH'"
-else
-    tmux new-session -d -s "$SESSION" -n experiment -c "$RUN_DIR" \
-        "'$SCRIPT_PATH' _experiment '$LABEL' '$CONFIG_PATH'"
-fi
+tmux new-session -d -s "$SESSION" -n experiment -c "$RUN_DIR" \
+    "'$SCRIPT_PATH' _experiment '$LABEL' '$CONFIG_PATH'"
 
-# Live metrics: file appears once the leader starts writing; tail -F waits for it.
+# Live metrics: file appears once the client ledger starts flushing; tail -F waits for it.
 tmux new-window -t "$SESSION" -n metrics -c "$RUN_DIR" \
-    "echo 'Waiting for system_tps_global.csv (appears after leader election)...'; tail -F system_tps_global.csv"
+    "echo 'Waiting for client_metrics_global.csv (appears once the workload starts)...'; tail -F client_metrics_global.csv"
 
 echo
 echo "Experiment running (label: $LABEL). Peek anytime with: tmux attach -t $SESSION"

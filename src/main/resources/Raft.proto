@@ -3,130 +3,38 @@ option java_multiple_files = true;
 option java_package = "org.example.raft";
 package raft;
 
+// ============================================================
+// Raft internals (server to server)
+// ============================================================
+
 service Raft {
-  rpc SendTransaction(ClientMessage) returns (Empty);
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
-  rpc sendAckToClient(Ack) returns (Empty);
 }
 
-
-message Empty{
-  int32 data = 1;
-}
-
-enum ReadConcern {
-  LINEARIZABLE = 0;
-  CAUSAL = 1;
-  EVENTUAL = 2;
-}
-enum ReadLevel {
-  LOCAL = 0;
-  MAJORITY = 1;
-}
-
-message AckMessage {
-  Transaction t = 1;
-  TimeStampProto timStamp = 2;
-  int32 currentLeader = 3;
-
-  // for read transactions
-  double balance = 4;
-  string accName = 5;
-  bool failure = 6;
-  bool resultNotReady = 7;
-  string id = 8;
-
-  // The consistency level the transaction actually executed at (after any
-  // server-side upgrade). executedLevelIncluded distinguishes "not reported"
-  // from proto3 defaults (ReadConcern LINEARIZABLE = 0, writeConcern 0).
-  bool executedLevelIncluded = 9;
-  ReadConcern executedReadConcern = 10;
-  ReadLevel executedReadLevel = 11;
-  int32 executedWriteConcern = 12;
-
-  // Chameleon stage 1: value returned for KV reads (balance is the legacy
-  // bank-model equivalent and dies in stage 2).
-  string readValue = 13;
-}
-
-message Ack {
-  // later on we can add more fields like timestamp for causal consistency
-  repeated AckMessage ackMessage = 1;
-}
-
-message ClientMessage {
-  Transaction t = 1;
-  int32 writeConcern = 2;
-  TimeStampProto timeStamp = 3;
-
-  string callbackHost = 4;
-  int32 callbackPort = 5;
-}
-
-message Transaction {
-  string sender = 1;
-  string receiver = 2;
-  double amount = 3;
-  string id = 4;
-  int64 transactionSendTimeInMs = 5;
-  int32 minRequiredConsistency = 6;
-  double baseProfit = 7;
-  double extraProfitMajority = 8;
-  double extraIntermediateProfit = 9;
-  int32 writeConcern = 10;
-  // this is there to check in which batch this transaction was actually processed
-  int32 batchNo = 11;
-
-  // for read transactions
-  bool isReadOnly = 12;
-  string readRequestedId = 13;
-  string accNameToRead = 14;
-  ReadConcern readConcern = 15;
-  int32 applicationId = 16;
-  int64 transactionArrivalTimeOnLeader = 17;
-  ReadLevel readLevel = 18;
-
-  // Chameleon stage 1: single-key KV data model. Writes carry key+value,
-  // reads carry key. The bank fields (sender/receiver/amount/accNameToRead)
-  // are legacy and die in stage 2.
-  string key = 19;
-  string value = 20;
-}
+// Log entries are pure KV writes. Reads never enter the log: linearizable
+// reads use ReadIndex, everything else serves from local state.
 message LogEntryProto {
   int32 logIndex = 1;
   int32 term = 2;
-  int32 writeConcern = 3;
-  Transaction t = 4;
-  TimeStampProto timeStamp = 5;
-  repeated bool serversThatReplicatedThisEntry = 6;
-  int32 copyOfWriteConcern = 7;
-  string callbackHost = 8;
-  int32 callbackPort = 9;
-  int64 timeOfArrivalAtLeader = 10;
-
-}
-
-message TimeStampProto {
-  int64 p = 1;
-  int64 l = 2;
-}
-
-message Log {
-  repeated LogEntryProto log = 1;
+  string key = 3;
+  string value = 4;
+  string opId = 5;
 }
 
 message AppendEntriesArgument {
   int32 leadersTerm = 1;
-  int32 prevLogIndex = 2;
-  int32 leadersId = 3;
+  int32 leadersId = 2;
+  int32 prevLogIndex = 3;
   int32 prevLogTerm = 4;
-  Log entriesToAppend = 5;
+  repeated LogEntryProto entries = 5;
   int32 leadersCommit = 6;
-  int32 ackIndex = 7;
-  TimeStampProto timeStamp = 8;
-  double systemThroughput = 9;
-  bool systemThroughputIncluded = 10;
+}
+
+message AppendEntriesResult {
+  int32 currentTerm = 1;
+  bool isSuccessFull = 2;
+  int32 followerId = 3;
 }
 
 message RequestVoteArguments {
@@ -136,20 +44,64 @@ message RequestVoteArguments {
   int32 lastLogTerm = 4;
 }
 
-message AppendEntriesResult {
-  int32 currentTerm = 1;
-  bool isSuccessFull = 2;
-  int32 followerId = 3;
-  TimeStampProto timeStamp = 4;
-  double followerReadThroughput = 5;
-  bool readThroughputIncluded = 6;
-}
 message RequestVoteResult {
   int32 currentTerm = 1;
   bool isVoteGranted = 2;
 }
 
+// ============================================================
+// Client protocol (Chameleon)
+// ============================================================
 
+service KvClient {
+  // Bidirectional session stream. Requests and responses are correlated by
+  // requestId; responses may arrive out of order (waits overlap).
+  rpc Session(stream KvRequest) returns (stream KvResponse);
+}
 
+// MongoDB-style read levels on Raft. LOCAL serves from the replica's log
+// (may contain uncommitted entries a leader change can roll back), MAJORITY
+// serves from majority-committed state.
+enum ReadLevel {
+  EVENTUAL_LOCAL = 0;
+  EVENTUAL_MAJORITY = 1;
+  CAUSAL_LOCAL = 2;
+  CAUSAL_MAJORITY = 3;
+  LINEARIZABLE = 4;
+}
 
+// Log indices in this protocol are 0-based; -1 means "none". Clients must
+// set the session index fields explicitly on every request.
+message KvRequest {
+  int64 requestId = 1;
+  int32 applicationId = 2;
+  int32 slaId = 3;
+  bool isRead = 4;
+  string key = 5;
+  string value = 6;                  // writes only
+  int32 committedSessionIndex = 7;   // causal-majority anchor, -1 = none
+  int32 uncommittedSessionIndex = 8; // causal-local anchor, -1 = none
+  double rttEstimateMs = 9;          // client's RTT estimate to this server
 
+  // Stage 2 only: the workload forces the level per request. These fields
+  // die when the rung scorer lands (stage 4) and the server decides.
+  ReadLevel forcedReadLevel = 10;
+  int32 forcedWriteConcern = 11;     // 1..majority
+}
+
+// satisfiedRung is added in stage 4 when SLAs exist.
+message KvResponse {
+  int64 requestId = 1;
+  bool ok = 2;
+  bool notLeader = 3;                // redirect: resend to leaderId
+  int32 leaderId = 4;                // valid when notLeader; -1 = unknown
+  string value = 5;                  // reads; "" when the key is absent
+  int32 valueIndex = 6;              // log index of the returned value's write (write: the entry's index); -1 = absent
+  ReadLevel deliveredReadLevel = 7;
+  int32 deliveredWriteConcern = 8;   // replication count at acknowledgment
+  bool waited = 9;                   // request waited server-side (excluded from RTT sampling)
+  bool timedOutAndFellBack = 10;     // wait expired; served at the strongest no-wait level
+  int32 logIndex = 11;               // node's last log index at reply
+  int32 commitIndex = 12;            // node's commit index at reply
+  double serviceTimeMs = 13;         // reply time minus t_recv, monotonic clock
+}
