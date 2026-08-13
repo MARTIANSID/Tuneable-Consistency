@@ -10,6 +10,10 @@ package raft;
 service Raft {
   rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
+  // Follower linearizable reads (stage 6, behind a config flag): a follower
+  // asks the leader for a confirmed read index, then waits for its own commit
+  // index to reach it before serving from local committed state.
+  rpc ConfirmReadIndex(ReadIndexRequest) returns (ReadIndexResult);
 }
 
 // Log entries are pure KV writes. Reads never enter the log: linearizable
@@ -47,6 +51,16 @@ message RequestVoteArguments {
 message RequestVoteResult {
   int32 currentTerm = 1;
   bool isVoteGranted = 2;
+}
+
+message ReadIndexRequest {
+  int32 requesterId = 1;
+}
+
+message ReadIndexResult {
+  bool success = 1;    // false: the callee is not the leader (see leaderId)
+  int32 readIndex = 2; // leader's commit index, confirmed by a majority round
+  int32 leaderId = 3;  // callee's best-known leader when success is false; -1 = unknown
 }
 
 // ============================================================

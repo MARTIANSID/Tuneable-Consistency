@@ -42,10 +42,20 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     // Global backstop on any server-side wait (from config).
     private static volatile long MAX_WAIT_MS = 400;
     private static volatile double REPLICATION_BUDGET_PER_SECOND = 20000;
+    // Stage 6: followers may serve linearizable reads by fetching a confirmed
+    // read index from the leader and waiting for their own commit index to
+    // reach it. Off by default until measured.
+    private static volatile boolean FOLLOWER_LINEARIZABLE_READS = false;
 
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
         MAX_WAIT_MS = config.chameleon.maxWaitMs;
         REPLICATION_BUDGET_PER_SECOND = config.chameleon.replicationBudgetPerSecond;
+        FOLLOWER_LINEARIZABLE_READS = config.chameleon.followerLinearizableReads;
+    }
+
+    /** Test-only: toggle follower linearizable reads without a full config. */
+    static void setFollowerLinearizableReadsForTest(boolean enabled) {
+        FOLLOWER_LINEARIZABLE_READS = enabled;
     }
 
     private static final int READ_LEVELS = 5;
@@ -176,7 +186,8 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             return;
         }
         boolean leader = node.isLeader();
-        int maxLevel = leader ? READ_LEVELS - 1 : READ_LEVELS - 2; // linearizable is leader-only
+        // Linearizable is leader-only unless follower reads are enabled.
+        int maxLevel = (leader || FOLLOWER_LINEARIZABLE_READS) ? READ_LEVELS - 1 : READ_LEVELS - 2;
         double rho = request.getRttEstimateMs();
         double lambda = plane.lambda();
         int uncommittedAnchor = request.getUncommittedSessionIndex();
@@ -249,19 +260,31 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                                     node.kv.readCommitted(key), true, true, boundMs));
                 }
             }
-            case LINEARIZABLE -> node.confirmLeadership().orTimeout(boundMs, TimeUnit.MILLISECONDS)
-                    .whenCompleteAsync((readIndex, error) -> {
-                        if (error == null) {
-                            completeRead(request, tRecvNanos, out, chosen, ReadLevel.LINEARIZABLE,
-                                    node.kv.readCommitted(key), true, false, 0);
-                        } else if (unwrap(error) instanceof ServerImpl.NotLeaderException) {
-                            releaseRider(chosen);
-                            send(out, notLeader(request), tRecvNanos);
-                        } else {
-                            completeRead(request, tRecvNanos, out, chosen, ReadLevel.EVENTUAL_MAJORITY,
-                                    node.kv.readCommitted(key), true, true, boundMs);
-                        }
-                    }, node.executorService);
+            case LINEARIZABLE -> {
+                // Leader: ReadIndex confirmation; the committed view already
+                // covers the returned index (state-before-index). Follower
+                // (flag-gated): fetch the confirmed index from the leader,
+                // then wait for the own commit index to reach it.
+                CompletableFuture<Void> ready = node.isLeader()
+                        ? node.confirmLeadership().thenApply(readIndex -> null)
+                        : node.readIndexFromLeader().thenCompose(readIndex ->
+                                node.currentCommitIndex() >= readIndex
+                                        ? CompletableFuture.completedFuture(null)
+                                        : node.awaitCommitIndex(readIndex));
+                ready.orTimeout(boundMs, TimeUnit.MILLISECONDS)
+                        .whenCompleteAsync((v, error) -> {
+                            if (error == null) {
+                                completeRead(request, tRecvNanos, out, chosen, ReadLevel.LINEARIZABLE,
+                                        node.kv.readCommitted(key), true, false, 0);
+                            } else if (unwrap(error) instanceof ServerImpl.NotLeaderException) {
+                                releaseRider(chosen);
+                                send(out, notLeader(request), tRecvNanos);
+                            } else {
+                                completeRead(request, tRecvNanos, out, chosen, ReadLevel.EVENTUAL_MAJORITY,
+                                        node.kv.readCommitted(key), true, true, boundMs);
+                            }
+                        }, node.executorService);
+            }
             default -> send(out, failure(request), tRecvNanos);
         }
     }

@@ -13,12 +13,13 @@
     "clientLostTimeoutMs": 10000,
     "rttWindowSize": 64,
     "clientRetryLimit": 3,
-    "sMax": 150,
+    "sMax": 130,
     "controlIntervalMs": 100,
-    "replicationBudgetPerSecond": 20000,
+    "replicationBudgetPerSecond": 30000,
     "uTarget": 0.85,
     "eta": 1.0,
-    "lambdaMin": 0.0001
+    "lambdaMin": 0.0001,
+    "followerLinearizableReads": false
   },
   "workload": {
     "keySpace": 100,

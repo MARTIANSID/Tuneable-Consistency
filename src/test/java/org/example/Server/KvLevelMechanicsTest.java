@@ -171,6 +171,40 @@ class KvLevelMechanicsTest {
     }
 
     @Test
+    void followerServesLinearizableReadsWhenEnabled() throws Exception {
+        SlaRegistry.registerReadSla(16, 1, List.of(read(LIN, 1000, 5)));
+        SlaRegistry.registerWriteSla(16, 1, List.of(write(2, 1000, 5)));
+
+        KvClientService.setFollowerLinearizableReadsForTest(true);
+        try (TestCluster cluster = new TestCluster(19600)) {
+            ServerImpl leader = cluster.awaitLeader(15_000);
+            ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+
+            try (TestSession leaderSession = new TestSession(cluster.portOf(leader.nodeId()));
+                    TestSession followerSession = new TestSession(cluster.portOf(follower.nodeId()))) {
+
+                KvResponse write = leaderSession.write("flr-key", "flr-value", 16, 1);
+                assertTrue(write.getOk());
+
+                // The LIN-only SLA is now satisfiable on the follower: no
+                // redirect. The follower fetches a confirmed read index from
+                // the leader, waits for its own commit index, and serves the
+                // committed write linearizably.
+                KvResponse read = followerSession.read("flr-key", 16, 1, -1, -1);
+                assertTrue(read.getOk(), "follower must serve the linearizable read itself");
+                assertEquals(LIN, read.getDeliveredReadLevel());
+                assertEquals("flr-value", read.getValue());
+                assertTrue(read.getWaited(), "the leader round trip counts as waiting");
+                assertFalse(read.getTimedOutAndFellBack());
+                assertTrue(read.getValueIndex() >= write.getValueIndex(),
+                        "linearizable read must observe the committed write");
+            }
+        } finally {
+            KvClientService.setFollowerLinearizableReadsForTest(false);
+        }
+    }
+
+    @Test
     void sessionClientKeepsReadYourWritesUnderLoad() throws Exception {
         SlaRegistry.registerReadSla(15, 1, List.of(read(CM, 1000, 4), read(CL, 500, 2)));
         SlaRegistry.registerWriteSla(15, 1, List.of(write(2, 1000, 4), write(1, 500, 2)));

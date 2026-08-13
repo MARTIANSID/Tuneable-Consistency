@@ -55,6 +55,7 @@ public final class ExperimentConfig {
         public Double uTarget;             // price controller utilization target (~0.85)
         public Double eta;                 // price controller gain (~1)
         public Double lambdaMin;           // price floor; only its order of magnitude matters
+        public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round; off until measured
     }
 
     /** Key selection for the workload; reads and writes draw from the same distribution. */
@@ -268,6 +269,7 @@ public final class ExperimentConfig {
         requirePositive(chameleon.uTarget, "chameleon.uTarget");
         requirePositive(chameleon.eta, "chameleon.eta");
         requirePositive(chameleon.lambdaMin, "chameleon.lambdaMin");
+        require(chameleon.followerLinearizableReads, "chameleon.followerLinearizableReads");
 
         require(workload, "workload");
         requirePositive(workload.keySpace, "workload.keySpace");

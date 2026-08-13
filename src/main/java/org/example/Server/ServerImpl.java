@@ -29,6 +29,8 @@ import org.example.raft.AppendEntriesResult;
 import org.example.raft.LogEntryProto;
 import org.example.raft.RaftGrpc;
 import org.example.raft.RaftGrpc.RaftStub;
+import org.example.raft.ReadIndexRequest;
+import org.example.raft.ReadIndexResult;
 import org.example.raft.RequestVoteArguments;
 import org.example.raft.RequestVoteResult;
 import org.slf4j.Logger;
@@ -291,14 +293,32 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 return;
             }
 
-            // Truncate any conflicting suffix (rebuilds the local KV view).
-            truncateSuffixAndRebuildLocal(prevLogIndex + 1);
-
-            // State before index (see appendWrite): apply each entry to the
-            // local KV view before the log publishes its index.
+            // Raft 5.3: truncate only at the first entry whose (index, term)
+            // conflicts with ours, never on a matching prefix. The leader
+            // sends rounds every 30 ms without waiting for responses, so
+            // duplicate and reordered rounds are routine; an unconditional
+            // truncation at prevLogIndex+1 would wipe and re-append the log on
+            // every stale round, and a stale empty probe would wipe it
+            // outright - after which the monotonic wait registries would let
+            // causal reads serve the emptied view.
             List<LogEntryProto> entries = args.getEntriesList();
-            if (!entries.isEmpty()) {
-                for (LogEntryProto proto : entries) {
+            int skip = 0;
+            while (skip < entries.size()) {
+                LogEntryProto proto = entries.get(skip);
+                if (proto.getLogIndex() < log.size() && log.get(proto.getLogIndex()).term == proto.getTerm()) {
+                    skip++;
+                } else {
+                    break;
+                }
+            }
+            if (skip < entries.size()) {
+                // Truncate any genuinely conflicting suffix (rebuilds the
+                // local KV view), then append the new entries. State before
+                // index (see appendWrite): apply each entry to the local KV
+                // view before the log publishes its index.
+                truncateSuffixAndRebuildLocal(entries.get(skip).getLogIndex());
+                for (int i = skip; i < entries.size(); i++) {
+                    LogEntryProto proto = entries.get(i);
                     LogEntry entry = new LogEntry(proto.getLogIndex(), proto.getTerm(), proto.getKey(),
                             proto.getValue(), proto.getOpId());
                     kv.applyLocal(entry);
@@ -837,6 +857,78 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             confirmation.future.completeExceptionally(
                     new NotLeaderException(currentLeader, "stepped down from leadership"));
         }
+    }
+
+    /**
+     * RPC handler: a follower asks this node (believing it the leader) for a
+     * confirmed read index. Runs the same ReadIndex confirmation as a local
+     * linearizable read; a non-leader answers success=false with its best
+     * leader hint instead of an error, so the caller can redirect.
+     */
+    @Override
+    public void confirmReadIndex(ReadIndexRequest request, StreamObserver<ReadIndexResult> responseObserver) {
+        if (shouldDropServerNetworkTraffic()) {
+            responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("Node is configured as failed: confirmReadIndex dropped")
+                    .asRuntimeException());
+            return;
+        }
+        confirmLeadership().whenComplete((readIndex, error) -> {
+            ReadIndexResult result = (error == null)
+                    ? ReadIndexResult.newBuilder().setSuccess(true).setReadIndex(readIndex)
+                            .setLeaderId(serverId).build()
+                    : ReadIndexResult.newBuilder().setSuccess(false).setReadIndex(-1)
+                            .setLeaderId(currentLeader == serverId ? -1 : currentLeader).build();
+            synchronized (responseObserver) {
+                try {
+                    responseObserver.onNext(result);
+                    responseObserver.onCompleted();
+                } catch (RuntimeException e) {
+                    LOG.debug("Dropping confirmReadIndex reply on server {}: {}", serverId, e.toString());
+                }
+            }
+        });
+    }
+
+    /**
+     * Follower-side half of follower linearizable reads: obtain a confirmed
+     * read index from the current leader. The caller must then wait for this
+     * node's own commit index to reach the returned index before serving from
+     * the committed view. Fails with NotLeaderException when no leader is
+     * known or the presumed leader has stepped down.
+     */
+    public CompletableFuture<Integer> readIndexFromLeader() {
+        if (status == ServerCurrentStatus.LEADER) {
+            return confirmLeadership();
+        }
+        int leaderId = currentLeader;
+        if (leaderId < 0 || leaderId == serverId || dropAllServerNetworkTraffic) {
+            return CompletableFuture.failedFuture(
+                    new NotLeaderException(-1, "server " + serverId + " knows no leader to ask for a read index"));
+        }
+        CompletableFuture<Integer> future = new CompletableFuture<>();
+        stubs[leaderId].confirmReadIndex(ReadIndexRequest.newBuilder().setRequesterId(serverId).build(),
+                new StreamObserver<>() {
+                    @Override
+                    public void onNext(ReadIndexResult result) {
+                        if (result.getSuccess()) {
+                            future.complete(result.getReadIndex());
+                        } else {
+                            future.completeExceptionally(new NotLeaderException(result.getLeaderId(),
+                                    "server " + leaderId + " is no longer the leader"));
+                        }
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                    }
+                });
+        return future;
     }
 
     /**
