@@ -36,6 +36,7 @@ public final class ClientMetricsTracker {
         final AtomicLong fallbacks = new AtomicLong();
         final AtomicLong redirects = new AtomicLong();
         final AtomicLong failures = new AtomicLong();
+        final AtomicLong rejected = new AtomicLong();
         final AtomicLong lost = new AtomicLong();
         final AtomicLong violations = new AtomicLong();
         final DoubleAdder latencySumMs = new DoubleAdder();
@@ -70,6 +71,20 @@ public final class ClientMetricsTracker {
     public static void recordFailure(int nodeId, String chosen) {
         cell(nodeId, chosen, "-").failures.incrementAndGet();
         maybeFlush();
+    }
+
+    /** Admission control shed the request; not retried by design. */
+    public static void recordRejected(int nodeId, String chosen) {
+        cell(nodeId, chosen, "-").rejected.incrementAndGet();
+        maybeFlush();
+    }
+
+    public static long totalRejected() {
+        long total = 0;
+        for (Cell c : cells.values()) {
+            total += c.rejected.get();
+        }
+        return total;
     }
 
     public static void recordLost(int nodeId, String chosen) {
@@ -119,16 +134,17 @@ public final class ClientMetricsTracker {
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,NodeId,ChosenLevel,ExecutedLevel,CountTotal,AvgLatencyMs,FallbacksTotal,RedirectsTotal,FailuresTotal,LostTotal,SessionViolationsTotal");
+                out.println("Timestamp,NodeId,ChosenLevel,ExecutedLevel,CountTotal,AvgLatencyMs,FallbacksTotal,RedirectsTotal,FailuresTotal,RejectedTotal,LostTotal,SessionViolationsTotal");
             }
             for (Map.Entry<Key, Cell> e : cells.entrySet()) {
                 Key k = e.getKey();
                 Cell c = e.getValue();
                 long count = c.count.get();
                 double avg = count == 0 ? 0.0 : c.latencySumMs.sum() / count;
-                out.printf("%d,%d,%s,%s,%d,%.3f,%d,%d,%d,%d,%d%n",
+                out.printf("%d,%d,%s,%s,%d,%.3f,%d,%d,%d,%d,%d,%d%n",
                         now, k.nodeId(), k.chosen(), k.executed(), count, avg,
-                        c.fallbacks.get(), c.redirects.get(), c.failures.get(), c.lost.get(), c.violations.get());
+                        c.fallbacks.get(), c.redirects.get(), c.failures.get(), c.rejected.get(), c.lost.get(),
+                        c.violations.get());
             }
         } catch (IOException e) {
             System.err.println("Failed to write " + CSV_PATH + ": " + e.getMessage());

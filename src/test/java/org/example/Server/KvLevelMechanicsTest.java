@@ -5,126 +5,86 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.example.Client.KvSessionClient;
-import org.example.raft.KvClientGrpc;
-import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
 import org.example.raft.ReadLevel;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
-
 /**
- * Level mechanics over the real client protocol: every read level and write
- * concern exercised through gRPC session streams against a live cluster,
- * including wait-timeout fallback, leader redirects, and the session
- * guarantee assertions of the real client under load.
+ * Level mechanics through the SLA-driven request path: the scorer chooses the
+ * level, so tests steer it with single-rung SLAs. On fresh clusters all
+ * histogram cells are empty (free and certain), so ties between levels
+ * satisfying the same rungs break toward the weakest level, which makes the
+ * chosen level deterministic; assertions that tolerate upgrades say so.
  */
 class KvLevelMechanicsTest {
 
-    /** Minimal blocking session for tests: send one request, await its response. */
-    private static final class TestSession implements AutoCloseable {
-        private final ManagedChannel channel;
-        private final StreamObserver<KvRequest> stream;
-        private final ConcurrentHashMap<Long, CompletableFuture<KvResponse>> waiting = new ConcurrentHashMap<>();
-        private final AtomicLong ids = new AtomicLong();
+    private static final ReadLevel EL = ReadLevel.EVENTUAL_LOCAL;
+    private static final ReadLevel EM = ReadLevel.EVENTUAL_MAJORITY;
+    private static final ReadLevel CL = ReadLevel.CAUSAL_LOCAL;
+    private static final ReadLevel CM = ReadLevel.CAUSAL_MAJORITY;
+    private static final ReadLevel LIN = ReadLevel.LINEARIZABLE;
 
-        TestSession(int port) {
-            channel = ManagedChannelBuilder.forAddress("localhost", port).usePlaintext().build();
-            stream = KvClientGrpc.newStub(channel).session(new StreamObserver<>() {
-                @Override
-                public void onNext(KvResponse response) {
-                    CompletableFuture<KvResponse> future = waiting.remove(response.getRequestId());
-                    if (future != null) {
-                        future.complete(response);
-                    }
-                }
+    private static RungScorer.Rung read(ReadLevel level, double thresholdMs, double profit) {
+        return new RungScorer.Rung(level.getNumber(), thresholdMs, profit);
+    }
 
-                @Override
-                public void onError(Throwable t) {
-                    waiting.values().forEach(f -> f.completeExceptionally(t));
-                }
+    private static RungScorer.Rung write(int concern, double thresholdMs, double profit) {
+        return new RungScorer.Rung(concern, thresholdMs, profit);
+    }
 
-                @Override
-                public void onCompleted() {
-                }
-            });
-        }
-
-        KvResponse call(KvRequest.Builder request) throws Exception {
-            long id = ids.incrementAndGet();
-            CompletableFuture<KvResponse> future = new CompletableFuture<>();
-            waiting.put(id, future);
-            synchronized (stream) {
-                stream.onNext(request.setRequestId(id).build());
-            }
-            return future.get(10, TimeUnit.SECONDS);
-        }
-
-        KvResponse write(String key, String value, int writeConcern) throws Exception {
-            return call(KvRequest.newBuilder().setIsRead(false).setKey(key).setValue(value)
-                    .setForcedWriteConcern(writeConcern)
-                    .setCommittedSessionIndex(-1).setUncommittedSessionIndex(-1));
-        }
-
-        KvResponse read(String key, ReadLevel level, int committedAnchor, int uncommittedAnchor) throws Exception {
-            return call(KvRequest.newBuilder().setIsRead(true).setKey(key)
-                    .setForcedReadLevel(level)
-                    .setCommittedSessionIndex(committedAnchor).setUncommittedSessionIndex(uncommittedAnchor));
-        }
-
-        @Override
-        public void close() {
-            channel.shutdownNow();
-        }
+    @BeforeAll
+    static void economicsDefaults() {
+        MeasurementPlane.applyEconomics(1000, 100, 0.85, 1.0, 0.0001);
     }
 
     @Test
-    void writeConcernsAndEventualViews() throws Exception {
+    void writeConcernsAndEventualViewsFollowTheSla() throws Exception {
+        SlaRegistry.registerWriteSla(10, 1, List.of(write(1, 1000, 5)));
+        SlaRegistry.registerWriteSla(11, 1, List.of(write(2, 1000, 5)));
+        SlaRegistry.registerReadSla(10, 1, List.of(read(EL, 1000, 5)));
+        SlaRegistry.registerReadSla(11, 1, List.of(read(EM, 1000, 5)));
+
         try (TestCluster cluster = new TestCluster(18400)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             try (TestSession session = new TestSession(cluster.portOf(leader.nodeId()))) {
 
-                // wc:1 acknowledges at append, before commit.
-                KvResponse w1 = session.write("k1", "va", 1);
+                // A wc:1 rung is satisfied by both concerns; the tie breaks to
+                // the cheaper wc:1, acknowledged at append.
+                KvResponse w1 = session.write("k1", "va", 10, 1);
                 assertTrue(w1.getOk());
                 assertEquals(1, w1.getDeliveredWriteConcern());
-                assertTrue(w1.getValueIndex() >= 0);
                 assertFalse(w1.getTimedOutAndFellBack());
 
-                // wc:majority acknowledges at commit: the response's commit
-                // index must already cover the entry.
-                KvResponse w2 = session.write("k2", "vb", 2);
+                // A wc:2 rung is only satisfiable by wc:2: acknowledged at
+                // commit, so the commit index covers the entry.
+                KvResponse w2 = session.write("k2", "vb", 11, 1);
                 assertTrue(w2.getOk());
                 assertEquals(2, w2.getDeliveredWriteConcern());
-                assertFalse(w2.getTimedOutAndFellBack());
                 assertTrue(w2.getCommitIndex() >= w2.getValueIndex(),
                         "majority ack implies committed: commitIndex=" + w2.getCommitIndex()
                                 + " entry=" + w2.getValueIndex());
 
-                // Eventual-local on the leader sees both immediately.
-                KvResponse local = session.read("k1", ReadLevel.EVENTUAL_LOCAL, -1, -1);
+                // Eventual-local SLA: every level satisfies it, weakest wins.
+                KvResponse local = session.read("k1", 10, 1, -1, -1);
                 assertEquals("va", local.getValue());
-                assertEquals(ReadLevel.EVENTUAL_LOCAL, local.getDeliveredReadLevel());
-                assertFalse(local.getWaited());
+                assertEquals(EL, local.getDeliveredReadLevel());
 
-                // Eventual-majority sees the majority-committed write.
-                KvResponse committed = session.read("k2", ReadLevel.EVENTUAL_MAJORITY, -1, -1);
+                // Eventual-majority SLA: EM is the weakest satisfying level.
+                KvResponse committed = session.read("k2", 11, 1, -1, -1);
                 assertEquals("vb", committed.getValue());
-                assertEquals(ReadLevel.EVENTUAL_MAJORITY, committed.getDeliveredReadLevel());
+                assertEquals(EM, committed.getDeliveredReadLevel());
             }
         }
     }
 
     @Test
     void causalMajorityWaitsForCommitOnFollower() throws Exception {
+        SlaRegistry.registerWriteSla(12, 1, List.of(write(1, 1000, 5)));
+        SlaRegistry.registerReadSla(12, 1, List.of(read(CM, 1000, 5)));
+
         try (TestCluster cluster = new TestCluster(18500)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
@@ -132,15 +92,15 @@ class KvLevelMechanicsTest {
             try (TestSession leaderSession = new TestSession(cluster.portOf(leader.nodeId()));
                     TestSession followerSession = new TestSession(cluster.portOf(follower.nodeId()))) {
 
-                // wc:1 write: acknowledged before commit; its index anchors the
-                // causal-majority read, which must block until the commit
-                // index catches up on the follower.
-                KvResponse write = leaderSession.write("causal-key", "cv", 1);
+                // wc:1 write acknowledged before commit; its index anchors the
+                // causal-majority read, which must block until the follower's
+                // commit index catches up.
+                KvResponse write = leaderSession.write("causal-key", "cv", 12, 1);
                 int anchor = write.getValueIndex();
 
-                KvResponse read = followerSession.read("causal-key", ReadLevel.CAUSAL_MAJORITY, anchor, -1);
+                KvResponse read = followerSession.read("causal-key", 12, 1, anchor, -1);
                 assertTrue(read.getOk());
-                assertEquals(ReadLevel.CAUSAL_MAJORITY, read.getDeliveredReadLevel());
+                assertEquals(CM, read.getDeliveredReadLevel(), "only causal-majority satisfies the rung on a follower");
                 assertFalse(read.getTimedOutAndFellBack());
                 assertEquals("cv", read.getValue());
                 assertTrue(read.getValueIndex() >= anchor);
@@ -150,31 +110,38 @@ class KvLevelMechanicsTest {
     }
 
     @Test
-    void causalWaitTimesOutAndFallsBackToEventual() throws Exception {
+    void causalWaitIsBoundedByTheSlaThresholdAndFallsBack() throws Exception {
+        // Single causal-local rung with a 50 ms threshold: the wait bound is
+        // d_max = 50 ms (not the global maxWaitMs of 400), and on expiry the
+        // request falls back to the strongest no-wait level of the same view.
+        SlaRegistry.registerReadSla(13, 1, List.of(read(CL, 50, 3)));
+
         try (TestCluster cluster = new TestCluster(18600)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
 
             try (TestSession session = new TestSession(cluster.portOf(follower.nodeId()))) {
-                // Anchor far beyond anything that will ever be written: the
-                // bounded wait must expire and fall back to eventual-local.
                 int unreachable = follower.lastLogIndex() + 100_000;
                 long start = System.nanoTime();
-                KvResponse read = session.read("any", ReadLevel.CAUSAL_LOCAL, -1, unreachable);
+                KvResponse read = session.read("any", 13, 1, -1, unreachable);
                 double elapsedMs = (System.nanoTime() - start) / 1_000_000.0;
 
                 assertTrue(read.getOk());
                 assertTrue(read.getWaited());
                 assertTrue(read.getTimedOutAndFellBack());
-                assertEquals(ReadLevel.EVENTUAL_LOCAL, read.getDeliveredReadLevel(),
-                        "fallback must be the strongest no-wait level of the same view");
-                assertTrue(elapsedMs >= 350, "the bounded wait must actually run, took " + elapsedMs + " ms");
+                assertEquals(EL, read.getDeliveredReadLevel());
+                assertTrue(elapsedMs >= 40, "the bounded wait must actually run, took " + elapsedMs + " ms");
+                assertTrue(elapsedMs < 250,
+                        "the SLA threshold (50 ms), not maxWaitMs (400 ms), bounds the wait; took " + elapsedMs);
             }
         }
     }
 
     @Test
-    void linearizableIsLeaderOnlyAndServesCommittedState() throws Exception {
+    void linearizableOnlySlasRedirectFromFollowersAndServeOnTheLeader() throws Exception {
+        SlaRegistry.registerWriteSla(14, 1, List.of(write(2, 1000, 5)));
+        SlaRegistry.registerReadSla(14, 1, List.of(read(LIN, 1000, 5)));
+
         try (TestCluster cluster = new TestCluster(18700)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
@@ -182,21 +149,21 @@ class KvLevelMechanicsTest {
             try (TestSession leaderSession = new TestSession(cluster.portOf(leader.nodeId()));
                     TestSession followerSession = new TestSession(cluster.portOf(follower.nodeId()))) {
 
-                KvResponse write = leaderSession.write("lin-key", "lv", 2);
+                KvResponse write = leaderSession.write("lin-key", "lv", 14, 1);
                 assertTrue(write.getOk());
 
-                // On a follower: redirect with a leader hint.
-                KvResponse redirected = followerSession.read("lin-key", ReadLevel.LINEARIZABLE, -1, -1);
+                // No rung is satisfiable by any follower-legal level: the
+                // request is illegal here, so redirect rather than reject.
+                KvResponse redirected = followerSession.read("lin-key", 14, 1, -1, -1);
                 assertFalse(redirected.getOk());
                 assertTrue(redirected.getNotLeader());
+                assertFalse(redirected.getRejected());
                 assertEquals(leader.nodeId(), redirected.getLeaderId());
 
-                // On the leader: ReadIndex round, served from committed state.
-                KvResponse read = leaderSession.read("lin-key", ReadLevel.LINEARIZABLE, -1, -1);
+                KvResponse read = leaderSession.read("lin-key", 14, 1, -1, -1);
                 assertTrue(read.getOk());
-                assertEquals(ReadLevel.LINEARIZABLE, read.getDeliveredReadLevel());
+                assertEquals(LIN, read.getDeliveredReadLevel());
                 assertEquals("lv", read.getValue());
-                assertFalse(read.getTimedOutAndFellBack());
                 assertTrue(read.getWaited(), "linearizable always waits for the confirmation round");
             }
         }
@@ -204,22 +171,23 @@ class KvLevelMechanicsTest {
 
     @Test
     void sessionClientKeepsReadYourWritesUnderLoad() throws Exception {
+        SlaRegistry.registerReadSla(15, 1, List.of(read(CM, 1000, 4), read(CL, 500, 2)));
+        SlaRegistry.registerWriteSla(15, 1, List.of(write(2, 1000, 4), write(1, 500, 2)));
+
         try (TestCluster cluster = new TestCluster(18800)) {
             cluster.awaitLeader(15_000);
 
-            try (KvSessionClient client = new KvSessionClient(1,
+            try (KvSessionClient client = new KvSessionClient(15,
                     List.of("localhost", "localhost", "localhost"), 18800, 64, 3, 8_000)) {
 
                 // Interleave writes and causal reads over a small keyspace so
                 // reads constantly chase this session's own writes across all
-                // three nodes (round-robin), including majority-anchored reads.
+                // three nodes; the server picks the levels, the assertions key
+                // on what was delivered.
                 for (int i = 0; i < 300; i++) {
                     String key = "s" + (i % 10);
-                    client.sendWrite(key, "v" + i, (i % 2 == 0) ? 1 : 2);
-                    client.sendRead(key, (i % 2 == 0) ? ReadLevel.CAUSAL_LOCAL : ReadLevel.CAUSAL_MAJORITY);
-                    if (i % 5 == 0) {
-                        client.sendRead(key, ReadLevel.LINEARIZABLE);
-                    }
+                    client.sendWrite(key, "v" + i, 1);
+                    client.sendRead(key, 1);
                 }
 
                 long deadline = System.currentTimeMillis() + 20_000;

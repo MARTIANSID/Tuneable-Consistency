@@ -71,7 +71,10 @@ enum ReadLevel {
 }
 
 // Log indices in this protocol are 0-based; -1 means "none". Clients must
-// set the session index fields explicitly on every request.
+// set the session index fields explicitly on every request. The request
+// carries no consistency level, no deadline, and no profit values: the
+// server chooses the level from the registered SLA (applicationId, slaId)
+// and the current shadow price.
 message KvRequest {
   int64 requestId = 1;
   int32 applicationId = 2;
@@ -83,10 +86,8 @@ message KvRequest {
   int32 uncommittedSessionIndex = 8; // causal-local anchor, -1 = none
   double rttEstimateMs = 9;          // client's RTT estimate to this server
 
-  // Stage 2 only: the workload forces the level per request. These fields
-  // die when the rung scorer lands (stage 4) and the server decides.
-  ReadLevel forcedReadLevel = 10;
-  int32 forcedWriteConcern = 11;     // 1..majority
+  // 10, 11 were the stage 2 forced-level fields, removed with the scorer.
+  reserved 10, 11;
 }
 
 // satisfiedRung is added in stage 4 when SLAs exist.
@@ -104,4 +105,5 @@ message KvResponse {
   int32 logIndex = 11;               // node's last log index at reply
   int32 commitIndex = 12;            // node's commit index at reply
   double serviceTimeMs = 13;         // reply time minus t_recv, monotonic clock
+  bool rejected = 14;                // admission control shed this request (max V_c <= 0 or a hard backstop)
 }

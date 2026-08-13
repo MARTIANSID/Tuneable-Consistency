@@ -1,7 +1,11 @@
 {
   "cluster": {
     "numServers": 3,
-    "serverHosts": ["localhost", "localhost", "localhost"],
+    "serverHosts": [
+      "localhost",
+      "localhost",
+      "localhost"
+    ],
     "serverBasePort": 8000
   },
   "chameleon": {
@@ -9,9 +13,131 @@
     "clientLostTimeoutMs": 10000,
     "rttWindowSize": 64,
     "clientRetryLimit": 3,
-    "sMax": 1000,
-    "controlIntervalMs": 100
+    "sMax": 150,
+    "controlIntervalMs": 100,
+    "replicationBudgetPerSecond": 20000,
+    "uTarget": 0.85,
+    "eta": 1.0,
+    "lambdaMin": 0.0001
   },
+  "slas": [
+    {
+      "applicationId": 1,
+      "read": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "level": "LINEARIZABLE",
+              "latencyMs": 300,
+              "profit": 10
+            },
+            {
+              "level": "CAUSAL_MAJORITY",
+              "latencyMs": 150,
+              "profit": 6
+            },
+            {
+              "level": "EVENTUAL_MAJORITY",
+              "latencyMs": 100,
+              "profit": 2
+            }
+          ]
+        }
+      ],
+      "write": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "concern": 2,
+              "latencyMs": 300,
+              "profit": 8
+            },
+            {
+              "concern": 1,
+              "latencyMs": 150,
+              "profit": 3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "applicationId": 2,
+      "read": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "level": "CAUSAL_MAJORITY",
+              "latencyMs": 250,
+              "profit": 5
+            },
+            {
+              "level": "CAUSAL_LOCAL",
+              "latencyMs": 125,
+              "profit": 3
+            },
+            {
+              "level": "EVENTUAL_LOCAL",
+              "latencyMs": 75,
+              "profit": 1
+            }
+          ]
+        }
+      ],
+      "write": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "concern": 2,
+              "latencyMs": 250,
+              "profit": 4
+            },
+            {
+              "concern": 1,
+              "latencyMs": 125,
+              "profit": 2
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "applicationId": 3,
+      "read": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "level": "CAUSAL_LOCAL",
+              "latencyMs": 500,
+              "profit": 2
+            },
+            {
+              "level": "EVENTUAL_LOCAL",
+              "latencyMs": 200,
+              "profit": 1
+            }
+          ]
+        }
+      ],
+      "write": [
+        {
+          "slaId": 1,
+          "rungs": [
+            {
+              "concern": 1,
+              "latencyMs": 200,
+              "profit": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
   "nodeFailure": {
     "enabled": false,
     "failedNodeId": 0
@@ -40,37 +166,29 @@
       "name": "Light",
       "durationSeconds": 70,
       "totalTPS": 30000,
-      "readPercentage": 0.90,
-      "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL_LOCAL": 0.70, "EVENTUAL_MAJORITY": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
-      "writeDistribution": { "1": 0.80, "2": 0.20 }
+      "readPercentage": 0.9,
+      "writePercentage": 0.1
     },
     {
       "name": "Medium",
       "durationSeconds": 60,
-      "totalTPS": 30000,
-      "readPercentage": 0.90,
-      "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL_LOCAL": 0.20, "EVENTUAL_MAJORITY": 0.20, "CAUSAL_LOCAL": 0.20, "CAUSAL_MAJORITY": 0.20, "LINEARIZABLE": 0.20 },
-      "writeDistribution": { "1": 0.50, "2": 0.50 }
+      "totalTPS": 45000,
+      "readPercentage": 0.9,
+      "writePercentage": 0.1
     },
     {
       "name": "Heavy",
       "durationSeconds": 60,
       "totalTPS": 70000,
-      "readPercentage": 0.90,
-      "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL_LOCAL": 0.05, "EVENTUAL_MAJORITY": 0.05, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.10, "LINEARIZABLE": 0.70 },
-      "writeDistribution": { "1": 0.20, "2": 0.80 }
+      "readPercentage": 0.9,
+      "writePercentage": 0.1
     },
     {
       "name": "Recovery",
       "durationSeconds": 60,
       "totalTPS": 30000,
-      "readPercentage": 0.90,
-      "writePercentage": 0.10,
-      "readDistribution": { "EVENTUAL_LOCAL": 0.70, "EVENTUAL_MAJORITY": 0.10, "CAUSAL_LOCAL": 0.10, "CAUSAL_MAJORITY": 0.05, "LINEARIZABLE": 0.05 },
-      "writeDistribution": { "1": 0.80, "2": 0.20 }
+      "readPercentage": 0.9,
+      "writePercentage": 0.1
     }
   ]
 }

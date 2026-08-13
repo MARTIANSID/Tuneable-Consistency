@@ -28,13 +28,34 @@ public final class MeasurementPlane implements AutoCloseable {
     // exceed 1 by design so the controller gets signal.
     private static volatile double S_MAX = 1000;
     private static volatile int CONTROL_INTERVAL_MS = 100;
+    private static volatile double U_TARGET = 0.85;
+    private static volatile double ETA = 1.0;
+    private static volatile double LAMBDA_MIN = 0.0001;
 
     private static final int HISTOGRAM_REFRESH_MS = 100;
     private static final int HISTOGRAM_DUMP_INTERVAL_MS = 5000;
 
+    // Step 4 cold-start rule: cap the requests concurrently riding a cell
+    // that has no samples yet, since samples arrive only on completion.
+    private static final int UNCALIBRATED_RIDER_CAP = 64;
+
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
-        S_MAX = config.chameleon.sMax;
-        CONTROL_INTERVAL_MS = config.chameleon.controlIntervalMs;
+        applyEconomics(config.chameleon.sMax, config.chameleon.controlIntervalMs,
+                config.chameleon.uTarget, config.chameleon.eta, config.chameleon.lambdaMin);
+    }
+
+    /** Direct knob access for tests (overload shedding needs artificial pressure). */
+    public static void applyEconomics(double sMax, int controlIntervalMs, double uTarget, double eta,
+            double lambdaMin) {
+        S_MAX = sMax;
+        CONTROL_INTERVAL_MS = controlIntervalMs;
+        U_TARGET = uTarget;
+        ETA = eta;
+        LAMBDA_MIN = lambdaMin;
+    }
+
+    public static double sMax() {
+        return S_MAX;
     }
 
     private final int nodeId;
@@ -53,12 +74,21 @@ public final class MeasurementPlane implements AutoCloseable {
     private volatile double lastUtilization;
     private volatile double lastCrossCheckUtilization;
 
+    private final PriceController priceController = new PriceController(U_TARGET, ETA, LAMBDA_MIN);
+    private final java.util.concurrent.atomic.AtomicInteger[][] uncalibratedRiders;
+
     private final ScheduledExecutorService scheduler;
 
     public MeasurementPlane(int nodeId, int numServers) {
         this.nodeId = nodeId;
         this.majority = (numServers / 2) + 1;
         this.histograms = new ServiceTimeHistograms(5 + majority);
+        this.uncalibratedRiders = new java.util.concurrent.atomic.AtomicInteger[5 + majority][ServiceTimeHistograms.GAP_BUCKETS];
+        for (int l = 0; l < 5 + majority; l++) {
+            for (int g = 0; g < ServiceTimeHistograms.GAP_BUCKETS; g++) {
+                uncalibratedRiders[l][g] = new java.util.concurrent.atomic.AtomicInteger();
+            }
+        }
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "measurement-plane-" + nodeId);
             t.setDaemon(true);
@@ -124,18 +154,48 @@ public final class MeasurementPlane implements AutoCloseable {
         lastUtilization = utilization;
         lastCrossCheckUtilization = crossCheck;
 
+        // The price moves once per interval; requests read the published
+        // lambda, never u.
+        priceController.update(utilization);
+
         String csvPath = "occupancy_" + nodeId + ".csv";
         File file = new File(csvPath);
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,U,CrossCheckU,AvgInFlight,InFlightAtClose");
+                out.println("Timestamp,U,CrossCheckU,AvgInFlight,InFlightAtClose,Lambda");
             }
-            out.printf("%d,%.6f,%.6f,%.3f,%d%n", System.currentTimeMillis(), utilization, crossCheck,
-                    interval.averageInFlight(), interval.inFlightAtClose());
+            out.printf("%d,%.6f,%.6f,%.3f,%d,%.8f%n", System.currentTimeMillis(), utilization, crossCheck,
+                    interval.averageInFlight(), interval.inFlightAtClose(), priceController.lambda());
         } catch (IOException e) {
             System.err.println("Failed to write " + csvPath + ": " + e.getMessage());
         }
+    }
+
+    /** The shadow price (profit per ms of slot time); up to one interval stale. */
+    public double lambda() {
+        return priceController.lambda();
+    }
+
+    /** Test-only: set the price directly (pair with a near-zero eta so the controller holds it). */
+    void forceLambdaForTest(double value) {
+        priceController.forceLambda(value);
+    }
+
+    /**
+     * Reserve a slot on an uncalibrated cell (no samples yet). Callers must
+     * release on completion. False = too many requests already riding it.
+     */
+    public boolean tryAcquireUncalibratedRider(int levelIndex, int gapBucket) {
+        if (uncalibratedRiders[levelIndex][gapBucket].incrementAndGet() <= UNCALIBRATED_RIDER_CAP) {
+            return true;
+        }
+        uncalibratedRiders[levelIndex][gapBucket].decrementAndGet();
+        return false;
+    }
+
+    public void releaseUncalibratedRider(int levelIndex, int gapBucket) {
+        uncalibratedRiders[levelIndex][gapBucket].decrementAndGet();
     }
 
     private void dumpHistograms() {

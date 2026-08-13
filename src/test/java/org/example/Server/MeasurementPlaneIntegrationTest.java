@@ -3,88 +3,51 @@ package org.example.Server;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.List;
 
-import org.example.raft.KvClientGrpc;
-import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
 import org.example.raft.ReadLevel;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
 
 /**
  * The measurement plane against a live cluster: cells populate under real
- * traffic, the abandoned-wait rule files at the timeout value under the
- * chosen level, and the occupancy integral matches the sum of completed
- * service times (they measure the same quantity, so with nothing in flight
- * they must agree tightly).
+ * traffic, the abandoned-wait rule files at the wait bound under the chosen
+ * level, and the occupancy integral matches the sum of completed service
+ * times (they measure the same quantity, so with nothing in flight they must
+ * agree tightly).
  */
 class MeasurementPlaneIntegrationTest {
 
-    private static final class TestSession implements AutoCloseable {
-        private final ManagedChannel channel;
-        private final StreamObserver<KvRequest> stream;
-        private final ConcurrentHashMap<Long, CompletableFuture<KvResponse>> waiting = new ConcurrentHashMap<>();
-        private final AtomicLong ids = new AtomicLong();
+    private static RungScorer.Rung read(ReadLevel level, double thresholdMs, double profit) {
+        return new RungScorer.Rung(level.getNumber(), thresholdMs, profit);
+    }
 
-        TestSession(int port) {
-            channel = ManagedChannelBuilder.forAddress("localhost", port).usePlaintext().build();
-            stream = KvClientGrpc.newStub(channel).session(new StreamObserver<>() {
-                @Override
-                public void onNext(KvResponse response) {
-                    CompletableFuture<KvResponse> future = waiting.remove(response.getRequestId());
-                    if (future != null) {
-                        future.complete(response);
-                    }
-                }
+    private static RungScorer.Rung write(int concern, double thresholdMs, double profit) {
+        return new RungScorer.Rung(concern, thresholdMs, profit);
+    }
 
-                @Override
-                public void onError(Throwable t) {
-                    waiting.values().forEach(f -> f.completeExceptionally(t));
-                }
-
-                @Override
-                public void onCompleted() {
-                }
-            });
-        }
-
-        KvResponse call(KvRequest.Builder request) throws Exception {
-            long id = ids.incrementAndGet();
-            CompletableFuture<KvResponse> future = new CompletableFuture<>();
-            waiting.put(id, future);
-            synchronized (stream) {
-                stream.onNext(request.setRequestId(id).build());
-            }
-            return future.get(10, TimeUnit.SECONDS);
-        }
-
-        @Override
-        public void close() {
-            channel.shutdownNow();
-        }
+    @BeforeAll
+    static void economicsDefaults() {
+        MeasurementPlane.applyEconomics(1000, 100, 0.85, 1.0, 0.0001);
     }
 
     @Test
     void cellsPopulateAndOccupancyMatchesCompletedServiceTimes() throws Exception {
+        SlaRegistry.registerReadSla(20, 1, List.of(read(ReadLevel.EVENTUAL_LOCAL, 1000, 2)));
+        SlaRegistry.registerWriteSla(20, 1, List.of(write(1, 1000, 2)));
+        SlaRegistry.registerReadSla(21, 1, List.of(read(ReadLevel.LINEARIZABLE, 1000, 5)));
+        SlaRegistry.registerWriteSla(21, 1, List.of(write(2, 1000, 5)));
+
         try (TestCluster cluster = new TestCluster(18900)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             MeasurementPlane plane = cluster.planes.get(leader.nodeId());
 
             try (TestSession session = new TestSession(cluster.portOf(leader.nodeId()))) {
                 for (int i = 0; i < 300; i++) {
-                    session.call(KvRequest.newBuilder().setIsRead(false).setKey("k" + (i % 10)).setValue("v" + i)
-                            .setForcedWriteConcern((i % 2 == 0) ? 1 : 2)
-                            .setCommittedSessionIndex(-1).setUncommittedSessionIndex(-1));
-                    session.call(KvRequest.newBuilder().setIsRead(true).setKey("k" + (i % 10))
-                            .setForcedReadLevel((i % 2 == 0) ? ReadLevel.EVENTUAL_LOCAL : ReadLevel.LINEARIZABLE)
-                            .setCommittedSessionIndex(-1).setUncommittedSessionIndex(-1));
+                    int app = (i % 2 == 0) ? 20 : 21;
+                    session.write("k" + (i % 10), "v" + i, app, 1);
+                    session.read("k" + (i % 10), app, 1, -1, -1);
                 }
 
                 // Let the refresh tick publish and the last replies settle.
@@ -120,7 +83,11 @@ class MeasurementPlaneIntegrationTest {
     }
 
     @Test
-    void abandonedWaitFilesAtTheTimeoutUnderTheChosenLevel() throws Exception {
+    void abandonedWaitFilesAtTheBoundUnderTheChosenLevel() throws Exception {
+        // Single causal-local rung, 300 ms threshold: d_max = 300 is the wait
+        // bound and the filing value for an abandoned wait.
+        SlaRegistry.registerReadSla(22, 1, List.of(read(ReadLevel.CAUSAL_LOCAL, 300, 3)));
+
         try (TestCluster cluster = new TestCluster(19000)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
@@ -129,20 +96,19 @@ class MeasurementPlaneIntegrationTest {
             try (TestSession session = new TestSession(cluster.portOf(follower.nodeId()))) {
                 // Unreachable anchor in the far-behind gap bucket: the wait
                 // expires, the fallback serves, and the sample lands in the
-                // causal-local far-gap cell at the timeout value.
+                // causal-local far-gap cell at the bound.
                 int unreachable = follower.lastLogIndex() + 100_000;
-                KvResponse read = session.call(KvRequest.newBuilder().setIsRead(true).setKey("any")
-                        .setForcedReadLevel(ReadLevel.CAUSAL_LOCAL)
-                        .setCommittedSessionIndex(-1).setUncommittedSessionIndex(unreachable));
-                assertTrue(read.getTimedOutAndFellBack());
+                KvResponse readResponse = session.read("any", 22, 1, -1, unreachable);
+                assertTrue(readResponse.getTimedOutAndFellBack());
+                assertEquals(ReadLevel.EVENTUAL_LOCAL, readResponse.getDeliveredReadLevel());
 
                 Thread.sleep(300); // let the tick publish
 
                 int causalLocal = plane.readLevelIndex(ReadLevel.CAUSAL_LOCAL);
                 ServiceTimeHistograms.Snapshot farGap = plane.histograms().snapshot(causalLocal, 3);
                 assertTrue(farGap.totalCount > 0, "abandoned wait must file under the chosen level's cell");
-                assertEquals(400.0, farGap.meanMs, 1.0,
-                        "abandoned wait files at the timeout value (maxWaitMs), got " + farGap.meanMs);
+                assertEquals(300.0, farGap.meanMs, 1.0,
+                        "abandoned wait files at the wait bound (d_max), got " + farGap.meanMs);
 
                 // Nothing under the fallback level: its cell must not have
                 // absorbed the abandoned wait.

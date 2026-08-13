@@ -136,7 +136,7 @@ public final class KvSessionClient implements AutoCloseable {
 
     // ===== Sending =====
 
-    public void sendRead(String key, ReadLevel level) {
+    public void sendRead(String key, int slaId) {
         // Snapshot the per-key assertion floors FIRST and fold them into the
         // session anchors. The anchors and the per-key map are updated by ack
         // threads in no particular order relative to this thread, so taking
@@ -151,33 +151,34 @@ public final class KvSessionClient implements AutoCloseable {
         KvRequest request = KvRequest.newBuilder()
                 .setRequestId(requestIdGen.incrementAndGet())
                 .setApplicationId(applicationId)
+                .setSlaId(slaId)
                 .setIsRead(true)
                 .setKey(key)
                 .setCommittedSessionIndex(committed)
                 .setUncommittedSessionIndex(uncommitted)
-                .setForcedReadLevel(level)
                 .build();
         dispatch(request, pickTarget(request), 1, keyWriteSnapshot, keyMajorityWriteSnapshot);
     }
 
-    public void sendWrite(String key, String value, int writeConcern) {
+    public void sendWrite(String key, String value, int slaId) {
         KvRequest request = KvRequest.newBuilder()
                 .setRequestId(requestIdGen.incrementAndGet())
                 .setApplicationId(applicationId)
+                .setSlaId(slaId)
                 .setIsRead(false)
                 .setKey(key)
                 .setValue(value)
                 .setCommittedSessionIndex(committedAnchor.get())
                 .setUncommittedSessionIndex(uncommittedAnchor.get())
-                .setForcedWriteConcern(writeConcern)
                 .build();
         dispatch(request, pickTarget(request), 1, null, null);
     }
 
     private int pickTarget(KvRequest request) {
-        boolean leaderOnly = !request.getIsRead() || request.getForcedReadLevel() == ReadLevel.LINEARIZABLE;
+        // Writes are leader-only; reads round-robin (the server redirects
+        // when an SLA is unservable on a follower).
         int leader = leaderHint;
-        if (leaderOnly && leader >= 0) {
+        if (!request.getIsRead() && leader >= 0) {
             return leader;
         }
         return Math.floorMod(roundRobin.getAndIncrement(), numServers);
@@ -236,6 +237,13 @@ public final class KvSessionClient implements AutoCloseable {
                 pending.remove(response.getRequestId());
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
             }
+            return;
+        }
+
+        if (response.getRejected()) {
+            // Admission shed this request; retrying would defeat the shedding.
+            pending.remove(response.getRequestId());
+            ClientMetricsTracker.recordRejected(nodeId, chosen);
             return;
         }
 
@@ -315,9 +323,7 @@ public final class KvSessionClient implements AutoCloseable {
     }
 
     private static String chosenLabel(KvRequest request) {
-        return request.getIsRead()
-                ? "R:" + request.getForcedReadLevel().name()
-                : "W:" + request.getForcedWriteConcern();
+        return (request.getIsRead() ? "R:" : "W:") + "A" + request.getApplicationId() + "S" + request.getSlaId();
     }
 
     private void sweepLost(){

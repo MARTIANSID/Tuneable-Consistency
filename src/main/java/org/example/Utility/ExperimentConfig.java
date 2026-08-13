@@ -30,6 +30,7 @@ public final class ExperimentConfig {
 
     public Cluster cluster;
     public Chameleon chameleon;
+    public List<AppSlas> slas;
     public NodeFailure nodeFailure;
     public TimedFailure timedFailure;
     public Geo geo;
@@ -49,6 +50,33 @@ public final class ExperimentConfig {
         public Integer clientRetryLimit;   // redirect/failure resends before giving up on a request
         public Double sMax;                // occupancy slot budget (avg requests in flight); placeholder until the stage 6 load sweep
         public Integer controlIntervalMs;  // utilization / price-controller interval
+        public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s; placeholder until stage 6
+        public Double uTarget;             // price controller utilization target (~0.85)
+        public Double eta;                 // price controller gain (~1)
+        public Double lambdaMin;           // price floor; only its order of magnitude matters
+    }
+
+    /** SLAs registered per application; requests carry only (applicationId, slaId). */
+    public static final class AppSlas {
+        public Integer applicationId;
+        public List<Sla> read;
+        public List<Sla> write;
+    }
+
+    public static final class Sla {
+        public Integer slaId;
+        public List<SlaRung> rungs;
+    }
+
+    /**
+     * One rung (kappa, delta, pi). Read rungs set level (a ReadLevel name),
+     * write rungs set concern (1..majority); exactly one of the two.
+     */
+    public static final class SlaRung {
+        public String level;
+        public Integer concern;
+        public Double latencyMs;
+        public Double profit;
     }
 
     public static final class NodeFailure {
@@ -78,16 +106,17 @@ public final class ExperimentConfig {
         public Integer singlePhaseDurationSeconds; // duration when runSinglePhase
     }
 
+    /**
+     * Phases control load and read/write mix only. The consistency-level mix
+     * is no longer configured anywhere: the server chooses levels from the
+     * registered SLAs and the current price.
+     */
     public static final class PhaseConfig {
         public String name;
         public Integer durationSeconds;
         public Integer totalTPS;
         public Double readPercentage;
         public Double writePercentage;
-        // keys: EVENTUAL_LOCAL, EVENTUAL_MAJORITY, CAUSAL_LOCAL, CAUSAL_MAJORITY, LINEARIZABLE
-        public Map<String, Double> readDistribution;
-        // keys: write concern as string, "1".."majority"
-        public Map<String, Double> writeDistribution;
     }
 
     // --- Loading ---
@@ -163,21 +192,38 @@ public final class ExperimentConfig {
         }
     }
 
-    private static void requireDistribution(Map<String, Double> dist, String key) {
-        require(dist, key);
-        if (dist.isEmpty()) {
-            throw new IllegalArgumentException("Config key '" + key + "' must not be empty");
+    private static final Set<String> READ_LEVELS = Set.of(
+            "EVENTUAL_LOCAL", "EVENTUAL_MAJORITY", "CAUSAL_LOCAL", "CAUSAL_MAJORITY", "LINEARIZABLE");
+
+    private static void validateSla(Sla sla, String prefix, boolean isRead, int majority) {
+        require(sla.slaId, prefix + "[].slaId");
+        String slaPrefix = prefix + "[slaId=" + sla.slaId + "]";
+        require(sla.rungs, slaPrefix + ".rungs");
+        if (sla.rungs.isEmpty()) {
+            throw new IllegalArgumentException(slaPrefix + ".rungs must not be empty");
         }
-        double sum = 0;
-        for (Map.Entry<String, Double> e : dist.entrySet()) {
-            require(e.getValue(), key + "." + e.getKey());
-            if (e.getValue() < 0) {
-                throw new IllegalArgumentException("Config key '" + key + "." + e.getKey() + "' must be >= 0, got " + e.getValue());
+        for (SlaRung rung : sla.rungs) {
+            if (isRead) {
+                require(rung.level, slaPrefix + ".rungs[].level");
+                if (rung.concern != null) {
+                    throw new IllegalArgumentException(slaPrefix + " is a read SLA; rungs must not set 'concern'");
+                }
+                if (!READ_LEVELS.contains(rung.level)) {
+                    throw new IllegalArgumentException(slaPrefix + ".rungs[].level '" + rung.level
+                            + "' is unknown. Valid: " + READ_LEVELS);
+                }
+            } else {
+                require(rung.concern, slaPrefix + ".rungs[].concern");
+                if (rung.level != null) {
+                    throw new IllegalArgumentException(slaPrefix + " is a write SLA; rungs must not set 'level'");
+                }
+                if (rung.concern < 1 || rung.concern > majority) {
+                    throw new IllegalArgumentException(slaPrefix + ".rungs[].concern " + rung.concern
+                            + " is out of range [1, " + majority + "]");
+                }
             }
-            sum += e.getValue();
-        }
-        if (Math.abs(sum - 1.0) > 1e-6) {
-            throw new IllegalArgumentException("Config key '" + key + "' must sum to 1.0, got " + sum);
+            requirePositive(rung.latencyMs, slaPrefix + ".rungs[].latencyMs");
+            requirePositive(rung.profit, slaPrefix + ".rungs[].profit");
         }
     }
 
@@ -201,6 +247,31 @@ public final class ExperimentConfig {
         requirePositive(chameleon.clientRetryLimit, "chameleon.clientRetryLimit");
         requirePositive(chameleon.sMax, "chameleon.sMax");
         requirePositive(chameleon.controlIntervalMs, "chameleon.controlIntervalMs");
+        requirePositive(chameleon.replicationBudgetPerSecond, "chameleon.replicationBudgetPerSecond");
+        requirePositive(chameleon.uTarget, "chameleon.uTarget");
+        requirePositive(chameleon.eta, "chameleon.eta");
+        requirePositive(chameleon.lambdaMin, "chameleon.lambdaMin");
+
+        require(slas, "slas");
+        if (slas.isEmpty()) {
+            throw new IllegalArgumentException("slas must register at least one application");
+        }
+        int majority = (cluster.numServers / 2) + 1;
+        for (AppSlas app : slas) {
+            require(app.applicationId, "slas[].applicationId");
+            String appPrefix = "slas[applicationId=" + app.applicationId + "]";
+            require(app.read, appPrefix + ".read");
+            require(app.write, appPrefix + ".write");
+            if (app.read.isEmpty() || app.write.isEmpty()) {
+                throw new IllegalArgumentException(appPrefix + " must register at least one read and one write SLA");
+            }
+            for (Sla sla : app.read) {
+                validateSla(sla, appPrefix + ".read", true, majority);
+            }
+            for (Sla sla : app.write) {
+                validateSla(sla, appPrefix + ".write", false, majority);
+            }
+        }
 
         require(nodeFailure, "nodeFailure");
         require(nodeFailure.enabled, "nodeFailure.enabled");
@@ -252,8 +323,6 @@ public final class ExperimentConfig {
                 throw new IllegalArgumentException(prefix + ": readPercentage + writePercentage must sum to 1.0, got "
                         + (p.readPercentage + p.writePercentage));
             }
-            requireDistribution(p.readDistribution, prefix + ".readDistribution");
-            requireDistribution(p.writeDistribution, prefix + ".writeDistribution");
         }
         if (experiment.runSinglePhase && experiment.singlePhaseIndex >= phases.size()) {
             throw new IllegalArgumentException("experiment.singlePhaseIndex " + experiment.singlePhaseIndex

@@ -18,7 +18,6 @@ import org.example.Client.ClientMetricsTracker;
 import org.example.Client.KvSessionClient;
 import org.example.Utility.ExperimentConfig;
 import org.example.Utility.ServerStatus.ServerCurrentStatus;
-import org.example.raft.ReadLevel;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -70,18 +69,13 @@ public class Servers {
         final int totalTPS;
         final double readPercentage;
         final double writePercentage;
-        final Map<ReadLevel, Double> readDistribution;
-        final Map<Integer, Double> writeDistribution;
 
-        Phase(String name, int durationSeconds, int totalTPS, double readPercentage, double writePercentage,
-                Map<ReadLevel, Double> readDistribution, Map<Integer, Double> writeDistribution) {
+        Phase(String name, int durationSeconds, int totalTPS, double readPercentage, double writePercentage) {
             this.name = name;
             this.durationSeconds = durationSeconds;
             this.totalTPS = totalTPS;
             this.readPercentage = readPercentage;
             this.writePercentage = writePercentage;
-            this.readDistribution = readDistribution;
-            this.writeDistribution = writeDistribution;
         }
     }
 
@@ -100,6 +94,8 @@ public class Servers {
     private static final Random random = new Random();
     private static List<ServerImpl> serversImpl = new ArrayList<>();
     private static KvSessionClient[] appClients;
+    private static Map<Integer, List<Integer>> readSlaIdsByApp;
+    private static Map<Integer, List<Integer>> writeSlaIdsByApp;
 
     static void applyConfig(ExperimentConfig config) {
         NUM_OF_SERVERS = config.cluster.numServers;
@@ -127,39 +123,19 @@ public class Servers {
         RUN_SINGLE_PHASE = config.experiment.runSinglePhase;
         SINGLE_PHASE_INDEX = config.experiment.singlePhaseIndex;
 
-        int majority = (NUM_OF_SERVERS / 2) + 1;
         PHASES.clear();
-        for (int i = 0; i < config.phases.size(); i++) {
-            ExperimentConfig.PhaseConfig p = config.phases.get(i);
-            Map<ReadLevel, Double> readDist = new HashMap<>();
-            for (Map.Entry<String, Double> e : p.readDistribution.entrySet()) {
-                try {
-                    readDist.put(ReadLevel.valueOf(e.getKey()), e.getValue());
-                } catch (IllegalArgumentException ex) {
-                    throw new IllegalArgumentException("phases[" + i + "].readDistribution has unknown read level '"
-                            + e.getKey() + "'. Valid: EVENTUAL_LOCAL, EVENTUAL_MAJORITY, CAUSAL_LOCAL, "
-                            + "CAUSAL_MAJORITY, LINEARIZABLE");
-                }
-            }
-            Map<Integer, Double> writeDist = new HashMap<>();
-            for (Map.Entry<String, Double> e : p.writeDistribution.entrySet()) {
-                int wc;
-                try {
-                    wc = Integer.parseInt(e.getKey());
-                } catch (NumberFormatException ex) {
-                    throw new IllegalArgumentException("phases[" + i + "].writeDistribution key '" + e.getKey()
-                            + "' is not an integer write concern");
-                }
-                if (wc < 1 || wc > majority) {
-                    throw new IllegalArgumentException("phases[" + i + "].writeDistribution write concern " + wc
-                            + " is out of range [1, " + majority + "] for " + NUM_OF_SERVERS + " servers");
-                }
-                writeDist.put(wc, e.getValue());
-            }
-            PHASES.add(new Phase(p.name, p.durationSeconds, p.totalTPS,
-                    p.readPercentage, p.writePercentage, readDist, writeDist));
+        for (ExperimentConfig.PhaseConfig p : config.phases) {
+            PHASES.add(new Phase(p.name, p.durationSeconds, p.totalTPS, p.readPercentage, p.writePercentage));
         }
         currentPhase = PHASES.get(0);
+
+        // Per-application SLA id pools the workload draws from (uniformly).
+        readSlaIdsByApp = new HashMap<>();
+        writeSlaIdsByApp = new HashMap<>();
+        for (ExperimentConfig.AppSlas app : config.slas) {
+            readSlaIdsByApp.put(app.applicationId, app.read.stream().map(s -> s.slaId).toList());
+            writeSlaIdsByApp.put(app.applicationId, app.write.stream().map(s -> s.slaId).toList());
+        }
 
         long activeSeconds = RUN_SINGLE_PHASE
                 ? config.experiment.singlePhaseDurationSeconds
@@ -174,6 +150,7 @@ public class Servers {
         ServerImpl.applyConfig(config);
         KvClientService.applyConfig(config);
         MeasurementPlane.applyConfig(config);
+        SlaRegistry.applyConfig(config);
         System.out.println("Loaded config from " + configPath.toAbsolutePath());
 
         clearCSVFiles();
@@ -426,24 +403,23 @@ public class Servers {
                     int readCount = computeReadCount(perTick, phase);
                     int writeCount = Math.max(0, perTick - readCount);
 
-                    List<ReadLevel> readChoices = buildDeterministicChoices(readCount,
-                            phase.readDistribution, ReadLevel.EVENTUAL_LOCAL,
-                            (a, b) -> a.name().compareTo(b.name()));
-                    List<Integer> writeChoices = buildDeterministicChoices(writeCount,
-                            phase.writeDistribution, 1, Integer::compareTo);
-
+                    // The workload no longer picks consistency levels: each
+                    // request names its application's SLA and the server
+                    // decides. SLA ids are drawn uniformly per application.
                     long now = System.currentTimeMillis();
                     for (int i = 0; i < writeCount; i++) {
+                        int appId = appCursor + 1;
                         KvSessionClient client = appClients[appCursor];
                         appCursor = (appCursor + 1) % NUM_APPLICATIONS;
                         String key = "user" + ((int) (totalInjected.get() % KEY_SPACE));
-                        client.sendWrite(key, "v-" + now + "-" + totalInjected.get(), writeChoices.get(i));
+                        client.sendWrite(key, "v-" + now + "-" + totalInjected.get(), pickSlaId(writeSlaIdsByApp, appId));
                         totalInjected.incrementAndGet();
                     }
-                    for (ReadLevel level : readChoices) {
+                    for (int i = 0; i < readCount; i++) {
+                        int appId = appCursor + 1;
                         KvSessionClient client = appClients[appCursor];
                         appCursor = (appCursor + 1) % NUM_APPLICATIONS;
-                        client.sendRead("user" + random.nextInt(KEY_SPACE), level);
+                        client.sendRead("user" + random.nextInt(KEY_SPACE), pickSlaId(readSlaIdsByApp, appId));
                         totalInjected.incrementAndGet();
                     }
 
@@ -451,10 +427,10 @@ public class Servers {
                     if (currentTime - lastReportTime >= 3000) {
                         long elapsedSeconds = (currentTime - experimentStartTime) / 1000;
                         System.out.printf(
-                                "[%02ds] Sent=%d | Responses=%d | Lost=%d | Violations=%d | Phase=%s | TotalTPS=%d%n",
+                                "[%02ds] Sent=%d | Responses=%d | Rejected=%d | Lost=%d | Violations=%d | Phase=%s | TotalTPS=%d%n",
                                 elapsedSeconds, totalInjected.get(), ClientMetricsTracker.totalResponses(),
-                                ClientMetricsTracker.totalLost(), ClientMetricsTracker.totalViolations(),
-                                phase.name, phase.totalTPS);
+                                ClientMetricsTracker.totalRejected(), ClientMetricsTracker.totalLost(),
+                                ClientMetricsTracker.totalViolations(), phase.name, phase.totalTPS);
                         lastReportTime = currentTime;
                     }
 
@@ -485,9 +461,9 @@ public class Servers {
             }
             ClientMetricsTracker.flushNow();
             long violations = ClientMetricsTracker.totalViolations();
-            System.out.printf("%nExperiment completed. Sent=%d Responses=%d Lost=%d SessionViolations=%d%n",
-                    totalInjected.get(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalLost(),
-                    violations);
+            System.out.printf("%nExperiment completed. Sent=%d Responses=%d Rejected=%d Lost=%d SessionViolations=%d%n",
+                    totalInjected.get(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalRejected(),
+                    ClientMetricsTracker.totalLost(), violations);
             for (KvSessionClient client : appClients) {
                 client.close();
             }
@@ -524,7 +500,6 @@ public class Servers {
         System.out.printf("   Duration: %ds | Total TPS: %d | Read%%: %.0f | Write%%: %.0f%n",
                 newPhase.durationSeconds, newPhase.totalTPS,
                 newPhase.readPercentage * 100.0, newPhase.writePercentage * 100.0);
-        System.out.printf("   Reads: %s%n   Writes: %s%n", newPhase.readDistribution, newPhase.writeDistribution);
         System.out.println("========================================");
     }
 
@@ -545,11 +520,18 @@ public class Servers {
         System.out.printf("   Total Duration: %d seconds%n", TOTAL_EXPERIMENT_DURATION_MS / 1000);
         System.out.println(RUN_SINGLE_PHASE ? "   Mode: SINGLE PHASE" : "   Mode: SEQUENTIAL PHASES");
         for (Phase p : PHASES) {
-            System.out.printf("   %d. %s: %ds | TotalTPS=%d | Reads=%s | Writes=%s%n",
-                    PHASES.indexOf(p) + 1, p.name, p.durationSeconds, p.totalTPS,
-                    p.readDistribution, p.writeDistribution);
+            System.out.printf("   %d. %s: %ds | TotalTPS=%d | Read%%=%.0f%n",
+                    PHASES.indexOf(p) + 1, p.name, p.durationSeconds, p.totalTPS, p.readPercentage * 100.0);
         }
         System.out.println();
+    }
+
+    private static int pickSlaId(Map<Integer, List<Integer>> slaIdsByApp, int appId) {
+        List<Integer> ids = slaIdsByApp.get(appId);
+        if (ids == null || ids.isEmpty()) {
+            throw new IllegalStateException("No SLAs registered for applicationId " + appId);
+        }
+        return ids.size() == 1 ? ids.get(0) : ids.get(random.nextInt(ids.size()));
     }
 
     private static int computeReadCount(int total, Phase phase) {
@@ -563,63 +545,6 @@ public class Servers {
             return 0;
         }
         return (int) Math.round(total * (read / sum));
-    }
-
-    /**
-     * Deterministic apportionment of a fixed count over a weighted
-     * distribution (largest remainder method), so every tick reproduces the
-     * configured mix exactly instead of sampling it.
-     */
-    private static <T> List<T> buildDeterministicChoices(int total, Map<T, Double> distribution, T fallbackKey,
-            java.util.Comparator<T> keyOrder) {
-        List<T> result = new ArrayList<>(Math.max(0, total));
-        if (total <= 0 || distribution == null || distribution.isEmpty()) {
-            return result;
-        }
-        double weightSum = distribution.values().stream().mapToDouble(v -> Math.max(0.0, v)).sum();
-        if (weightSum <= 0.0) {
-            return result;
-        }
-
-        Map<T, Integer> counts = new HashMap<>();
-        Map<T, Double> fractions = new HashMap<>();
-        int assigned = 0;
-        for (Map.Entry<T, Double> entry : distribution.entrySet()) {
-            double raw = Math.max(0.0, entry.getValue()) / weightSum * total;
-            int base = (int) Math.floor(raw);
-            counts.put(entry.getKey(), base);
-            fractions.put(entry.getKey(), raw - base);
-            assigned += base;
-        }
-
-        int remaining = total - assigned;
-        List<T> keysByFraction = new ArrayList<>(distribution.keySet());
-        keysByFraction.sort((a, b) -> {
-            int cmp = Double.compare(fractions.getOrDefault(b, 0.0), fractions.getOrDefault(a, 0.0));
-            return (cmp != 0) ? cmp : keyOrder.compare(a, b);
-        });
-        int idx = 0;
-        while (remaining > 0 && !keysByFraction.isEmpty()) {
-            T key = keysByFraction.get(idx % keysByFraction.size());
-            counts.put(key, counts.getOrDefault(key, 0) + 1);
-            remaining--;
-            idx++;
-        }
-
-        List<T> sortedKeys = new ArrayList<>(counts.keySet());
-        sortedKeys.sort(keyOrder);
-        for (T key : sortedKeys) {
-            for (int i = 0; i < counts.getOrDefault(key, 0); i++) {
-                result.add(key);
-            }
-        }
-        while (result.size() < total) {
-            result.add(fallbackKey);
-        }
-        if (result.size() > total) {
-            return new ArrayList<>(result.subList(0, total));
-        }
-        return result;
     }
 
     /** Clear result CSVs at startup so every run starts from a clean slate. */
