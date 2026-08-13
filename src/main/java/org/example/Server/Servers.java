@@ -97,10 +97,13 @@ public class Servers {
     private static final Random random = new Random();
     private static List<ServerImpl> serversImpl = new ArrayList<>();
     private static KvSessionClient[] appClients;
+    private static org.example.Client.ClientMode CLIENT_MODE;
+    private static double PILEUS_EXPLORATION_FRACTION;
+    private static boolean FOLLOWER_LIN_READS;
     private static Map<Integer, List<Integer>> readSlaIdsByApp;
     private static Map<Integer, List<Integer>> writeSlaIdsByApp;
-    private static Map<Integer, Map<Integer, Integer>> readSlaFloorsByApp;
-    private static Map<Integer, Map<Integer, Integer>> writeSlaFloorsByApp;
+    private static Map<Integer, Map<Integer, List<org.example.Utility.RungScorer.Rung>>> readSlasByApp;
+    private static Map<Integer, Map<Integer, List<org.example.Utility.RungScorer.Rung>>> writeSlasByApp;
 
     static void applyConfig(ExperimentConfig config) {
         NUM_OF_SERVERS = config.cluster.numServers;
@@ -121,9 +124,12 @@ public class Servers {
         CLEAR_GEO_SETTINGS_ON_EXIT = config.geo.clearOnExit;
         USE_SUDO_FOR_GEO_SCRIPT = config.geo.useSudo;
 
-        RTT_WINDOW_SIZE = config.chameleon.rttWindowSize;
-        CLIENT_RETRY_LIMIT = config.chameleon.clientRetryLimit;
-        CLIENT_LOST_TIMEOUT_MS = config.chameleon.clientLostTimeoutMs;
+        RTT_WINDOW_SIZE = config.client.rttWindowSize;
+        CLIENT_RETRY_LIMIT = config.client.retryLimit;
+        CLIENT_LOST_TIMEOUT_MS = config.client.lostTimeoutMs;
+        CLIENT_MODE = org.example.Client.ClientMode.fromConfig(config.mode);
+        PILEUS_EXPLORATION_FRACTION = config.pileus.explorationFraction;
+        FOLLOWER_LIN_READS = config.server.followerLinearizableReads;
 
         RUN_SINGLE_PHASE = config.experiment.runSinglePhase;
         SINGLE_PHASE_INDEX = config.experiment.singlePhaseIndex;
@@ -135,25 +141,30 @@ public class Servers {
         currentPhase = PHASES.get(0);
 
         // Per-application SLA id pools the workload draws from (uniformly),
-        // and the per-SLA floor strengths the clients grade upgrades against.
+        // and the full rung tables the clients target and grade against (the
+        // application's own registration, mirrored client-side).
         readSlaIdsByApp = new HashMap<>();
         writeSlaIdsByApp = new HashMap<>();
-        readSlaFloorsByApp = new HashMap<>();
-        writeSlaFloorsByApp = new HashMap<>();
+        readSlasByApp = new HashMap<>();
+        writeSlasByApp = new HashMap<>();
         for (ExperimentConfig.AppSlas app : config.slas) {
             readSlaIdsByApp.put(app.applicationId, app.read.stream().map(s -> s.slaId).toList());
             writeSlaIdsByApp.put(app.applicationId, app.write.stream().map(s -> s.slaId).toList());
-            Map<Integer, Integer> readFloors = new HashMap<>();
+            Map<Integer, List<org.example.Utility.RungScorer.Rung>> readTables = new HashMap<>();
             for (ExperimentConfig.Sla sla : app.read) {
-                readFloors.put(sla.slaId, sla.rungs.stream()
-                        .mapToInt(r -> ReadLevel.valueOf(r.level).getNumber()).min().orElseThrow());
+                readTables.put(sla.slaId, sla.rungs.stream()
+                        .map(r -> new org.example.Utility.RungScorer.Rung(
+                                ReadLevel.valueOf(r.level).getNumber(), r.latencyMs, r.profit))
+                        .toList());
             }
-            Map<Integer, Integer> writeFloors = new HashMap<>();
+            Map<Integer, List<org.example.Utility.RungScorer.Rung>> writeTables = new HashMap<>();
             for (ExperimentConfig.Sla sla : app.write) {
-                writeFloors.put(sla.slaId, sla.rungs.stream().mapToInt(r -> r.concern).min().orElseThrow());
+                writeTables.put(sla.slaId, sla.rungs.stream()
+                        .map(r -> new org.example.Utility.RungScorer.Rung(r.concern, r.latencyMs, r.profit))
+                        .toList());
             }
-            readSlaFloorsByApp.put(app.applicationId, readFloors);
-            writeSlaFloorsByApp.put(app.applicationId, writeFloors);
+            readSlasByApp.put(app.applicationId, readTables);
+            writeSlasByApp.put(app.applicationId, writeTables);
         }
 
         keySampler = config.workload.keyDistribution.equals("zipfian")
@@ -200,9 +211,10 @@ public class Servers {
 
         appClients = new KvSessionClient[NUM_APPLICATIONS];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
-            appClients[app] = new KvSessionClient(app + 1, SERVER_HOSTS, SERVER_BASE_PORT,
+            appClients[app] = new KvSessionClient(app + 1, SERVER_HOSTS, SERVER_BASE_PORT, CLIENT_MODE,
                     RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
-                    readSlaFloorsByApp.get(app + 1), writeSlaFloorsByApp.get(app + 1));
+                    readSlasByApp.get(app + 1), writeSlasByApp.get(app + 1),
+                    PILEUS_EXPLORATION_FRACTION, FOLLOWER_LIN_READS);
         }
 
         startPhasedInjection();

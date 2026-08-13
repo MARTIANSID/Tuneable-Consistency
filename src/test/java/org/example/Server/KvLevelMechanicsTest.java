@@ -10,6 +10,7 @@ import java.util.Map;
 import org.example.Client.KvSessionClient;
 import org.example.raft.KvResponse;
 import org.example.raft.ReadLevel;
+import org.example.Utility.RungScorer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -213,8 +214,11 @@ class KvLevelMechanicsTest {
             cluster.awaitLeader(15_000);
 
             try (KvSessionClient client = new KvSessionClient(15,
-                    List.of("localhost", "localhost", "localhost"), 18800, 64, 3, 8_000,
-                    Map.of(1, CL.getNumber()), Map.of(1, 1))) {
+                    List.of("localhost", "localhost", "localhost"), 18800,
+                    org.example.Client.ClientMode.CHAMELEON, 64, 3, 8_000,
+                    Map.of(1, List.of(read(CM, 1000, 4), read(CL, 500, 2))),
+                    Map.of(1, List.of(write(2, 1000, 4), write(1, 500, 2))),
+                    0.0, false)) {
 
                 // Interleave writes and causal reads over a small keyspace so
                 // reads constantly chase this session's own writes across all

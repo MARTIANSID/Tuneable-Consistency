@@ -102,6 +102,13 @@ message KvRequest {
 
   // 10, 11 were the stage 2 forced-level fields, removed with the scorer.
   reserved 10, 11;
+
+  // Client-decided target, sent only in the non-chameleon modes (the server
+  // scorer ignores them). The wait bound is the client's d_max analog,
+  // target threshold minus RTT estimate; the server clamps it to maxWaitMs.
+  bool wantLinearizable = 12;        // reads: run the ReadIndex round
+  int32 requestedWriteConcern = 13;  // writes: acks to wait for (1..majority)
+  double waitBoundMs = 14;           // clamp on this request's server-side wait; <=0 = maxWaitMs
 }
 
 message KvResponse {
@@ -121,8 +128,17 @@ message KvResponse {
   bool rejected = 14;                // admission control shed this request (max V_c <= 0 or a hard backstop)
 
   // Step 7 grading: what was actually delivered, not what was targeted.
+  // Populated by the chameleon* modes as server-side diagnostics; the
+  // authoritative grading for the ledger is client-side in every mode.
   int32 satisfiedRung = 15;          // index into the registered SLA's rung list of the best rung met; -1 = none
   double predictedProfit = 16;       // E_c of the chosen level at decision time
   double realizedProfit = 17;        // profit of the satisfied rung; 0 when none was met
   int32 gradedReadStrength = 18;     // strongest read level the delivered result satisfies (ReadLevel ordinal); reads only
+
+  // Both views, populated on every read in every mode: the client-side SLA
+  // check picks which value satisfies the best rung and grades accordingly.
+  string localValue = 19;            // this node's local (may-roll-back) view; "" = absent
+  int32 localValueIndex = 20;        // log index of the local value's write; -1 = absent
+  string committedValue = 21;        // this node's majority-committed view; "" = absent
+  int32 committedValueIndex = 22;    // log index of the committed value's write; -1 = absent
 }

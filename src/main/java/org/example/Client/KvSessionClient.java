@@ -4,13 +4,16 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.example.Utility.RungScorer;
 import org.example.raft.KvClientGrpc;
 import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
@@ -21,44 +24,45 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
 
 /**
- * One application session against the cluster (Chameleon stage 2).
+ * One application session against the cluster. Owns a stream per server, the
+ * session anchors (uncommitted = highest log index among this session's
+ * acknowledged writes; committed = highest among its majority-acknowledged
+ * writes), a per-node RTT estimator fed by no-wait replies, and the client
+ * side of the experiment arm ({@link ClientMode}):
  *
- * Owns a stream per server, the session anchors (uncommitted = highest log
- * index among this session's acknowledged writes; committed = highest index
- * among its majority-acknowledged writes), a per-node RTT estimator fed only
- * by no-wait replies, and the session-guarantee assertions: a causal-local
- * read must return a value at least as new as this session's last
- * acknowledged write to that key, causal-majority and linearizable reads at
- * least as new as its last majority-acknowledged write.
+ * - chameleon: reads to the lowest-RTT node, the server scorer decides.
+ * - chameleonPileus: reads routed by the Pileus selector, server decides.
+ * - pileus: the selector picks (server, rung); the request carries the
+ *   target (wantLinearizable / requestedWriteConcern) plus a wait bound of
+ *   threshold minus RTT, the client's d_max analog.
+ * - highestProfit / lowestProfit: static rung target, lowest-RTT routing.
  *
- * The client also carries the application's view of its SLAs (the floor
- * strength per SLA id) so the ledger can classify a graded delivery above the
- * floor as an upgrade, split into free vs waiting by the response's waited
- * flag.
- *
- * Writes and linearizable reads target the leader (learned from notLeader
- * redirects); everything else round-robins. Redirected or failed requests
- * are resent up to retryLimit times; requests with no response within
- * lostTimeoutMs are scored as lost.
+ * Every served response is graded client-side ({@link ClientGrader}) against
+ * both returned views with client-observed latency; the verdict feeds the
+ * ledger and the session-guarantee assertions. Writes and linearizable-only
+ * targets go to the leader (learned from notLeader redirects).
  */
 public final class KvSessionClient implements AutoCloseable {
 
     private final int applicationId;
     private final int numServers;
+    private final int majority;
+    private final ClientMode mode;
     private final int retryLimit;
     private final long lostTimeoutMs;
-    private final int majority;
+    private final boolean followerLinReads;
 
-    // Floor strength per SLA id: the weakest rung's requirement (ReadLevel
-    // ordinal for reads, write concern for writes). A graded delivery above
-    // the floor is an upgrade.
-    private final Map<Integer, Integer> readSlaFloors;
-    private final Map<Integer, Integer> writeSlaFloors;
+    // Full SLA tables (the application's own registration) and their floors.
+    private final Map<Integer, List<RungScorer.Rung>> readSlas;
+    private final Map<Integer, List<RungScorer.Rung>> writeSlas;
+    private final Map<Integer, Integer> readFloors;
+    private final Map<Integer, Integer> writeFloors;
 
     private final List<ManagedChannel> channels = new ArrayList<>();
     private final StreamObserver<KvRequest>[] streams;
     private final Object[] streamLocks;
     private final RttEstimator rttEstimator;
+    private final PileusSelector selector; // null unless the mode routes with Pileus
 
     private final AtomicLong requestIdGen = new AtomicLong();
     private final AtomicInteger roundRobin = new AtomicInteger();
@@ -82,13 +86,17 @@ public final class KvSessionClient implements AutoCloseable {
         final long firstSendMs;
         final int targetNode;
         final int attempt;
-        // Assertion snapshots taken at send time (null = this session had not
-        // written the key yet, so there is nothing to assert).
+        // Send-time snapshots: assertion floors (null = the session had not
+        // written the key), the client-side profit prediction, and the target
+        // rung's threshold for recomputing the wait bound on retries.
         final Integer keyWriteSnapshot;
         final Integer keyMajorityWriteSnapshot;
+        final double predictedProfit;
+        final double targetThresholdMs;
 
         Pending(KvRequest request, long firstSendNanos, long firstSendMs, int targetNode, int attempt,
-                Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot) {
+                Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot,
+                double predictedProfit, double targetThresholdMs) {
             this.request = request;
             this.firstSendNanos = firstSendNanos;
             this.firstSendMs = firstSendMs;
@@ -96,23 +104,34 @@ public final class KvSessionClient implements AutoCloseable {
             this.attempt = attempt;
             this.keyWriteSnapshot = keyWriteSnapshot;
             this.keyMajorityWriteSnapshot = keyMajorityWriteSnapshot;
+            this.predictedProfit = predictedProfit;
+            this.targetThresholdMs = targetThresholdMs;
         }
     }
 
     @SuppressWarnings("unchecked")
-    public KvSessionClient(int applicationId, List<String> hosts, int basePort, int rttWindowSize,
-            int retryLimit, long lostTimeoutMs,
-            Map<Integer, Integer> readSlaFloors, Map<Integer, Integer> writeSlaFloors) {
+    public KvSessionClient(int applicationId, List<String> hosts, int basePort, ClientMode mode,
+            int rttWindowSize, int retryLimit, long lostTimeoutMs,
+            Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
+            double explorationFraction, boolean followerLinReads) {
         this.applicationId = applicationId;
         this.numServers = hosts.size();
+        this.majority = (numServers / 2) + 1;
+        this.mode = mode;
         this.retryLimit = retryLimit;
         this.lostTimeoutMs = lostTimeoutMs;
-        this.majority = (numServers / 2) + 1;
-        this.readSlaFloors = Map.copyOf(readSlaFloors);
-        this.writeSlaFloors = Map.copyOf(writeSlaFloors);
+        this.followerLinReads = followerLinReads;
+        this.readSlas = Map.copyOf(readSlas);
+        this.writeSlas = Map.copyOf(writeSlas);
+        this.readFloors = floorsOf(this.readSlas);
+        this.writeFloors = floorsOf(this.writeSlas);
         this.streams = new StreamObserver[numServers];
         this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
+        this.selector = mode.pileusRouting()
+                ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
+                        explorationFraction, new Random())
+                : null;
 
         for (int i = 0; i < numServers; i++) {
             final int nodeId = i;
@@ -146,34 +165,99 @@ public final class KvSessionClient implements AutoCloseable {
         this.lostSweeper.scheduleAtFixedRate(this::sweepLost, 1, 1, TimeUnit.SECONDS);
     }
 
+    private static Map<Integer, Integer> floorsOf(Map<Integer, List<RungScorer.Rung>> slas) {
+        Map<Integer, Integer> floors = new ConcurrentHashMap<>();
+        slas.forEach((slaId, rungs) -> floors.put(slaId,
+                rungs.stream().mapToInt(RungScorer.Rung::strength).min().orElseThrow()));
+        return floors;
+    }
+
+    private List<RungScorer.Rung> slaOf(Map<Integer, List<RungScorer.Rung>> slas, int slaId) {
+        List<RungScorer.Rung> rungs = slas.get(slaId);
+        if (rungs == null) {
+            throw new IllegalStateException("No SLA registered on the client for applicationId="
+                    + applicationId + " slaId=" + slaId);
+        }
+        return rungs;
+    }
+
     // ===== Sending =====
 
     public void sendRead(String key, int slaId) {
         // Snapshot the per-key assertion floors FIRST and fold them into the
-        // session anchors. The anchors and the per-key map are updated by ack
-        // threads in no particular order relative to this thread, so taking
-        // the anchor alone could yield a wait anchor below the floor the
-        // assertion later checks against; max() restores the invariant that
-        // the request always waits at least as far as the assertion expects.
+        // session anchors (see stage 2: unordered ack updates would otherwise
+        // let the wait anchor lag the floor the assertion checks against).
         Integer keyWriteSnapshot = lastWriteIndexByKey.get(key);
         Integer keyMajorityWriteSnapshot = lastMajorityWriteIndexByKey.get(key);
         int uncommitted = Math.max(uncommittedAnchor.get(), keyWriteSnapshot == null ? -1 : keyWriteSnapshot);
         int committed = Math.max(committedAnchor.get(),
                 keyMajorityWriteSnapshot == null ? -1 : keyMajorityWriteSnapshot);
-        KvRequest request = KvRequest.newBuilder()
+
+        List<RungScorer.Rung> sla = slaOf(readSlas, slaId);
+        int targetNode;
+        RungScorer.Rung targetRung = null;
+        double predicted = 0;
+        switch (mode) {
+            case CHAMELEON -> targetNode = lowestRttNode();
+            case CHAMELEON_PILEUS -> {
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint);
+                targetNode = choice == null ? lowestRttNode() : choice.node();
+            }
+            case PILEUS -> {
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint);
+                if (choice == null) {
+                    targetNode = lowestRttNode();
+                } else {
+                    targetNode = choice.node();
+                    targetRung = sla.get(choice.rungIndex());
+                    predicted = choice.expectedProfit();
+                }
+            }
+            default -> { // HIGHEST_PROFIT / LOWEST_PROFIT
+                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.HIGHEST_PROFIT));
+                predicted = targetRung.profit();
+                boolean linOnLeaderOnly = targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber()
+                        && !followerLinReads;
+                targetNode = (linOnLeaderOnly && leaderHint >= 0) ? leaderHint : lowestRttNode();
+            }
+        }
+
+        KvRequest.Builder request = KvRequest.newBuilder()
                 .setRequestId(requestIdGen.incrementAndGet())
                 .setApplicationId(applicationId)
                 .setSlaId(slaId)
                 .setIsRead(true)
                 .setKey(key)
                 .setCommittedSessionIndex(committed)
-                .setUncommittedSessionIndex(uncommitted)
-                .build();
-        dispatch(request, pickTarget(request), 1, keyWriteSnapshot, keyMajorityWriteSnapshot);
+                .setUncommittedSessionIndex(uncommitted);
+        if (targetRung != null) {
+            request.setWantLinearizable(targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber());
+        }
+        dispatch(request.build(), targetNode, 1, keyWriteSnapshot, keyMajorityWriteSnapshot,
+                predicted, targetRung == null ? 0 : targetRung.thresholdMs());
     }
 
     public void sendWrite(String key, String value, int slaId) {
-        KvRequest request = KvRequest.newBuilder()
+        List<RungScorer.Rung> sla = slaOf(writeSlas, slaId);
+        int targetNode = pickWriteTarget();
+        RungScorer.Rung targetRung = null;
+        double predicted = 0;
+        switch (mode) {
+            case CHAMELEON, CHAMELEON_PILEUS -> {
+                // Server decides the concern.
+            }
+            case PILEUS -> {
+                PileusSelector.Choice choice = selector.chooseWrite(sla, targetNode);
+                targetRung = sla.get(choice.rungIndex());
+                predicted = choice.expectedProfit();
+            }
+            default -> {
+                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.HIGHEST_PROFIT));
+                predicted = targetRung.profit();
+            }
+        }
+
+        KvRequest.Builder request = KvRequest.newBuilder()
                 .setRequestId(requestIdGen.incrementAndGet())
                 .setApplicationId(applicationId)
                 .setSlaId(slaId)
@@ -181,42 +265,78 @@ public final class KvSessionClient implements AutoCloseable {
                 .setKey(key)
                 .setValue(value)
                 .setCommittedSessionIndex(committedAnchor.get())
-                .setUncommittedSessionIndex(uncommittedAnchor.get())
-                .build();
-        dispatch(request, pickTarget(request), 1, null, null);
+                .setUncommittedSessionIndex(uncommittedAnchor.get());
+        if (targetRung != null) {
+            request.setRequestedWriteConcern(Math.min(Math.max(1, targetRung.strength()), majority));
+        }
+        dispatch(request.build(), targetNode, 1, null, null,
+                predicted, targetRung == null ? 0 : targetRung.thresholdMs());
     }
 
-    private int pickTarget(KvRequest request) {
-        // Writes are leader-only; reads round-robin (the server redirects
-        // when an SLA is unservable on a follower).
-        int leader = leaderHint;
-        if (!request.getIsRead() && leader >= 0) {
-            return leader;
+    /** The max-profit or floor rung; profit ties go to the weakest requirement. */
+    private static int staticTargetIndex(List<RungScorer.Rung> sla, boolean highest) {
+        int best = 0;
+        for (int i = 1; i < sla.size(); i++) {
+            RungScorer.Rung rung = sla.get(i);
+            RungScorer.Rung current = sla.get(best);
+            boolean betterProfit = highest ? rung.profit() > current.profit() : rung.profit() < current.profit();
+            if (betterProfit || (rung.profit() == current.profit() && rung.strength() < current.strength())) {
+                best = i;
+            }
         }
-        return Math.floorMod(roundRobin.getAndIncrement(), numServers);
+        return best;
+    }
+
+    /** Lowest estimated RTT; ties (including the all-cold start) break randomly. */
+    private int lowestRttNode() {
+        double best = Double.MAX_VALUE;
+        int count = 0;
+        int pick = 0;
+        for (int i = 0; i < numServers; i++) {
+            double estimate = rttEstimator.estimateMs(i);
+            if (estimate < best) {
+                best = estimate;
+                count = 1;
+                pick = i;
+            } else if (estimate == best && ThreadLocalRandom.current().nextInt(++count) == 0) {
+                pick = i;
+            }
+        }
+        return pick;
+    }
+
+    private int pickWriteTarget() {
+        int leader = leaderHint;
+        return leader >= 0 ? leader : Math.floorMod(roundRobin.getAndIncrement(), numServers);
     }
 
     private void dispatch(KvRequest request, int targetNode, int attempt,
-            Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot) {
+            Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot,
+            double predictedProfit, double targetThresholdMs) {
         long nowNanos = System.nanoTime();
         long nowMs = System.currentTimeMillis();
         Pending previous = pending.get(request.getRequestId());
         Pending entry = (previous != null)
-                // Retry: keep the original send instants so latency stays end to end.
+                // Retry: keep the original send instants and snapshots so
+                // latency stays end to end and the prediction stays the first.
                 ? new Pending(request, previous.firstSendNanos, previous.firstSendMs, targetNode, attempt,
-                        previous.keyWriteSnapshot, previous.keyMajorityWriteSnapshot)
+                        previous.keyWriteSnapshot, previous.keyMajorityWriteSnapshot,
+                        previous.predictedProfit, previous.targetThresholdMs)
                 : new Pending(request, nowNanos, nowMs, targetNode, attempt,
-                        keyWriteSnapshot, keyMajorityWriteSnapshot);
+                        keyWriteSnapshot, keyMajorityWriteSnapshot, predictedProfit, targetThresholdMs);
         pending.put(request.getRequestId(), entry);
 
-        // RTT estimate rides the request so the server can subtract it from
-        // SLA thresholds (used by the scorer from stage 4 on).
-        KvRequest withRtt = request.toBuilder()
-                .setRttEstimateMs(rttEstimator.estimateMs(targetNode))
-                .build();
+        // The RTT estimate rides every request (the scorer's rho); in the
+        // client-decided modes the wait bound is the d_max analog, the target
+        // rung's threshold minus the network's share of it.
+        double rtt = rttEstimator.estimateMs(targetNode);
+        KvRequest.Builder withRtt = request.toBuilder().setRttEstimateMs(rtt);
+        if (entry.targetThresholdMs > 0) {
+            withRtt.setWaitBoundMs(Math.max(1.0, entry.targetThresholdMs - rtt));
+        }
         try {
             synchronized (streamLocks[targetNode]) {
-                streams[targetNode].onNext(withRtt);
+                streams[targetNode].onNext(withRtt.build());
             }
         } catch (RuntimeException e) {
             // Stream unusable (node down): the sweeper scores it as lost.
@@ -243,8 +363,7 @@ public final class KvSessionClient implements AutoCloseable {
                 int target = (hinted >= 0 && hinted < numServers)
                         ? hinted
                         : Math.floorMod(roundRobin.getAndIncrement(), numServers);
-                // Retries reuse the snapshots stored in the pending entry.
-                dispatch(request, target, entry.attempt + 1, null, null);
+                dispatch(request, target, entry.attempt + 1, null, null, 0, 0);
             } else {
                 pending.remove(response.getRequestId());
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
@@ -253,8 +372,17 @@ public final class KvSessionClient implements AutoCloseable {
         }
 
         if (response.getRejected()) {
-            // Admission shed this request; retrying would defeat the shedding.
+            // Admission shed this request; retrying would defeat the shedding,
+            // but the selector must see the rejection or it would keep
+            // targeting the rejecting node on cold-start optimism.
             pending.remove(response.getRequestId());
+            if (selector != null) {
+                if (request.getIsRead()) {
+                    selector.observeReadRejected(nodeId, request.getWantLinearizable());
+                } else {
+                    selector.observeWriteRejected(request.getRequestedWriteConcern());
+                }
+            }
             ClientMetricsTracker.recordRejected(nodeId, chosen);
             return;
         }
@@ -262,7 +390,7 @@ public final class KvSessionClient implements AutoCloseable {
         if (!response.getOk()) {
             if (entry.attempt < retryLimit) {
                 dispatch(request, Math.floorMod(roundRobin.getAndIncrement(), numServers), entry.attempt + 1,
-                        null, null);
+                        null, null, 0, 0);
             } else {
                 pending.remove(response.getRequestId());
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
@@ -273,32 +401,45 @@ public final class KvSessionClient implements AutoCloseable {
         pending.remove(response.getRequestId());
         double latencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
         rttEstimator.observe(nodeId, latencyMs, response.getServiceTimeMs(), response.getWaited());
+        if (selector != null) {
+            selector.observeIndices(nodeId, response.getLogIndex(), response.getCommitIndex());
+        }
 
-        boolean violation = false;
+        ClientGrader.Verdict verdict;
         boolean upgraded;
         String executed;
         if (request.getIsRead()) {
             executed = "R:" + response.getDeliveredReadLevel().name();
-            // Upgrade: the graded delivery (step 7) exceeds the SLA's floor.
-            upgraded = response.getGradedReadStrength() > floorOf(readSlaFloors, request.getSlaId());
-            violation = checkSessionGuarantee(entry, response);
-            if (violation) {
+            if (selector != null) {
+                selector.observeRead(nodeId,
+                        request.getWantLinearizable()
+                                || response.getDeliveredReadLevel() == ReadLevel.LINEARIZABLE,
+                        latencyMs);
+            }
+            verdict = ClientGrader.gradeRead(slaOf(readSlas, request.getSlaId()), response,
+                    request.getUncommittedSessionIndex(), request.getCommittedSessionIndex(),
+                    entry.keyWriteSnapshot, entry.keyMajorityWriteSnapshot, latencyMs);
+            upgraded = verdict.gradedStrength() > readFloors.get(request.getSlaId());
+            if (verdict.violation()) {
                 long n = violations.incrementAndGet();
                 if (n <= VIOLATIONS_TO_PRINT) {
                     System.err.printf(
-                            "SESSION VIOLATION app=%d key=%s level=%s valueIndex=%d expected>=%s (node %d)%n",
+                            "SESSION VIOLATION app=%d key=%s delivered=%s localIdx=%d committedIdx=%d expected>=%s/%s (node %d)%n",
                             applicationId, request.getKey(), response.getDeliveredReadLevel(),
-                            response.getValueIndex(),
-                            response.getDeliveredReadLevel() == ReadLevel.CAUSAL_LOCAL
-                                    ? entry.keyWriteSnapshot
-                                    : entry.keyMajorityWriteSnapshot,
-                            nodeId);
+                            response.getLocalValueIndex(), response.getCommittedValueIndex(),
+                            entry.keyWriteSnapshot, entry.keyMajorityWriteSnapshot, nodeId);
                 }
             }
         } else {
             int index = response.getValueIndex();
             executed = "W:" + response.getDeliveredWriteConcern();
-            upgraded = response.getDeliveredWriteConcern() > floorOf(writeSlaFloors, request.getSlaId());
+            if (selector != null) {
+                selector.observeWrite(request.getRequestedWriteConcern() > 0
+                        ? request.getRequestedWriteConcern()
+                        : response.getDeliveredWriteConcern(), latencyMs);
+            }
+            verdict = ClientGrader.gradeWrite(slaOf(writeSlas, request.getSlaId()), response, latencyMs);
+            upgraded = response.getDeliveredWriteConcern() > writeFloors.get(request.getSlaId());
             lastWriteIndexByKey.merge(request.getKey(), index, Math::max);
             uncommittedAnchor.accumulateAndGet(index, Math::max);
             if (response.getDeliveredWriteConcern() >= majority && !response.getTimedOutAndFellBack()) {
@@ -307,45 +448,17 @@ public final class KvSessionClient implements AutoCloseable {
             }
         }
 
+        double predicted = mode.chameleonDecision() ? response.getPredictedProfit() : entry.predictedProfit;
         ClientMetricsTracker.recordResponse(nodeId, chosen, executed, latencyMs,
-                response.getTimedOutAndFellBack(), violation,
-                response.getPredictedProfit(), response.getRealizedProfit(),
-                response.getSatisfiedRung(), upgraded, response.getWaited());
-    }
-
-    /**
-     * Read-your-writes at the causal levels: the value's index must cover this
-     * session's last acknowledged write to the key (snapshotted at send time).
-     * Fallback responses carry a weaker delivered level and are exempt by
-     * construction (the check keys on what was delivered, not requested).
-     */
-    private boolean checkSessionGuarantee(Pending entry, KvResponse response) {
-        switch (response.getDeliveredReadLevel()) {
-            case CAUSAL_LOCAL:
-                return entry.keyWriteSnapshot != null && response.getValueIndex() < entry.keyWriteSnapshot;
-            case CAUSAL_MAJORITY:
-            case LINEARIZABLE:
-                return entry.keyMajorityWriteSnapshot != null
-                        && response.getValueIndex() < entry.keyMajorityWriteSnapshot;
-            default:
-                return false;
-        }
-    }
-
-    private int floorOf(Map<Integer, Integer> floors, int slaId) {
-        Integer floor = floors.get(slaId);
-        if (floor == null) {
-            throw new IllegalStateException("No SLA floor registered on the client for applicationId="
-                    + applicationId + " slaId=" + slaId);
-        }
-        return floor;
+                response.getTimedOutAndFellBack(), verdict.violation(),
+                predicted, verdict.realizedProfit(), verdict.satisfiedRung(), upgraded, response.getWaited());
     }
 
     private static String chosenLabel(KvRequest request) {
         return (request.getIsRead() ? "R:" : "W:") + "A" + request.getApplicationId() + "S" + request.getSlaId();
     }
 
-    private void sweepLost(){
+    private void sweepLost() {
         long now = System.currentTimeMillis();
         Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();
         while (it.hasNext()) {

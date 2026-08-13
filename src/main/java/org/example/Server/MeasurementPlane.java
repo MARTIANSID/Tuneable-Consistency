@@ -40,7 +40,7 @@ public final class MeasurementPlane implements AutoCloseable {
     private static final int UNCALIBRATED_RIDER_CAP = 64;
 
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
-        applyEconomics(config.chameleon.sMax, config.chameleon.controlIntervalMs,
+        applyEconomics(config.server.sMax, config.chameleon.controlIntervalMs,
                 config.chameleon.uTarget, config.chameleon.eta, config.chameleon.lambdaMin);
     }
 

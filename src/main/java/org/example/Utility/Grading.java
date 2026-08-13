@@ -1,4 +1,4 @@
-package org.example.Server;
+package org.example.Utility;
 
 import java.util.List;
 
@@ -49,13 +49,22 @@ public final class Grading {
             int uncommittedAnchor, int committedAnchor) {
         int graded = executed.getNumber();
         boolean valueCommitted = valueIndex <= commitIndex;
+        boolean coversAckedWrites = uncommittedAnchor < 0 || viewFrontierIndex >= uncommittedAnchor;
+        boolean coversCommittedWrites = committedAnchor < 0 || commitIndex >= committedAnchor;
         if (valueCommitted) {
             graded = Math.max(graded, ReadLevel.EVENTUAL_MAJORITY.getNumber());
         }
-        if (uncommittedAnchor < 0 || viewFrontierIndex >= uncommittedAnchor) {
+        if (coversAckedWrites) {
             graded = Math.max(graded, ReadLevel.CAUSAL_LOCAL.getNumber());
         }
-        if (valueCommitted && (committedAnchor < 0 || commitIndex >= committedAnchor)) {
+        // Post-hoc upgrades are cumulative: because the ladder is a total
+        // order, claiming causal-majority implies every weaker level's
+        // guarantee, so the causal-local condition must hold too. (A session
+        // with wc:1-acked writes but no majority-acked writes would otherwise
+        // get causal-majority vacuously on a replica that has not seen its
+        // acked writes at all.) Executed levels keep their floor: their
+        // mechanics enforced their own conditions.
+        if (valueCommitted && coversAckedWrites && coversCommittedWrites) {
             graded = Math.max(graded, ReadLevel.CAUSAL_MAJORITY.getNumber());
         }
         return graded;

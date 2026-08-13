@@ -10,18 +10,26 @@
     ],
     "serverBasePort": 8000
   },
-  "chameleon": {
+  "mode": "chameleon",
+  "server": {
     "maxWaitMs": 400,
-    "clientLostTimeoutMs": 10000,
-    "rttWindowSize": 64,
-    "clientRetryLimit": 3,
     "sMax": 100,
-    "controlIntervalMs": 100,
     "replicationBudgetPerSecond": 31000,
+    "followerLinearizableReads": false
+  },
+  "chameleon": {
+    "controlIntervalMs": 100,
     "uTarget": 0.85,
     "eta": 1.0,
-    "lambdaMin": 0.0001,
-    "followerLinearizableReads": false
+    "lambdaMin": 0.0001
+  },
+  "client": {
+    "rttWindowSize": 64,
+    "retryLimit": 3,
+    "lostTimeoutMs": 10000
+  },
+  "pileus": {
+    "explorationFraction": 0.05
   },
   "workload": {
     "keySpace": 100,

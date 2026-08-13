@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.util.List;
 
+import org.example.Utility.Grading;
+import org.example.Utility.RungScorer;
 import org.junit.jupiter.api.Test;
 
 /** Step 7 grading: the plan's two upgrade cases plus the realized-profit rules. */
@@ -66,6 +68,16 @@ class GradingTest {
         // executed level's mechanics already delivered it.
         int graded = Grading.gradeRead(CAUSAL_MAJORITY, 9, 7, 7, 20, 20);
         assertEquals(CAUSAL_MAJORITY.getNumber(), graded);
+    }
+
+    @Test
+    void causalMajorityIsNotGrantedPastAFailedCausalLocalCondition() {
+        // A session with wc:1-acked writes (uncommitted anchor 8) but no
+        // majority-acked writes (committed anchor -1), reading a replica
+        // whose frontier has not reached the acked writes: the vacuous
+        // causal-majority condition must not smuggle in causal-local, so the
+        // grade stops at eventual-majority.
+        assertEquals(EVENTUAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 6, 8, -1));
     }
 
     @Test

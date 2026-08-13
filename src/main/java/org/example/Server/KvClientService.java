@@ -5,6 +5,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import org.example.Utility.Grading;
+import org.example.Utility.RungScorer;
 import org.example.raft.KvClientGrpc;
 import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
@@ -47,15 +49,25 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     // reach it. Off by default until measured.
     private static volatile boolean FOLLOWER_LINEARIZABLE_READS = false;
 
+    // True in the chameleon* modes: the server scorer resolves the subSLA
+    // target. False: the dumb path serves the client's explicit target.
+    private static volatile boolean CHAMELEON_DECISION = true;
+
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
-        MAX_WAIT_MS = config.chameleon.maxWaitMs;
-        REPLICATION_BUDGET_PER_SECOND = config.chameleon.replicationBudgetPerSecond;
-        FOLLOWER_LINEARIZABLE_READS = config.chameleon.followerLinearizableReads;
+        MAX_WAIT_MS = config.server.maxWaitMs;
+        REPLICATION_BUDGET_PER_SECOND = config.server.replicationBudgetPerSecond;
+        FOLLOWER_LINEARIZABLE_READS = config.server.followerLinearizableReads;
+        CHAMELEON_DECISION = config.chameleonDecision();
     }
 
     /** Test-only: toggle follower linearizable reads without a full config. */
     static void setFollowerLinearizableReadsForTest(boolean enabled) {
         FOLLOWER_LINEARIZABLE_READS = enabled;
+    }
+
+    /** Test-only: toggle the decision mode without a full config. */
+    static void setChameleonDecisionForTest(boolean enabled) {
+        CHAMELEON_DECISION = enabled;
     }
 
     private static final int READ_LEVELS = 5;
@@ -113,10 +125,140 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             return;
         }
         if (request.getIsRead()) {
-            handleRead(request, tRecvNanos, out);
+            if (CHAMELEON_DECISION) {
+                handleRead(request, tRecvNanos, out);
+            } else {
+                dumbRead(request, tRecvNanos, out);
+            }
         } else {
-            handleWrite(request, tRecvNanos, out);
+            if (CHAMELEON_DECISION) {
+                handleWrite(request, tRecvNanos, out);
+            } else {
+                dumbWrite(request, tRecvNanos, out);
+            }
         }
+    }
+
+    // ===== Dumb path (pileus / highestProfit / lowestProfit modes) =====
+    //
+    // The client resolved the subSLA target; the server serves what it has.
+    // Reads return both views immediately; the only read wait is the
+    // ReadIndex round when linearizability was explicitly requested, and
+    // write waits are pure ack semantics for the requested concern. Both are
+    // clamped by min(client wait bound, maxWaitMs). No scoring, no price, no
+    // upgrades; admission is the occupancy cap (in handle) plus the
+    // replication bucket.
+
+    /** The client's d_max analog: its wait bound, clamped to maxWaitMs. */
+    private long requestBound(KvRequest request) {
+        double bound = request.getWaitBoundMs();
+        return bound > 0 ? Math.min((long) Math.ceil(bound), MAX_WAIT_MS) : MAX_WAIT_MS;
+    }
+
+    private void dumbRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+        if (!request.getWantLinearizable()) {
+            send(out, dumbReadReply(request, ReadLevel.EVENTUAL_MAJORITY, false, false), tRecvNanos);
+            return;
+        }
+        if (!node.isLeader() && !FOLLOWER_LINEARIZABLE_READS) {
+            send(out, notLeader(request), tRecvNanos);
+            return;
+        }
+        CompletableFuture<Void> ready = node.isLeader()
+                ? node.confirmLeadership().thenApply(readIndex -> null)
+                : node.readIndexFromLeader().thenCompose(readIndex ->
+                        node.currentCommitIndex() >= readIndex
+                                ? CompletableFuture.completedFuture(null)
+                                : node.awaitCommitIndex(readIndex));
+        ready.orTimeout(requestBound(request), TimeUnit.MILLISECONDS)
+                .whenCompleteAsync((v, error) -> {
+                    if (error == null) {
+                        send(out, dumbReadReply(request, ReadLevel.LINEARIZABLE, true, false), tRecvNanos);
+                    } else if (unwrap(error) instanceof ServerImpl.NotLeaderException) {
+                        send(out, notLeader(request), tRecvNanos);
+                    } else {
+                        send(out, dumbReadReply(request, ReadLevel.EVENTUAL_MAJORITY, true, true), tRecvNanos);
+                    }
+                }, node.executorService);
+    }
+
+    private KvResponse.Builder dumbReadReply(KvRequest request, ReadLevel delivered, boolean waited,
+            boolean fellBack) {
+        KvStore.Versioned committed = node.kv.readCommitted(request.getKey());
+        return withViews(KvResponse.newBuilder()
+                .setRequestId(request.getRequestId())
+                .setOk(true)
+                .setValue(committed == null ? "" : committed.value())
+                .setValueIndex(committed == null ? -1 : committed.index())
+                .setDeliveredReadLevel(delivered)
+                .setWaited(waited)
+                .setTimedOutAndFellBack(fellBack)
+                .setSatisfiedRung(-1), request.getKey());
+    }
+
+    private void dumbWrite(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+        if (!node.isLeader()) {
+            send(out, notLeader(request), tRecvNanos);
+            return;
+        }
+        int writeConcern = Math.min(Math.max(1, request.getRequestedWriteConcern()), node.majority());
+        if (!replicationBucket.tryCharge()) {
+            send(out, rejected(request), tRecvNanos);
+            return;
+        }
+        int index;
+        try {
+            index = node.appendWrite(request.getKey(), request.getValue(),
+                    request.getApplicationId() + "-" + request.getRequestId());
+        } catch (ServerImpl.NotLeaderException e) {
+            send(out, notLeader(request).setLeaderId(e.leaderId), tRecvNanos);
+            return;
+        }
+        if (writeConcern <= 1) {
+            send(out, dumbWriteReply(request, index, 1, false, false), tRecvNanos);
+            return;
+        }
+        CompletableFuture<Void> wait = (writeConcern >= node.majority())
+                ? node.awaitCommitIndex(index)
+                : node.awaitReplication(index, writeConcern);
+        awaitBounded(wait, requestBound(request),
+                () -> send(out, dumbWriteReply(request, index, writeConcern, true, false), tRecvNanos),
+                () -> send(out, dumbWriteReply(request, index, node.replicaCount(index), true, true), tRecvNanos));
+    }
+
+    private KvResponse.Builder dumbWriteReply(KvRequest request, int entryIndex, int deliveredWriteConcern,
+            boolean waited, boolean fellBack) {
+        return stamp(KvResponse.newBuilder())
+                .setRequestId(request.getRequestId())
+                .setOk(true)
+                .setValueIndex(entryIndex)
+                .setDeliveredWriteConcern(deliveredWriteConcern)
+                .setWaited(waited)
+                .setTimedOutAndFellBack(fellBack)
+                .setSatisfiedRung(-1);
+    }
+
+    /**
+     * Both views, populated on every read reply in every mode. The node's
+     * indices are stamped BEFORE the views are read: the client grades causal
+     * claims from these indices against the views' value indices, so the
+     * published frontier must never exceed the state the views were read from
+     * (state-before-index, mirrored onto the reply).
+     */
+    private KvResponse.Builder withViews(KvResponse.Builder reply, String key) {
+        stamp(reply);
+        KvStore.Versioned local = node.kv.readLocal(key);
+        KvStore.Versioned committed = node.kv.readCommitted(key);
+        return reply
+                .setLocalValue(local == null ? "" : local.value())
+                .setLocalValueIndex(local == null ? -1 : local.index())
+                .setCommittedValue(committed == null ? "" : committed.value())
+                .setCommittedValueIndex(committed == null ? -1 : committed.index());
+    }
+
+    /** Stamp the node's current indices onto a reply. */
+    private KvResponse.Builder stamp(KvResponse.Builder reply) {
+        return reply.setLogIndex(node.lastLogIndex()).setCommitIndex(node.currentCommitIndex());
     }
 
     // ===== Scoring machinery =====
@@ -312,7 +454,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 SlaRegistry.readSla(request.getApplicationId(), request.getSlaId()),
                 graded, serviceMs + request.getRttEstimateMs());
 
-        send(out, KvResponse.newBuilder()
+        send(out, withViews(KvResponse.newBuilder()
                 .setRequestId(request.getRequestId())
                 .setOk(true)
                 .setValue(versioned == null ? "" : versioned.value())
@@ -323,7 +465,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 .setSatisfiedRung(realized.rungIndex())
                 .setRealizedProfit(realized.profit())
                 .setPredictedProfit(chosen.scored.expectedProfit())
-                .setGradedReadStrength(graded), tRecvNanos);
+                .setGradedReadStrength(graded), request.getKey()), tRecvNanos);
     }
 
     // ===== Writes =====
@@ -402,7 +544,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 SlaRegistry.writeSla(request.getApplicationId(), request.getSlaId()),
                 deliveredWriteConcern, serviceMs + request.getRttEstimateMs());
 
-        send(out, KvResponse.newBuilder()
+        send(out, stamp(KvResponse.newBuilder())
                 .setRequestId(request.getRequestId())
                 .setOk(true)
                 .setValueIndex(entryIndex)
@@ -439,7 +581,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     }
 
     private KvResponse.Builder notLeader(KvRequest request) {
-        return KvResponse.newBuilder()
+        return stamp(KvResponse.newBuilder())
                 .setRequestId(request.getRequestId())
                 .setOk(false)
                 .setNotLeader(true)
@@ -448,7 +590,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     }
 
     private KvResponse.Builder rejected(KvRequest request) {
-        return KvResponse.newBuilder()
+        return stamp(KvResponse.newBuilder())
                 .setRequestId(request.getRequestId())
                 .setOk(false)
                 .setRejected(true)
@@ -457,15 +599,14 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     }
 
     private KvResponse.Builder failure(KvRequest request) {
-        return KvResponse.newBuilder().setRequestId(request.getRequestId()).setOk(false).setSatisfiedRung(-1)
+        return stamp(KvResponse.newBuilder()).setRequestId(request.getRequestId()).setOk(false)
+                .setSatisfiedRung(-1)
                 .setLeaderId(-1);
     }
 
     private void send(StreamObserver<KvResponse> out, KvResponse.Builder reply, long tRecvNanos) {
         double serviceTimeMs = (System.nanoTime() - tRecvNanos) / 1_000_000.0;
-        reply.setLogIndex(node.lastLogIndex())
-                .setCommitIndex(node.currentCommitIndex())
-                .setServiceTimeMs(serviceTimeMs);
+        reply.setServiceTimeMs(serviceTimeMs);
         // The slot closes exactly once per request: every handle path ends in
         // exactly one send.
         plane.requestCompleted(serviceTimeMs);

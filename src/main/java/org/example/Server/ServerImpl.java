@@ -890,45 +890,102 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         });
     }
 
+    // ===== Batched follower read index =====
+
+    // At most one read-index round is in flight per follower; requests that
+    // arrive before a round's send share its returned index (their
+    // linearization point, the confirmation, happens after their arrival).
+    // Requests arriving while a round is in flight join the next round.
+    // Callers must never orTimeout the shared future directly; derive first.
+    private CompletableFuture<Integer> inFlightReadIndexRound;   // guarded by readIndexRoundLock
+    private CompletableFuture<Integer> queuedReadIndexRound;     // guarded by readIndexRoundLock
+    private final Object readIndexRoundLock = new Object();
+    final AtomicInteger readIndexRoundsSent = new AtomicInteger(); // test observability
+
     /**
      * Follower-side half of follower linearizable reads: obtain a confirmed
-     * read index from the current leader. The caller must then wait for this
-     * node's own commit index to reach the returned index before serving from
-     * the committed view. Fails with NotLeaderException when no leader is
-     * known or the presumed leader has stepped down.
+     * read index from the current leader, batching concurrent callers into
+     * shared rounds. The caller must then wait for this node's own commit
+     * index to reach the returned index before serving from the committed
+     * view. Fails with NotLeaderException when no leader is known or the
+     * presumed leader has stepped down.
      */
     public CompletableFuture<Integer> readIndexFromLeader() {
         if (status == ServerCurrentStatus.LEADER) {
             return confirmLeadership();
         }
-        int leaderId = currentLeader;
-        if (leaderId < 0 || leaderId == serverId || dropAllServerNetworkTraffic) {
-            return CompletableFuture.failedFuture(
-                    new NotLeaderException(-1, "server " + serverId + " knows no leader to ask for a read index"));
+        CompletableFuture<Integer> round;
+        boolean sendNow = false;
+        synchronized (readIndexRoundLock) {
+            if (inFlightReadIndexRound != null) {
+                if (queuedReadIndexRound == null) {
+                    queuedReadIndexRound = new CompletableFuture<>();
+                }
+                round = queuedReadIndexRound;
+            } else {
+                inFlightReadIndexRound = new CompletableFuture<>();
+                round = inFlightReadIndexRound;
+                sendNow = true;
+            }
         }
-        CompletableFuture<Integer> future = new CompletableFuture<>();
+        if (sendNow) {
+            sendReadIndexRound(round);
+        }
+        return round;
+    }
+
+    private void sendReadIndexRound(CompletableFuture<Integer> round) {
+        int leaderId = currentLeader;
+        if (status == ServerCurrentStatus.LEADER) {
+            confirmLeadership().whenComplete((readIndex, error) -> finishReadIndexRound(round, readIndex, error));
+            return;
+        }
+        if (leaderId < 0 || leaderId == serverId || dropAllServerNetworkTraffic) {
+            finishReadIndexRound(round, null,
+                    new NotLeaderException(-1, "server " + serverId + " knows no leader to ask for a read index"));
+            return;
+        }
+        readIndexRoundsSent.incrementAndGet();
         stubs[leaderId].confirmReadIndex(ReadIndexRequest.newBuilder().setRequesterId(serverId).build(),
                 new StreamObserver<>() {
                     @Override
                     public void onNext(ReadIndexResult result) {
                         if (result.getSuccess()) {
-                            future.complete(result.getReadIndex());
+                            finishReadIndexRound(round, result.getReadIndex(), null);
                         } else {
-                            future.completeExceptionally(new NotLeaderException(result.getLeaderId(),
+                            finishReadIndexRound(round, null, new NotLeaderException(result.getLeaderId(),
                                     "server " + leaderId + " is no longer the leader"));
                         }
                     }
 
                     @Override
                     public void onError(Throwable t) {
-                        future.completeExceptionally(t);
+                        finishReadIndexRound(round, null, t);
                     }
 
                     @Override
                     public void onCompleted() {
                     }
                 });
-        return future;
+    }
+
+    private void finishReadIndexRound(CompletableFuture<Integer> round, Integer readIndex, Throwable error) {
+        // Promote the queued round before completing this one, so late
+        // callers can never join a round that has already resolved.
+        CompletableFuture<Integer> next;
+        synchronized (readIndexRoundLock) {
+            inFlightReadIndexRound = queuedReadIndexRound;
+            queuedReadIndexRound = null;
+            next = inFlightReadIndexRound;
+        }
+        if (error != null) {
+            round.completeExceptionally(error);
+        } else {
+            round.complete(readIndex);
+        }
+        if (next != null) {
+            sendReadIndexRound(next);
+        }
     }
 
     /**

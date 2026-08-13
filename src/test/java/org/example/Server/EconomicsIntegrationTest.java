@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.List;
 
 import org.example.raft.ReadLevel;
+import org.example.Utility.RungScorer;
 import org.junit.jupiter.api.Test;
 
 /**

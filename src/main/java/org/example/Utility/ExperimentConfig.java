@@ -28,8 +28,12 @@ public final class ExperimentConfig {
 
     // --- Schema (wrapper types so that missing keys are detectable as null) ---
 
+    public String mode;
     public Cluster cluster;
+    public ServerConfig server;
     public Chameleon chameleon;
+    public ClientConfig client;
+    public Pileus pileus;
     public Workload workload;
     public List<AppSlas> slas;
     public NodeFailure nodeFailure;
@@ -44,18 +48,32 @@ public final class ExperimentConfig {
         public Integer serverBasePort;   // server i listens on basePort + i + 1
     }
 
+    /** Mode-independent server mechanics. */
+    public static final class ServerConfig {
+        public Integer maxWaitMs;          // clamp on every server-side wait; expiry falls back / acks what is there
+        public Double sMax;                // occupancy slot budget; the hard cap rejects above 1.5x this in every mode
+        public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s (universal admission)
+        public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round (all modes)
+    }
+
+    /** Chameleon economics; consulted only by the chameleon* modes. */
     public static final class Chameleon {
-        public Integer maxWaitMs;          // bound on every server-side wait; expiry falls back to no-wait level
-        public Integer clientLostTimeoutMs; // no response within this -> the client scores the request as lost
-        public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
-        public Integer clientRetryLimit;   // redirect/failure resends before giving up on a request
-        public Double sMax;                // occupancy slot budget (avg requests in flight); placeholder until the stage 6 load sweep
         public Integer controlIntervalMs;  // utilization / price-controller interval
-        public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s; placeholder until stage 6
         public Double uTarget;             // price controller utilization target (~0.85)
         public Double eta;                 // price controller gain (~1)
         public Double lambdaMin;           // price floor; only its order of magnitude matters
-        public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round; off until measured
+    }
+
+    /** Mode-independent client mechanics. */
+    public static final class ClientConfig {
+        public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
+        public Integer retryLimit;         // redirect/failure resends before giving up on a request
+        public Integer lostTimeoutMs;      // no response within this -> the client scores the request as lost
+    }
+
+    /** Pileus routing; consulted only by the pileus-routed modes. */
+    public static final class Pileus {
+        public Double explorationFraction; // fraction of requests routed randomly to keep windows fresh
     }
 
     /** Key selection for the workload; reads and writes draw from the same distribution. */
@@ -126,6 +144,16 @@ public final class ExperimentConfig {
         public Integer totalTPS;
         public Double readPercentage;
         public Double writePercentage;
+    }
+
+    /** True when the server-side scorer resolves the subSLA target (chameleon* modes). */
+    public boolean chameleonDecision() {
+        return mode.equals("chameleon") || mode.equals("chameleonPileus");
+    }
+
+    /** True when the client routes with the Pileus windows. */
+    public boolean pileusRouting() {
+        return mode.equals("chameleonPileus") || mode.equals("pileus");
     }
 
     // --- Loading ---
@@ -206,6 +234,18 @@ public final class ExperimentConfig {
 
     private static final Set<String> KEY_DISTRIBUTIONS = Set.of("uniform", "zipfian");
 
+    /**
+     * The experiment arms. Each value bundles who resolves the subSLA target
+     * with how contact servers are chosen:
+     * chameleon        - server scorer decides, lowest-RTT routing
+     * chameleonPileus  - server scorer decides, Pileus routing
+     * pileus           - client picks (server, rung) by expected profit
+     * highestProfit    - client targets the max-profit rung, lowest-RTT routing
+     * lowestProfit     - client targets the floor rung, lowest-RTT routing
+     */
+    private static final Set<String> MODES = Set.of(
+            "chameleon", "chameleonPileus", "pileus", "highestProfit", "lowestProfit");
+
     /** Keep in sync with ClientMetricsTracker.MAX_RUNGS (fixed CSV columns). */
     private static final int MAX_RUNGS_PER_SLA = 4;
 
@@ -255,21 +295,37 @@ public final class ExperimentConfig {
         }
         requirePositive(cluster.serverBasePort, "cluster.serverBasePort");
 
-        require(chameleon, "chameleon");
-        requirePositive(chameleon.maxWaitMs, "chameleon.maxWaitMs");
-        requirePositive(chameleon.clientLostTimeoutMs, "chameleon.clientLostTimeoutMs");
-        requirePositive(chameleon.rttWindowSize, "chameleon.rttWindowSize");
-        if (chameleon.rttWindowSize < 8) {
-            throw new IllegalArgumentException("chameleon.rttWindowSize must be >= 8, got " + chameleon.rttWindowSize);
+        require(mode, "mode");
+        if (!MODES.contains(mode)) {
+            throw new IllegalArgumentException("mode must be one of " + MODES + ", got '" + mode + "'");
         }
-        requirePositive(chameleon.clientRetryLimit, "chameleon.clientRetryLimit");
-        requirePositive(chameleon.sMax, "chameleon.sMax");
+
+        require(server, "server");
+        requirePositive(server.maxWaitMs, "server.maxWaitMs");
+        requirePositive(server.sMax, "server.sMax");
+        requirePositive(server.replicationBudgetPerSecond, "server.replicationBudgetPerSecond");
+        require(server.followerLinearizableReads, "server.followerLinearizableReads");
+
+        require(chameleon, "chameleon");
         requirePositive(chameleon.controlIntervalMs, "chameleon.controlIntervalMs");
-        requirePositive(chameleon.replicationBudgetPerSecond, "chameleon.replicationBudgetPerSecond");
         requirePositive(chameleon.uTarget, "chameleon.uTarget");
         requirePositive(chameleon.eta, "chameleon.eta");
         requirePositive(chameleon.lambdaMin, "chameleon.lambdaMin");
-        require(chameleon.followerLinearizableReads, "chameleon.followerLinearizableReads");
+
+        require(client, "client");
+        requirePositive(client.rttWindowSize, "client.rttWindowSize");
+        if (client.rttWindowSize < 8) {
+            throw new IllegalArgumentException("client.rttWindowSize must be >= 8, got " + client.rttWindowSize);
+        }
+        requirePositive(client.retryLimit, "client.retryLimit");
+        requirePositive(client.lostTimeoutMs, "client.lostTimeoutMs");
+
+        require(pileus, "pileus");
+        require(pileus.explorationFraction, "pileus.explorationFraction");
+        if (pileus.explorationFraction < 0 || pileus.explorationFraction >= 1) {
+            throw new IllegalArgumentException("pileus.explorationFraction must be in [0, 1), got "
+                    + pileus.explorationFraction);
+        }
 
         require(workload, "workload");
         requirePositive(workload.keySpace, "workload.keySpace");
