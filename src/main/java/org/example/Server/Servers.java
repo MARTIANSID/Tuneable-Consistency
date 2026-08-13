@@ -173,6 +173,7 @@ public class Servers {
         applyConfig(config);
         ServerImpl.applyConfig(config);
         KvClientService.applyConfig(config);
+        MeasurementPlane.applyConfig(config);
         System.out.println("Loaded config from " + configPath.toAbsolutePath());
 
         clearCSVFiles();
@@ -183,9 +184,10 @@ public class Servers {
         for (int i = 1; i <= NUM_OF_SERVERS; i++) {
             int port = SERVER_BASE_PORT + i;
             ServerImpl serverImpl = new ServerImpl(i - 1, NUM_OF_SERVERS);
+            MeasurementPlane plane = new MeasurementPlane(i - 1, NUM_OF_SERVERS);
             Server server = ServerBuilder.forPort(port)
                     .addService(serverImpl)
-                    .addService(new KvClientService(serverImpl))
+                    .addService(new KvClientService(serverImpl, plane))
                     .build()
                     .start();
             System.out.println("Server" + (i - 1) + " started on port " + port);
@@ -622,7 +624,11 @@ public class Servers {
 
     /** Clear result CSVs at startup so every run starts from a clean slate. */
     private static void clearCSVFiles() {
-        String[] files = { "client_metrics_global.csv" };
+        List<String> files = new ArrayList<>(List.of("client_metrics_global.csv"));
+        for (int sid = 0; sid < 10; sid++) {
+            files.add("occupancy_" + sid + ".csv");
+            files.add("histograms_" + sid + ".csv");
+        }
         for (String filename : files) {
             File file = new File(filename);
             if (file.exists() && !file.delete()) {

@@ -22,6 +22,7 @@ final class TestCluster implements AutoCloseable {
     static final int NUM_NODES = 3;
 
     final List<ServerImpl> nodes = new ArrayList<>();
+    final List<MeasurementPlane> planes = new ArrayList<>();
     final List<Server> rpcServers = new ArrayList<>();
     final int basePort;
 
@@ -30,11 +31,13 @@ final class TestCluster implements AutoCloseable {
         ServerImpl.applyClusterSettings(Collections.nCopies(NUM_NODES, "localhost"), basePort);
         for (int i = 0; i < NUM_NODES; i++) {
             ServerImpl node = new ServerImpl(i, NUM_NODES);
+            MeasurementPlane plane = new MeasurementPlane(i, NUM_NODES);
             rpcServers.add(ServerBuilder.forPort(basePort + i + 1)
                     .addService(node)
-                    .addService(new KvClientService(node))
+                    .addService(new KvClientService(node, plane))
                     .build().start());
             nodes.add(node);
+            planes.add(plane);
         }
         for (ServerImpl node : nodes) {
             node.setUpStubs();
@@ -101,6 +104,9 @@ final class TestCluster implements AutoCloseable {
 
     @Override
     public void close() {
+        for (MeasurementPlane plane : planes) {
+            plane.close();
+        }
         for (ServerImpl node : nodes) {
             node.shutdown();
         }

@@ -1,0 +1,192 @@
+package org.example.Server;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.DoubleAdder;
+
+import org.example.raft.ReadLevel;
+
+/**
+ * One node's measurement plane (Chameleon stage 3): the service-time
+ * histograms and the occupancy meter, their refresh/control schedules, and
+ * the CSV outputs. Utilization is computed per control interval but not yet
+ * acted on; the price controller (stage 4) will read it.
+ *
+ * Levels are indexed 0..4 for the read levels (proto ordinal) and
+ * 5..5+majority-1 for write concerns 1..majority.
+ */
+public final class MeasurementPlane implements AutoCloseable {
+
+    // From config (see ExperimentConfig.chameleon). S_MAX is a placeholder
+    // budget until the stage 6 load sweep calibrates it; utilization may
+    // exceed 1 by design so the controller gets signal.
+    private static volatile double S_MAX = 1000;
+    private static volatile int CONTROL_INTERVAL_MS = 100;
+
+    private static final int HISTOGRAM_REFRESH_MS = 100;
+    private static final int HISTOGRAM_DUMP_INTERVAL_MS = 5000;
+
+    public static void applyConfig(org.example.Utility.ExperimentConfig config) {
+        S_MAX = config.chameleon.sMax;
+        CONTROL_INTERVAL_MS = config.chameleon.controlIntervalMs;
+    }
+
+    private final int nodeId;
+    private final int majority;
+    private final ServiceTimeHistograms histograms;
+    private final OccupancyMeter occupancy = new OccupancyMeter();
+
+    // Cross-check (development aid from the plan): the sum of service times of
+    // requests completing in the interval approximates the same utilization,
+    // with boundary bias when service times are comparable to the interval.
+    private final DoubleAdder completedServiceMsInterval = new DoubleAdder();
+
+    private final AtomicLong cumulativeSlotNanos = new AtomicLong();
+    private final DoubleAdder cumulativeCompletedServiceMs = new DoubleAdder();
+
+    private volatile double lastUtilization;
+    private volatile double lastCrossCheckUtilization;
+
+    private final ScheduledExecutorService scheduler;
+
+    public MeasurementPlane(int nodeId, int numServers) {
+        this.nodeId = nodeId;
+        this.majority = (numServers / 2) + 1;
+        this.histograms = new ServiceTimeHistograms(5 + majority);
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "measurement-plane-" + nodeId);
+            t.setDaemon(true);
+            return t;
+        });
+        scheduler.scheduleAtFixedRate(histograms::refreshTick,
+                HISTOGRAM_REFRESH_MS, HISTOGRAM_REFRESH_MS, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(this::closeControlInterval,
+                CONTROL_INTERVAL_MS, CONTROL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(this::dumpHistograms,
+                HISTOGRAM_DUMP_INTERVAL_MS, HISTOGRAM_DUMP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    // ===== Level indexing =====
+
+    public int readLevelIndex(ReadLevel level) {
+        return level.getNumber();
+    }
+
+    public int writeLevelIndex(int writeConcern) {
+        return 5 + Math.min(Math.max(1, writeConcern), majority) - 1;
+    }
+
+    public String levelLabel(int levelIndex) {
+        return levelIndex < 5 ? "R:" + ReadLevel.forNumber(levelIndex).name() : "W:" + (levelIndex - 4);
+    }
+
+    // ===== Hot path =====
+
+    /** Step 5's on_event(+1): the request holds a slot from here to reply. */
+    public void requestAdmitted() {
+        occupancy.onEvent(1);
+    }
+
+    /** Step 8's on_event(-1), plus the completed-service cross-check feed. */
+    public void requestCompleted(double serviceMs) {
+        occupancy.onEvent(-1);
+        completedServiceMsInterval.add(serviceMs);
+        cumulativeCompletedServiceMs.add(serviceMs);
+    }
+
+    /** File one service-time sample into H[level][gapBucket] (step 8 rules at the call site). */
+    public void fileServiceTime(int levelIndex, int gapBucket, double serviceMs) {
+        histograms.file(levelIndex, gapBucket, serviceMs);
+    }
+
+    public ServiceTimeHistograms histograms() {
+        return histograms;
+    }
+
+    // ===== Control interval =====
+
+    private void closeControlInterval() {
+        OccupancyMeter.Interval interval = occupancy.closeInterval();
+        double intervalMs = interval.intervalNanos() / 1_000_000.0;
+        if (intervalMs <= 0) {
+            return;
+        }
+        double slotMs = interval.slotNanos() / 1_000_000.0;
+        double utilization = slotMs / (S_MAX * intervalMs);
+        double crossCheck = completedServiceMsInterval.sumThenReset() / (S_MAX * intervalMs);
+        cumulativeSlotNanos.addAndGet(interval.slotNanos());
+        lastUtilization = utilization;
+        lastCrossCheckUtilization = crossCheck;
+
+        String csvPath = "occupancy_" + nodeId + ".csv";
+        File file = new File(csvPath);
+        boolean writeHeader = !file.exists() || file.length() == 0;
+        try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
+            if (writeHeader) {
+                out.println("Timestamp,U,CrossCheckU,AvgInFlight,InFlightAtClose");
+            }
+            out.printf("%d,%.6f,%.6f,%.3f,%d%n", System.currentTimeMillis(), utilization, crossCheck,
+                    interval.averageInFlight(), interval.inFlightAtClose());
+        } catch (IOException e) {
+            System.err.println("Failed to write " + csvPath + ": " + e.getMessage());
+        }
+    }
+
+    private void dumpHistograms() {
+        String csvPath = "histograms_" + nodeId + ".csv";
+        File file = new File(csvPath);
+        boolean writeHeader = !file.exists() || file.length() == 0;
+        try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
+            if (writeHeader) {
+                out.println("Timestamp,Level,GapBucket,DecayedCount,MeanMs,P50Ms,P95Ms,P99Ms");
+            }
+            long now = System.currentTimeMillis();
+            for (int l = 0; l < histograms.numLevels(); l++) {
+                for (int g = 0; g < ServiceTimeHistograms.GAP_BUCKETS; g++) {
+                    ServiceTimeHistograms.Snapshot snapshot = histograms.snapshot(l, g);
+                    if (snapshot.totalCount <= 0) {
+                        continue;
+                    }
+                    out.printf("%d,%s,%d,%.2f,%.4f,%.4f,%.4f,%.4f%n", now, levelLabel(l), g,
+                            snapshot.totalCount, snapshot.meanMs,
+                            snapshot.quantileMs(0.50), snapshot.quantileMs(0.95), snapshot.quantileMs(0.99));
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Failed to write " + csvPath + ": " + e.getMessage());
+        }
+    }
+
+    // ===== Introspection (stage 4 and tests) =====
+
+    public double lastUtilization() {
+        return lastUtilization;
+    }
+
+    public double lastCrossCheckUtilization() {
+        return lastCrossCheckUtilization;
+    }
+
+    public long cumulativeSlotNanos() {
+        return cumulativeSlotNanos.get();
+    }
+
+    public double cumulativeCompletedServiceMs() {
+        return cumulativeCompletedServiceMs.sum();
+    }
+
+    public int inFlight() {
+        return occupancy.inFlight();
+    }
+
+    @Override
+    public void close() {
+        scheduler.shutdownNow();
+    }
+}

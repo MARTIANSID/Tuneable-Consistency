@@ -8,7 +8,9 @@
     "maxWaitMs": 400,
     "clientLostTimeoutMs": 10000,
     "rttWindowSize": 64,
-    "clientRetryLimit": 3
+    "clientRetryLimit": 3,
+    "sMax": 1000,
+    "controlIntervalMs": 100
   },
   "nodeFailure": {
     "enabled": false,

@@ -47,6 +47,8 @@ public final class ExperimentConfig {
         public Integer clientLostTimeoutMs; // no response within this -> the client scores the request as lost
         public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
         public Integer clientRetryLimit;   // redirect/failure resends before giving up on a request
+        public Double sMax;                // occupancy slot budget (avg requests in flight); placeholder until the stage 6 load sweep
+        public Integer controlIntervalMs;  // utilization / price-controller interval
     }
 
     public static final class NodeFailure {
@@ -197,6 +199,8 @@ public final class ExperimentConfig {
             throw new IllegalArgumentException("chameleon.rttWindowSize must be >= 8, got " + chameleon.rttWindowSize);
         }
         requirePositive(chameleon.clientRetryLimit, "chameleon.clientRetryLimit");
+        requirePositive(chameleon.sMax, "chameleon.sMax");
+        requirePositive(chameleon.controlIntervalMs, "chameleon.controlIntervalMs");
 
         require(nodeFailure, "nodeFailure");
         require(nodeFailure.enabled, "nodeFailure.enabled");

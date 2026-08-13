@@ -13,20 +13,22 @@ import org.slf4j.LoggerFactory;
 import io.grpc.stub.StreamObserver;
 
 /**
- * The client-facing per-request path (Chameleon stage 2). Every request is
- * timestamped the moment it comes off the stream (t_recv, monotonic clock),
- * executed at its forced level, and answered on the same stream with the
- * delivered level, the node's log/commit indices, and the measured service
- * time.
+ * The client-facing per-request path (Chameleon stage 2 + 3). Every request
+ * is timestamped the moment it comes off the stream (t_recv, monotonic
+ * clock), takes an occupancy slot until its reply, is executed at its forced
+ * level, and files its measured service time into the histogram cell of the
+ * level it actually executed under and the gap bucket it ran under.
  *
  * Levels are pure mechanics here: eventual levels read a view immediately,
  * causal levels wait for the relevant index to reach the client's session
  * anchor, linearizable runs a ReadIndex confirmation on the leader, and write
- * concerns wait for replication or commit. Waits are bounded by maxWaitMs;
- * on expiry the request falls back to the strongest level that needs no
- * waiting and says so in the response. The decision of which level to run
- * arrives with the request (forced by the workload) until the rung scorer
- * lands in stage 4.
+ * concerns wait for replication or commit. Every wait is bounded by
+ * maxWaitMs; on expiry the request falls back to the strongest level that
+ * needs no waiting and says so in the response. An abandoned wait files its
+ * sample under the level originally chosen at the timeout value, and nothing
+ * under the fallback level, whose measured time is dominated by the abandoned
+ * wait (step 8). The decision of which level to run arrives with the request
+ * (forced by the workload) until the rung scorer lands in stage 4.
  */
 public final class KvClientService extends KvClientGrpc.KvClientImplBase {
 
@@ -40,9 +42,11 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     }
 
     private final ServerImpl node;
+    private final MeasurementPlane plane;
 
-    public KvClientService(ServerImpl node) {
+    public KvClientService(ServerImpl node, MeasurementPlane plane) {
         this.node = node;
+        this.plane = plane;
     }
 
     @Override
@@ -51,8 +55,9 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             @Override
             public void onNext(KvRequest request) {
                 // Step 1: t_recv the moment the request comes off the stream,
-                // before any queueing or waiting.
+                // before any queueing or waiting; the occupancy slot opens here.
                 long tRecvNanos = System.nanoTime();
+                plane.requestAdmitted();
                 try {
                     handle(request, tRecvNanos, responseObserver);
                 } catch (Exception e) {
@@ -93,42 +98,62 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     private void handleRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
         String key = request.getKey();
         switch (request.getForcedReadLevel()) {
-            case EVENTUAL_LOCAL ->
+            case EVENTUAL_LOCAL -> {
+                fileMeasured(plane.readLevelIndex(ReadLevel.EVENTUAL_LOCAL), 0, tRecvNanos);
                 send(out, readReply(request, ReadLevel.EVENTUAL_LOCAL, node.kv.readLocal(key), false, false),
                         tRecvNanos);
-            case EVENTUAL_MAJORITY ->
+            }
+            case EVENTUAL_MAJORITY -> {
+                fileMeasured(plane.readLevelIndex(ReadLevel.EVENTUAL_MAJORITY), 0, tRecvNanos);
                 send(out, readReply(request, ReadLevel.EVENTUAL_MAJORITY, node.kv.readCommitted(key), false, false),
                         tRecvNanos);
+            }
             case CAUSAL_LOCAL -> {
                 int anchor = request.getUncommittedSessionIndex();
+                // Step 3: the gap this level must close, bucketed coarsely.
+                // Everything at or below zero is one bucket.
+                int gapBucket = ServiceTimeHistograms.gapBucketOf((long) anchor - node.lastLogIndex());
+                int levelIndex = plane.readLevelIndex(ReadLevel.CAUSAL_LOCAL);
                 if (anchor < 0 || node.lastLogIndex() >= anchor) {
+                    fileMeasured(levelIndex, gapBucket, tRecvNanos);
                     send(out, readReply(request, ReadLevel.CAUSAL_LOCAL, node.kv.readLocal(key), false, false),
                             tRecvNanos);
                 } else {
                     awaitBounded(node.awaitLocalLogIndex(anchor),
-                            () -> send(out,
-                                    readReply(request, ReadLevel.CAUSAL_LOCAL, node.kv.readLocal(key), true, false),
-                                    tRecvNanos),
-                            () -> send(out,
-                                    readReply(request, ReadLevel.EVENTUAL_LOCAL, node.kv.readLocal(key), true, true),
-                                    tRecvNanos));
+                            () -> {
+                                fileMeasured(levelIndex, gapBucket, tRecvNanos);
+                                send(out, readReply(request, ReadLevel.CAUSAL_LOCAL, node.kv.readLocal(key), true,
+                                        false), tRecvNanos);
+                            },
+                            () -> {
+                                // Abandoned wait: file under the chosen level at
+                                // the timeout value, nothing under the fallback.
+                                plane.fileServiceTime(levelIndex, gapBucket, MAX_WAIT_MS);
+                                send(out, readReply(request, ReadLevel.EVENTUAL_LOCAL, node.kv.readLocal(key), true,
+                                        true), tRecvNanos);
+                            });
                 }
             }
             case CAUSAL_MAJORITY -> {
                 int anchor = request.getCommittedSessionIndex();
+                int gapBucket = ServiceTimeHistograms.gapBucketOf((long) anchor - node.currentCommitIndex());
+                int levelIndex = plane.readLevelIndex(ReadLevel.CAUSAL_MAJORITY);
                 if (anchor < 0 || node.currentCommitIndex() >= anchor) {
+                    fileMeasured(levelIndex, gapBucket, tRecvNanos);
                     send(out, readReply(request, ReadLevel.CAUSAL_MAJORITY, node.kv.readCommitted(key), false, false),
                             tRecvNanos);
                 } else {
                     awaitBounded(node.awaitCommitIndex(anchor),
-                            () -> send(out,
-                                    readReply(request, ReadLevel.CAUSAL_MAJORITY, node.kv.readCommitted(key), true,
-                                            false),
-                                    tRecvNanos),
-                            () -> send(out,
-                                    readReply(request, ReadLevel.EVENTUAL_MAJORITY, node.kv.readCommitted(key), true,
-                                            true),
-                                    tRecvNanos));
+                            () -> {
+                                fileMeasured(levelIndex, gapBucket, tRecvNanos);
+                                send(out, readReply(request, ReadLevel.CAUSAL_MAJORITY, node.kv.readCommitted(key),
+                                        true, false), tRecvNanos);
+                            },
+                            () -> {
+                                plane.fileServiceTime(levelIndex, gapBucket, MAX_WAIT_MS);
+                                send(out, readReply(request, ReadLevel.EVENTUAL_MAJORITY, node.kv.readCommitted(key),
+                                        true, true), tRecvNanos);
+                            });
                 }
             }
             case LINEARIZABLE -> {
@@ -136,22 +161,26 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                     send(out, notLeader(request), tRecvNanos);
                     return;
                 }
+                int levelIndex = plane.readLevelIndex(ReadLevel.LINEARIZABLE);
                 // ReadIndex: no log entry; serve committed state once a
-                // majority heartbeat round confirms leadership. The committed
-                // view covers the read index by construction.
-                node.confirmLeadership().whenCompleteAsync((readIndex, error) -> {
-                    if (error == null) {
-                        send(out, readReply(request, ReadLevel.LINEARIZABLE, node.kv.readCommitted(key), true, false),
-                                tRecvNanos);
-                    } else if (unwrap(error) instanceof ServerImpl.NotLeaderException) {
-                        send(out, notLeader(request), tRecvNanos);
-                    } else {
-                        // Confirmation round timed out: fall back to the
-                        // strongest no-wait level.
-                        send(out, readReply(request, ReadLevel.EVENTUAL_MAJORITY, node.kv.readCommitted(key), true,
-                                true), tRecvNanos);
-                    }
-                }, node.executorService);
+                // majority heartbeat round confirms leadership. Bounded by the
+                // same wait budget as every other level.
+                node.confirmLeadership().orTimeout(MAX_WAIT_MS, TimeUnit.MILLISECONDS)
+                        .whenCompleteAsync((readIndex, error) -> {
+                            if (error == null) {
+                                fileMeasured(levelIndex, 0, tRecvNanos);
+                                send(out, readReply(request, ReadLevel.LINEARIZABLE, node.kv.readCommitted(key), true,
+                                        false), tRecvNanos);
+                            } else if (unwrap(error) instanceof ServerImpl.NotLeaderException) {
+                                send(out, notLeader(request), tRecvNanos);
+                            } else {
+                                // Confirmation round timed out: abandoned-wait
+                                // filing, then the strongest no-wait level.
+                                plane.fileServiceTime(levelIndex, 0, MAX_WAIT_MS);
+                                send(out, readReply(request, ReadLevel.EVENTUAL_MAJORITY, node.kv.readCommitted(key),
+                                        true, true), tRecvNanos);
+                            }
+                        }, node.executorService);
             }
             default -> send(out, failure(request), tRecvNanos);
         }
@@ -165,6 +194,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             return;
         }
         int writeConcern = Math.min(Math.max(1, request.getForcedWriteConcern()), node.majority());
+        int levelIndex = plane.writeLevelIndex(writeConcern);
 
         int index;
         try {
@@ -176,6 +206,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         }
 
         if (writeConcern <= 1) {
+            fileMeasured(levelIndex, 0, tRecvNanos);
             send(out, writeReply(request, index, 1, false, false), tRecvNanos);
             return;
         }
@@ -186,8 +217,14 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 ? node.awaitCommitIndex(index)
                 : node.awaitReplication(index, writeConcern);
         awaitBounded(wait,
-                () -> send(out, writeReply(request, index, writeConcern, true, false), tRecvNanos),
-                () -> send(out, writeReply(request, index, node.replicaCount(index), true, true), tRecvNanos));
+                () -> {
+                    fileMeasured(levelIndex, 0, tRecvNanos);
+                    send(out, writeReply(request, index, writeConcern, true, false), tRecvNanos);
+                },
+                () -> {
+                    plane.fileServiceTime(levelIndex, 0, MAX_WAIT_MS);
+                    send(out, writeReply(request, index, node.replicaCount(index), true, true), tRecvNanos);
+                });
     }
 
     // ===== Helpers =====
@@ -201,6 +238,10 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                         onExpired.run();
                     }
                 }, node.executorService);
+    }
+
+    private void fileMeasured(int levelIndex, int gapBucket, long tRecvNanos) {
+        plane.fileServiceTime(levelIndex, gapBucket, (System.nanoTime() - tRecvNanos) / 1_000_000.0);
     }
 
     private static Throwable unwrap(Throwable t) {
@@ -244,9 +285,13 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     }
 
     private void send(StreamObserver<KvResponse> out, KvResponse.Builder reply, long tRecvNanos) {
+        double serviceTimeMs = (System.nanoTime() - tRecvNanos) / 1_000_000.0;
         reply.setLogIndex(node.lastLogIndex())
                 .setCommitIndex(node.currentCommitIndex())
-                .setServiceTimeMs((System.nanoTime() - tRecvNanos) / 1_000_000.0);
+                .setServiceTimeMs(serviceTimeMs);
+        // The slot closes exactly once per request: every handle path ends in
+        // exactly one send.
+        plane.requestCompleted(serviceTimeMs);
         try {
             synchronized (out) {
                 out.onNext(reply.build());
