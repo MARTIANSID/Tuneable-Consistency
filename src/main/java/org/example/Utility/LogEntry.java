@@ -1,6 +1,6 @@
 package org.example.Utility;
 
-import org.ds.paxos.Transaction;
+import org.example.raft.Transaction;
 
 import java.util.HashSet;
 import java.util.*;

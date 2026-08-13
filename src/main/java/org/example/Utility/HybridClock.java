@@ -1,6 +1,6 @@
 package org.example.Utility;
 
-import org.ds.paxos.TimeStampProto;
+import org.example.raft.TimeStampProto;
 
 import java.util.Objects;
 

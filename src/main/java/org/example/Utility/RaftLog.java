@@ -1,8 +1,8 @@
 package org.example.Utility;
 
-import org.ds.paxos.Log;
-import org.ds.paxos.LogEntryProto;
-import org.ds.paxos.TimeStampProto;
+import org.example.raft.Log;
+import org.example.raft.LogEntryProto;
+import org.example.raft.TimeStampProto;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;

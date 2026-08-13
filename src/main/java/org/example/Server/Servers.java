@@ -28,11 +28,11 @@ import org.example.Client.LatencyAwareRouter;
 import org.example.TokenBucket.TokenBucketImpl;
 import org.example.Utility.BatchProcessor;
 import org.example.Utility.ExperimentConfig;
-import org.ds.paxos.ClientMessage;
-import org.ds.paxos.ReadConcern;
-import org.ds.paxos.ReadLevel;
-import org.ds.paxos.Transaction;
-import org.ds.paxos.TimeStampProto;
+import org.example.raft.ClientMessage;
+import org.example.raft.ReadConcern;
+import org.example.raft.ReadLevel;
+import org.example.raft.Transaction;
+import org.example.raft.TimeStampProto;
 import org.example.Utility.TransactionOption;
 
 public class Servers{
@@ -843,17 +843,17 @@ public class Servers{
 
     private static ClientMessage generateWriteTransaction(long now, int sequence, int minConsistency) {
         String txId = UUID.randomUUID().toString();
-        String sender = "user" + (sequence % 100);
-        String receiver = "user" + ((sequence + 50) % 100);
-        double amount = 1.0 + (sequence % 10);
+        // Single-key KV write over a 100-key space (Chameleon stage 1); the
+        // value encodes time and sequence so every write is distinguishable.
+        String key = "user" + (sequence % 100);
+        String value = "v-" + now + "-" + sequence;
 
         int applicationId = 1 + random.nextInt(3);
 
         Transaction transaction = Transaction.newBuilder()
                 .setId(txId)
-                .setSender(sender)
-                .setReceiver(receiver)
-                .setAmount(amount)
+                .setKey(key)
+                .setValue(value)
                 .setTransactionSendTimeInMs(now)
                 .setMinRequiredConsistency(minConsistency)
                 .setApplicationId(applicationId)
@@ -907,7 +907,7 @@ public class Servers{
     private static ClientMessage generateReadTransaction(TimeStampProto lastWriteTs, ReadClass readClass,
             int applicationId) {
         String txId = UUID.randomUUID().toString();
-        String accName = "user" + random.nextInt(100);
+        String key = "user" + random.nextInt(100);
         long now = System.currentTimeMillis();
 
         ReadConcern readConcern;
@@ -939,7 +939,7 @@ public class Servers{
         Transaction transaction = Transaction.newBuilder()
                 .setId(txId)
                 .setIsReadOnly(true)
-                .setAccNameToRead(accName)
+                .setKey(key)
                 .setReadConcern(readConcern)
                 .setReadLevel(readLevel)
                 .setMinRequiredConsistency(writeConcern)

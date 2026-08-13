@@ -13,9 +13,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.ds.paxos.ClientMessage;
-import org.ds.paxos.RaftGrpc;
-import org.ds.paxos.Transaction;
+import org.example.raft.ClientMessage;
+import org.example.raft.RaftGrpc;
+import org.example.raft.Transaction;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;

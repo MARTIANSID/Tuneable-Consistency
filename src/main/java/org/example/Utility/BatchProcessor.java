@@ -9,11 +9,11 @@ import java.util.PriorityQueue;
 import java.util.Queue;
 import java.util.Set;
 import java.util.Map;
-import org.ds.paxos.ReadConcern;
-import org.ds.paxos.ReadLevel;
-import org.ds.paxos.Transaction;
+import org.example.raft.ReadConcern;
+import org.example.raft.ReadLevel;
+import org.example.raft.Transaction;
 
-import org.ds.paxos.ClientMessage;
+import org.example.raft.ClientMessage;
 
 public class BatchProcessor {
 

@@ -1,6 +1,7 @@
 syntax = "proto3";
-option java_multiple_files =  true;
-package org.ds.paxos;
+option java_multiple_files = true;
+option java_package = "org.example.raft";
+package raft;
 
 service Raft {
   rpc SendTransaction(ClientMessage) returns (Empty);
@@ -43,6 +44,10 @@ message AckMessage {
   ReadConcern executedReadConcern = 10;
   ReadLevel executedReadLevel = 11;
   int32 executedWriteConcern = 12;
+
+  // Chameleon stage 1: value returned for KV reads (balance is the legacy
+  // bank-model equivalent and dies in stage 2).
+  string readValue = 13;
 }
 
 message Ack {
@@ -81,6 +86,12 @@ message Transaction {
   int32 applicationId = 16;
   int64 transactionArrivalTimeOnLeader = 17;
   ReadLevel readLevel = 18;
+
+  // Chameleon stage 1: single-key KV data model. Writes carry key+value,
+  // reads carry key. The bank fields (sender/receiver/amount/accNameToRead)
+  // are legacy and die in stage 2.
+  string key = 19;
+  string value = 20;
 }
 message LogEntryProto {
   int32 logIndex = 1;

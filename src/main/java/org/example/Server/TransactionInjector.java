@@ -1,6 +1,6 @@
 package org.example.Server;
 
-import org.ds.paxos.ClientMessage;
+import org.example.raft.ClientMessage;
 import org.example.Utility.ServerStatus;
 import org.example.Utility.TransactionOption;
 

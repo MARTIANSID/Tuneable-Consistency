@@ -1,9 +1,9 @@
 package org.example.Utility;
 
-import org.ds.paxos.ClientMessage;
-import org.ds.paxos.ReadConcern;
-import org.ds.paxos.ReadLevel;
-import org.ds.paxos.Transaction;
+import org.example.raft.ClientMessage;
+import org.example.raft.ReadConcern;
+import org.example.raft.ReadLevel;
+import org.example.raft.Transaction;
 
 import java.util.ArrayList;
 import java.util.List;

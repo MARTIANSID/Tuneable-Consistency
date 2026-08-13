@@ -1,6 +1,6 @@
 package org.example.Utility;
 
-import org.ds.paxos.ClientMessage;
+import org.example.raft.ClientMessage;
 
 public class ServerStatus {
     public enum ServerCurrentStatus {

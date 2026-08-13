@@ -3,7 +3,7 @@ package org.example.Server;
 import io.grpc.*;
 import io.grpc.stub.StreamObserver;
 
-import org.ds.paxos.*;
+import org.example.raft.*;
 import org.example.Timer.CustomTimer;
 
 import java.io.File;
@@ -17,7 +17,7 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.ds.paxos.RaftGrpc.*;
+import org.example.raft.RaftGrpc.*;
 
 import org.example.TokenBucket.TokenBucketImpl;
 import org.example.Utility.*;
@@ -73,9 +73,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentHashMap<String, Long> timeAtWhichTransactionWasReceived;
 
-    ConcurrentHashMap<String, Double> clientBalancesMajorityCommitted;
-
-    ConcurrentHashMap<String, Double> clientBalancesLatest;
+    // Replicated KV state machine: local view applied at log append (may roll
+    // back), committed view applied at commit-index advance (never rolls back).
+    final KvStore kv;
 
     ConcurrentSkipListMap<HybridClock.TimeStamp, Integer> timeStampsInLog;
 
@@ -190,8 +190,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         MAX_BATCH_SIZE = config.serverTuning.maxBatchSize;
         REDIS_HOST = config.redis.host;
         REDIS_PORT = config.redis.port;
-        SERVER_HOSTS = List.copyOf(config.cluster.serverHosts);
-        SERVER_BASE_PORT = config.cluster.serverBasePort;
+        applyClusterSettings(config.cluster.serverHosts, config.cluster.serverBasePort);
+    }
+
+    /** Point the peer stubs at a cluster without a full config (tests use this directly). */
+    public static void applyClusterSettings(List<String> serverHosts, int basePort) {
+        SERVER_HOSTS = List.copyOf(serverHosts);
+        SERVER_BASE_PORT = basePort;
     }
     private static final double BACKLOG_DRAIN_RATIO = 1.0;
     private static final int ACK_FUTURE_TIMEOUT_MS = 300;
@@ -267,6 +272,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     ConcurrentLinkedQueue<TransactionOption> backLogQueue;
 
+    // Every gRPC channel this node opens (peer stubs, client callback stubs),
+    // so shutdown() can close them all.
+    private final List<ManagedChannel> ownedChannels = Collections.synchronizedList(new ArrayList<>());
+
     // ===== Consistency toggles =====
     // When false, the server will bypass handleTokenBucket() and execute the incoming
     // batch exactly as received (no upgrades, no deferrals).
@@ -325,8 +334,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.totalLatency = new AtomicLong(0);
         this.ackTransactionCount = new AtomicLong(0);
         this.hybridClock = new HybridClock();
-        this.clientBalancesMajorityCommitted = new ConcurrentHashMap<>();
-        this.clientBalancesLatest = new ConcurrentHashMap<>();
+        this.kv = new KvStore();
         this.timeStampsInLog = new ConcurrentSkipListMap<>();
         this.ackLock = new ReentrantReadWriteLock();
         this.NUM_OF_SERVERS = NUM_OF_SERVERS;
@@ -434,6 +442,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 ManagedChannel channel = ManagedChannelBuilder
                         .forAddress(SERVER_HOSTS.get(i), SERVER_BASE_PORT + (i + 1)).enableRetry()
                         .usePlaintext().build();
+                ownedChannels.add(channel);
                 stubs[i] = RaftGrpc.newStub(channel);
                 blockingStubs[i] = RaftGrpc.newBlockingStub(channel);
 
@@ -520,8 +529,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 // we need the time stamps in log to provide causal consistency
                 timeStampsInLog.put(HybridClock.TimeStamp.convertToTimeStamp(logEntry.getTimeStamp()),
                         logEntry.getLogIndex());
-                // updating local balances
-                updateBalances(logEntry.getT(), clientBalancesLatest);
+                // applying to the local (may-roll-back) KV view at append time
+                kv.applyLocal(logEntry.getT(), logEntry.getLogIndex());
                 // updating ackSent Map
                 ackSent.put(id, false);
             }
@@ -531,9 +540,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
                 // updating the commitIndex of this follower
                 commitIndex.set(Math.min(leadersCommitIndex, log.size() - 1));
-                // update majority committed ap
+                // update the majority-committed KV view
                 for (int i = (prevCommitIndex + 1); i <= commitIndex.get(); i++) {
-                    updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
+                    kv.applyCommitted(log.get(i).t, i);
                     // updating the ack sent
                     ackSent.put(log.get(i).t.getId(), true);
                 }
@@ -561,41 +570,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    // inside write lock
-    private void updateBalances(Transaction t, ConcurrentHashMap<String, Double> balances) {
-        if (t.getIsReadOnly())
-            return;
-
-        String sender = t.getSender(), receiver = t.getReceiver(), id = t.getId();
-
-        double amount = t.getAmount();
-
-        balances.put(sender, balances.getOrDefault(sender, 100.0) - amount);
-        balances.put(receiver, balances.getOrDefault(receiver, 100.0) + amount);
-    }
-
-    // inside write lock
+    // inside write lock; logIndex is the first log position being truncated
     private void rollbackTillIndex(int logIndex) {
-        // remove the entries from the logIndex till the end
+        if (logIndex >= log.size()) {
+            // Nothing is being truncated (the common append-only path).
+            return;
+        }
+        if (logIndex <= commitIndex.get()) {
+            // Raft's leader completeness guarantee makes this unreachable: a
+            // leader whose consistency check passed can never truncate below
+            // the follower's commit index. If it happens, the state machine is
+            // corrupt and continuing silently would serve wrong committed data.
+            throw new IllegalStateException("attempted to roll back committed entries: truncation at "
+                    + logIndex + " but commit index is " + commitIndex.get());
+        }
         for (int i = logIndex; i < log.size(); i++) {
-            Transaction t = log.get(i).t;
-            String id = t.getId();
-
-            if (!t.getIsReadOnly()) {
-                String sender = t.getSender(), receiver = t.getReceiver();
-
-                double amount = t.getAmount();
-                // revert the transaction, and the rollback will be performed in the
-                // clientBalancesLatest
-                clientBalancesLatest.put(sender, clientBalancesLatest.get(sender) + amount);
-                clientBalancesLatest.put(receiver, clientBalancesLatest.get(receiver) - amount);
-            }
-
             // remove the entries from tIdToLogIndex
-            tIdToLogIndex.remove(id);
+            tIdToLogIndex.remove(log.get(i).t.getId());
             // remove the timestamps
             timeStampsInLog.remove(log.get(i).timeStamp);
         }
+        // Rebuild the local KV view: committed state plus the uncommitted
+        // entries that survive the truncation, replayed in log order.
+        kv.rebuildLocal(log.logEntriesFromIndex(commitIndex.get() + 1, logIndex));
     }
 
     // in lock
@@ -858,6 +855,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     private RaftStub createClientStub(String host, int port) {
         ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
+        ownedChannels.add(channel);
         return RaftGrpc.newStub(channel);
     }
 
@@ -1150,8 +1148,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 .setExecutedReadLevel(entry.t.getReadLevel());
 
                         if (entry.t.getIsReadOnly()) {
-                            ackBuilder.setId(id).setBalance(
-                                    clientBalancesMajorityCommitted.getOrDefault(entry.t.getAccNameToRead(), 0.0));
+                            KvStore.Versioned committedValue = kv.readCommitted(entry.t.getKey());
+                            ackBuilder.setId(id)
+                                    .setReadValue(committedValue == null ? "" : committedValue.value());
                             recordReadConcernLatency(ReadConcern.LINEARIZABLE, ReadLevel.MAJORITY,
                                 entry.timeOfArrivalAtLeader);
                         }
@@ -1361,7 +1360,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                         writeConcernLatencySum.get(writeConcernOfThisTransaction) + currentLatency);
                             }
 
-                            updateBalances(log.get(i).t, clientBalancesMajorityCommitted);
+                            kv.applyCommitted(log.get(i).t, i);
                         }
                         // System.out.println("The commit index of leader updated to -- " +
                         // commitIndex.get());
@@ -1461,6 +1460,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                     boolean includeThroughput;
                     double combinedSystemThroughput = 0;
                     long now = System.currentTimeMillis();
+                    // Taken before the RPC is sent: any response to this round
+                    // proves leadership only for confirmations registered
+                    // before this instant (ReadIndex).
+                    final long sendStartNanos = System.nanoTime();
 
                     // ================= SNAPSHOT UNDER READ LOCK =================
                     lock.readLock().lock();
@@ -1536,6 +1539,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                                     result,
                                                     matchIndexForFollower,
                                                     indexToSendFrom));
+                                    // ReadIndex: a response whose term does not
+                                    // exceed ours means this follower accepted
+                                    // our authority for this round.
+                                    if (result.getCurrentTerm() <= request.getLeadersTerm()) {
+                                        recordLeadershipAck(followerId, sendStartNanos, request.getLeadersTerm());
+                                    }
                                 }
 
                                 @Override
@@ -1655,6 +1664,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (status == ServerCurrentStatus.LEADER || status == ServerCurrentStatus.CANDIDATE) {
             startTheElectionTimer();
         }
+        // A node that is no longer leader can never confirm leadership.
+        failPendingLeadershipConfirmations();
         // the status changes to follower
         status = ServerCurrentStatus.FOLLOWER;
         // we have to start the election timer because now it is a follower
@@ -2105,7 +2116,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 log.append(new LogEntry(index, currentTerm.get(), t, writeConcern, currentTimeStamp, NUM_OF_SERVERS,
                         t.getTransactionArrivalTimeOnLeader(), host, port));
 
-                updateBalances(t, clientBalancesLatest);
+                kv.applyLocal(t, index);
                 timeStampsInLog.put(currentTimeStamp, index);
                 log.updateWriteConcern(index, serverId, ackTransactionTimeStampsForAllWriteConcerns,
                         writeConcernThroughputLocks, writeConcernLatencyLocks, writeConcernLatencies,
@@ -2457,21 +2468,22 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         }
     }
 
-    private Ack getBalanceBasedOnReadLevel(ReadConcern readConcern, ReadLevel readLevel, String accName, String id) {
-        double balance = (readLevel == ReadLevel.LOCAL)
-                ? clientBalancesLatest.getOrDefault(accName, 0.0)
-                : clientBalancesMajorityCommitted.getOrDefault(accName, 0.0);
-        return Ack.newBuilder().addAckMessage(AckMessage.newBuilder().setAccName(accName)
-                .setBalance(balance).setId(id)
+    private Ack buildReadAck(ReadConcern readConcern, ReadLevel readLevel, String key, String id) {
+        KvStore.Versioned versioned = (readLevel == ReadLevel.LOCAL)
+                ? kv.readLocal(key)
+                : kv.readCommitted(key);
+        return Ack.newBuilder().addAckMessage(AckMessage.newBuilder()
+                .setReadValue(versioned == null ? "" : versioned.value())
+                .setId(id)
                 .setExecutedLevelIncluded(true)
                 .setExecutedReadConcern(readConcern)
                 .setExecutedReadLevel(readLevel)
                 .build()).build();
     }
 
-    private Ack buildFailureAck(String accName, String id) {
+    private Ack buildFailureAck(String id) {
         return Ack.newBuilder()
-                .addAckMessage(AckMessage.newBuilder().setFailure(true).setAccName(accName).setId(id).build())
+                .addAckMessage(AckMessage.newBuilder().setFailure(true).setId(id).build())
                 .build();
     }
 
@@ -2482,7 +2494,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
      */
     public Ack processReadRequest(ClientMessage cm) {
         Transaction t = cm.getT();
-        String accName = t.getAccNameToRead();
+        String key = t.getKey();
         String id = t.getId();
         ReadLevel readLevel = t.getReadLevel();
         String host = cm.getCallbackHost();
@@ -2491,7 +2503,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         long arrivalTime = t.getTransactionArrivalTimeOnLeader();
 
         if (shouldDropServerNetworkTraffic()) {
-            return buildFailureAck(accName, id);
+            return buildFailureAck(id);
         }
 
         int majority = (NUM_OF_SERVERS / 2) + 1;
@@ -2511,7 +2523,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 @Override
                 public void run() {
                     if (shouldDropServerNetworkTraffic()) {
-                        clientStub.sendAckToClient(buildFailureAck(accName, id), new StreamObserver<Empty>() {
+                        clientStub.sendAckToClient(buildFailureAck(id), new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}
                             @Override public void onCompleted() {}
@@ -2539,7 +2551,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                                 //         incomingTPS,
                                 //         new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date(currentTime)));
                         }
-                        Ack failAck = buildFailureAck(accName, id);
+                        Ack failAck = buildFailureAck(id);
                         clientStub.sendAckToClient(failAck, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}
@@ -2579,7 +2591,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             countOfSystemWideLatencies.incrementAndGet();
                         }
                         recordReadConcernLatency(readConcern, readLevel, arrivalTime);
-                        Ack ack = getBalanceBasedOnReadLevel(readConcern, readLevel, accName, id);
+                        Ack ack = buildReadAck(readConcern, readLevel, key, id);
                         clientStub.sendAckToClient(ack, new StreamObserver<Empty>() {
                             @Override public void onNext(Empty value) {}
                             @Override public void onError(Throwable t) {}
@@ -2611,7 +2623,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             try {
                 ClientMessage clientMessage = ClientMessage.newBuilder().setWriteConcern(majority)
                         .setT(Transaction.newBuilder().setId(id).setIsReadOnly(true).setWriteConcern(majority)
-                                .setMinRequiredConsistency(majority).setAccNameToRead(accName)
+                                .setMinRequiredConsistency(majority).setKey(key)
                                 .setReadConcern(readConcern).setReadLevel(readLevel)
                                 .setTransactionArrivalTimeOnLeader(arrivalTime).build())
                         .setCallbackHost(host).setCallbackPort(port).build();
@@ -2643,12 +2655,138 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 countOfSystemWideLatencies.incrementAndGet();
             }
             recordReadConcernLatency(readConcern, readLevel, arrivalTime);
-            return getBalanceBasedOnReadLevel(readConcern, readLevel, accName, id);
+            return buildReadAck(readConcern, readLevel, key, id);
         }
     }
 
     // this resets and starts the timer again
     private void startTheElectionTimer() {
         this.electionTimer.reset();
+    }
+
+    // ===== ReadIndex leadership confirmation (Chameleon stage 1) =====
+
+    /** Thrown when a leader-only operation is invoked on a non-leader. */
+    public static final class NotLeaderException extends Exception {
+        public NotLeaderException(String message) {
+            super(message);
+        }
+    }
+
+    private static final long CONFIRM_LEADERSHIP_TIMEOUT_MS = 1000;
+
+    private static final class LeadershipConfirmation {
+        final int term;
+        final int readIndex;
+        final long registeredAtNanos;
+        final Set<Integer> ackedFollowers = ConcurrentHashMap.newKeySet();
+        final CompletableFuture<Integer> future = new CompletableFuture<>();
+
+        LeadershipConfirmation(int term, int readIndex, long registeredAtNanos) {
+            this.term = term;
+            this.readIndex = readIndex;
+            this.registeredAtNanos = registeredAtNanos;
+        }
+    }
+
+    private final ConcurrentLinkedQueue<LeadershipConfirmation> pendingLeadershipConfirmations = new ConcurrentLinkedQueue<>();
+
+    /**
+     * ReadIndex (linearizable reads without log entries): snapshot the commit
+     * index, then confirm this node is still the leader by observing a majority
+     * of followers acknowledge an AppendEntries round that started after this
+     * call. The returned future completes with the snapshotted commit index;
+     * the caller can then serve the read from local committed state. No log
+     * entry is created, and the confirmation rides the regular replication
+     * heartbeats already in flight.
+     *
+     * The committed KV view is applied in the same critical sections that
+     * advance the commit index, so once the future completes the local
+     * committed view already covers the returned index and no apply-wait is
+     * needed.
+     */
+    public CompletableFuture<Integer> confirmLeadership() {
+        lock.readLock().lock();
+        try {
+            if (status != ServerCurrentStatus.LEADER) {
+                return CompletableFuture.failedFuture(
+                        new NotLeaderException("server " + serverId + " is not the leader"));
+            }
+            int readIndex = commitIndex.get();
+            if (NUM_OF_SERVERS == 1) {
+                return CompletableFuture.completedFuture(readIndex);
+            }
+            LeadershipConfirmation confirmation = new LeadershipConfirmation(
+                    currentTerm.get(), readIndex, System.nanoTime());
+            pendingLeadershipConfirmations.add(confirmation);
+            causalReadScheduler.schedule(() -> {
+                if (pendingLeadershipConfirmations.remove(confirmation)) {
+                    confirmation.future.completeExceptionally(new TimeoutException(
+                            "no majority heartbeat round within " + CONFIRM_LEADERSHIP_TIMEOUT_MS + " ms"));
+                }
+            }, CONFIRM_LEADERSHIP_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            return confirmation.future;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private void recordLeadershipAck(int followerId, long sendStartNanos, int termAtSend) {
+        if (pendingLeadershipConfirmations.isEmpty()) {
+            return;
+        }
+        int majority = (NUM_OF_SERVERS / 2) + 1;
+        for (LeadershipConfirmation confirmation : pendingLeadershipConfirmations) {
+            // Only rounds started after registration prove leadership at (or
+            // after) the moment the read index was snapshotted.
+            if (confirmation.term != termAtSend || sendStartNanos < confirmation.registeredAtNanos) {
+                continue;
+            }
+            confirmation.ackedFollowers.add(followerId);
+            // +1 counts this node itself.
+            if (confirmation.ackedFollowers.size() + 1 >= majority
+                    && pendingLeadershipConfirmations.remove(confirmation)) {
+                confirmation.future.complete(confirmation.readIndex);
+            }
+        }
+    }
+
+    private void failPendingLeadershipConfirmations() {
+        LeadershipConfirmation confirmation;
+        while ((confirmation = pendingLeadershipConfirmations.poll()) != null) {
+            confirmation.future.completeExceptionally(new NotLeaderException("stepped down from leadership"));
+        }
+    }
+
+    /**
+     * Stop all background activity (election timer, replication and batch
+     * schedulers, worker pool) and close every gRPC channel this node opened.
+     * Used by tests and orderly teardown; the node is unusable afterwards.
+     */
+    public void shutdown() {
+        dropAllServerNetworkTraffic = true;
+        electionTimer.stop();
+        electionTimer.shutdown();
+        failPendingLeadershipConfirmations();
+        if (batchProcessor != null) {
+            batchProcessor.shutdownNow();
+        }
+        if (sendAppendEntriesScheduler != null) {
+            sendAppendEntriesScheduler.shutdownNow();
+        }
+        if (causalReadScheduler != null) {
+            causalReadScheduler.shutdownNow();
+        }
+        if (backLogScheuler != null) {
+            backLogScheuler.shutdownNow();
+        }
+        if (executorService != null) {
+            executorService.shutdownNow();
+        }
+        synchronized (ownedChannels) {
+            for (ManagedChannel channel : ownedChannels) {
+                channel.shutdownNow();
+            }
+        }
     }
 }

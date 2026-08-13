@@ -15,9 +15,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.ds.paxos.AckMessage;
-import org.ds.paxos.ReadConcern;
-import org.ds.paxos.ReadLevel;
+import org.example.raft.AckMessage;
+import org.example.raft.ReadConcern;
+import org.example.raft.ReadLevel;
 import org.example.Utility.ExperimentConfig;
 import org.example.Utility.TransactionOption;
 

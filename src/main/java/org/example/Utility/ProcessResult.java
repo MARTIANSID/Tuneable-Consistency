@@ -1,5 +1,5 @@
 package org.example.Utility;
-import org.ds.paxos.ClientMessage;
+import org.example.raft.ClientMessage;
 import java.util.ArrayList;
 import java.util.List;
 

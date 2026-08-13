@@ -7,13 +7,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.ds.paxos.Ack;
-import org.ds.paxos.AckMessage;
-import org.ds.paxos.Empty;
-import org.ds.paxos.RaftGrpc;
-import org.ds.paxos.ReadConcern;
-import org.ds.paxos.TimeStampProto;
-import org.ds.paxos.Transaction;
+import org.example.raft.Ack;
+import org.example.raft.AckMessage;
+import org.example.raft.Empty;
+import org.example.raft.RaftGrpc;
+import org.example.raft.ReadConcern;
+import org.example.raft.TimeStampProto;
+import org.example.raft.Transaction;
 import org.example.Utility.HybridClock;
 
 import io.grpc.stub.StreamObserver;

@@ -120,6 +120,9 @@
                 <version>3.5.6</version>
                 <configuration>
                     <useModulePath>false</useModulePath>
+                    <!-- Server nodes write metrics CSVs into the working
+                         directory; keep test runs from polluting the repo root. -->
+                    <workingDirectory>${project.build.directory}</workingDirectory>
                 </configuration>
             </plugin>
         </plugins>
