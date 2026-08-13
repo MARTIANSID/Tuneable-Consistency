@@ -1,7 +1,9 @@
 {
   "cluster": {
-    "numServers": 3,
+    "numServers": 5,
     "serverHosts": [
+      "localhost",
+      "localhost",
       "localhost",
       "localhost",
       "localhost"
@@ -13,9 +15,9 @@
     "clientLostTimeoutMs": 10000,
     "rttWindowSize": 64,
     "clientRetryLimit": 3,
-    "sMax": 130,
+    "sMax": 100,
     "controlIntervalMs": 100,
-    "replicationBudgetPerSecond": 30000,
+    "replicationBudgetPerSecond": 31000,
     "uTarget": 0.85,
     "eta": 1.0,
     "lambdaMin": 0.0001,
@@ -56,7 +58,7 @@
           "slaId": 1,
           "rungs": [
             {
-              "concern": 2,
+              "concern": 3,
               "latencyMs": 300,
               "profit": 8
             },
@@ -98,7 +100,7 @@
           "slaId": 1,
           "rungs": [
             {
-              "concern": 2,
+              "concern": 3,
               "latencyMs": 250,
               "profit": 4
             },
