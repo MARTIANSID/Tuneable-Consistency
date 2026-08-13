@@ -90,7 +90,6 @@ message KvRequest {
   reserved 10, 11;
 }
 
-// satisfiedRung is added in stage 4 when SLAs exist.
 message KvResponse {
   int64 requestId = 1;
   bool ok = 2;
@@ -106,4 +105,10 @@ message KvResponse {
   int32 commitIndex = 12;            // node's commit index at reply
   double serviceTimeMs = 13;         // reply time minus t_recv, monotonic clock
   bool rejected = 14;                // admission control shed this request (max V_c <= 0 or a hard backstop)
+
+  // Step 7 grading: what was actually delivered, not what was targeted.
+  int32 satisfiedRung = 15;          // index into the registered SLA's rung list of the best rung met; -1 = none
+  double predictedProfit = 16;       // E_c of the chosen level at decision time
+  double realizedProfit = 17;        // profit of the satisfied rung; 0 when none was met
+  int32 gradedReadStrength = 18;     // strongest read level the delivered result satisfies (ReadLevel ordinal); reads only
 }

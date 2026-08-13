@@ -30,6 +30,7 @@ public final class ExperimentConfig {
 
     public Cluster cluster;
     public Chameleon chameleon;
+    public Workload workload;
     public List<AppSlas> slas;
     public NodeFailure nodeFailure;
     public TimedFailure timedFailure;
@@ -54,6 +55,13 @@ public final class ExperimentConfig {
         public Double uTarget;             // price controller utilization target (~0.85)
         public Double eta;                 // price controller gain (~1)
         public Double lambdaMin;           // price floor; only its order of magnitude matters
+    }
+
+    /** Key selection for the workload; reads and writes draw from the same distribution. */
+    public static final class Workload {
+        public Integer keySpace;        // number of distinct keys
+        public String keyDistribution;  // "uniform" or "zipfian"
+        public Double zipfianExponent;  // skew; weight of rank r is 1/(r+1)^exponent (used when zipfian)
     }
 
     /** SLAs registered per application; requests carry only (applicationId, slaId). */
@@ -195,12 +203,21 @@ public final class ExperimentConfig {
     private static final Set<String> READ_LEVELS = Set.of(
             "EVENTUAL_LOCAL", "EVENTUAL_MAJORITY", "CAUSAL_LOCAL", "CAUSAL_MAJORITY", "LINEARIZABLE");
 
+    private static final Set<String> KEY_DISTRIBUTIONS = Set.of("uniform", "zipfian");
+
+    /** Keep in sync with ClientMetricsTracker.MAX_RUNGS (fixed CSV columns). */
+    private static final int MAX_RUNGS_PER_SLA = 4;
+
     private static void validateSla(Sla sla, String prefix, boolean isRead, int majority) {
         require(sla.slaId, prefix + "[].slaId");
         String slaPrefix = prefix + "[slaId=" + sla.slaId + "]";
         require(sla.rungs, slaPrefix + ".rungs");
         if (sla.rungs.isEmpty()) {
             throw new IllegalArgumentException(slaPrefix + ".rungs must not be empty");
+        }
+        if (sla.rungs.size() > MAX_RUNGS_PER_SLA) {
+            throw new IllegalArgumentException(slaPrefix + ".rungs must have at most " + MAX_RUNGS_PER_SLA
+                    + " rungs (the client ledger's satisfied-rung columns are fixed), got " + sla.rungs.size());
         }
         for (SlaRung rung : sla.rungs) {
             if (isRead) {
@@ -251,6 +268,17 @@ public final class ExperimentConfig {
         requirePositive(chameleon.uTarget, "chameleon.uTarget");
         requirePositive(chameleon.eta, "chameleon.eta");
         requirePositive(chameleon.lambdaMin, "chameleon.lambdaMin");
+
+        require(workload, "workload");
+        requirePositive(workload.keySpace, "workload.keySpace");
+        require(workload.keyDistribution, "workload.keyDistribution");
+        if (!KEY_DISTRIBUTIONS.contains(workload.keyDistribution)) {
+            throw new IllegalArgumentException("workload.keyDistribution must be one of " + KEY_DISTRIBUTIONS
+                    + ", got '" + workload.keyDistribution + "'");
+        }
+        if (workload.keyDistribution.equals("zipfian")) {
+            requirePositive(workload.zipfianExponent, "workload.zipfianExponent");
+        }
 
         require(slas, "slas");
         if (slas.isEmpty()) {

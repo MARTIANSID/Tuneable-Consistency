@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.Map;
 
 import org.example.Client.KvSessionClient;
 import org.example.raft.KvResponse;
@@ -178,7 +179,8 @@ class KvLevelMechanicsTest {
             cluster.awaitLeader(15_000);
 
             try (KvSessionClient client = new KvSessionClient(15,
-                    List.of("localhost", "localhost", "localhost"), 18800, 64, 3, 8_000)) {
+                    List.of("localhost", "localhost", "localhost"), 18800, 64, 3, 8_000,
+                    Map.of(1, CL.getNumber()), Map.of(1, 1))) {
 
                 // Interleave writes and causal reads over a small keyspace so
                 // reads constantly chase this session's own writes across all

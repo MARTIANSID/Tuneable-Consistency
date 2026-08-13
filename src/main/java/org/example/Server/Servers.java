@@ -17,7 +17,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.example.Client.ClientMetricsTracker;
 import org.example.Client.KvSessionClient;
 import org.example.Utility.ExperimentConfig;
+import org.example.Utility.KeySampler;
 import org.example.Utility.ServerStatus.ServerCurrentStatus;
+import org.example.raft.ReadLevel;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -59,8 +61,9 @@ public class Servers {
     private static int CLIENT_LOST_TIMEOUT_MS;
 
     private static final int NUM_APPLICATIONS = 3;
-    private static final int KEY_SPACE = 100;
     private static final int TICK_MS = 100;
+
+    private static KeySampler keySampler;
 
     // ===== Workload phases =====
     static class Phase {
@@ -96,6 +99,8 @@ public class Servers {
     private static KvSessionClient[] appClients;
     private static Map<Integer, List<Integer>> readSlaIdsByApp;
     private static Map<Integer, List<Integer>> writeSlaIdsByApp;
+    private static Map<Integer, Map<Integer, Integer>> readSlaFloorsByApp;
+    private static Map<Integer, Map<Integer, Integer>> writeSlaFloorsByApp;
 
     static void applyConfig(ExperimentConfig config) {
         NUM_OF_SERVERS = config.cluster.numServers;
@@ -129,13 +134,31 @@ public class Servers {
         }
         currentPhase = PHASES.get(0);
 
-        // Per-application SLA id pools the workload draws from (uniformly).
+        // Per-application SLA id pools the workload draws from (uniformly),
+        // and the per-SLA floor strengths the clients grade upgrades against.
         readSlaIdsByApp = new HashMap<>();
         writeSlaIdsByApp = new HashMap<>();
+        readSlaFloorsByApp = new HashMap<>();
+        writeSlaFloorsByApp = new HashMap<>();
         for (ExperimentConfig.AppSlas app : config.slas) {
             readSlaIdsByApp.put(app.applicationId, app.read.stream().map(s -> s.slaId).toList());
             writeSlaIdsByApp.put(app.applicationId, app.write.stream().map(s -> s.slaId).toList());
+            Map<Integer, Integer> readFloors = new HashMap<>();
+            for (ExperimentConfig.Sla sla : app.read) {
+                readFloors.put(sla.slaId, sla.rungs.stream()
+                        .mapToInt(r -> ReadLevel.valueOf(r.level).getNumber()).min().orElseThrow());
+            }
+            Map<Integer, Integer> writeFloors = new HashMap<>();
+            for (ExperimentConfig.Sla sla : app.write) {
+                writeFloors.put(sla.slaId, sla.rungs.stream().mapToInt(r -> r.concern).min().orElseThrow());
+            }
+            readSlaFloorsByApp.put(app.applicationId, readFloors);
+            writeSlaFloorsByApp.put(app.applicationId, writeFloors);
         }
+
+        keySampler = config.workload.keyDistribution.equals("zipfian")
+                ? KeySampler.zipfian(config.workload.keySpace, config.workload.zipfianExponent)
+                : KeySampler.uniform(config.workload.keySpace);
 
         long activeSeconds = RUN_SINGLE_PHASE
                 ? config.experiment.singlePhaseDurationSeconds
@@ -178,7 +201,8 @@ public class Servers {
         appClients = new KvSessionClient[NUM_APPLICATIONS];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
             appClients[app] = new KvSessionClient(app + 1, SERVER_HOSTS, SERVER_BASE_PORT,
-                    RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS);
+                    RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
+                    readSlaFloorsByApp.get(app + 1), writeSlaFloorsByApp.get(app + 1));
         }
 
         startPhasedInjection();
@@ -405,13 +429,15 @@ public class Servers {
 
                     // The workload no longer picks consistency levels: each
                     // request names its application's SLA and the server
-                    // decides. SLA ids are drawn uniformly per application.
+                    // decides. SLA ids are drawn uniformly per application;
+                    // keys come from the configured distribution (uniform or
+                    // zipfian), the same for reads and writes.
                     long now = System.currentTimeMillis();
                     for (int i = 0; i < writeCount; i++) {
                         int appId = appCursor + 1;
                         KvSessionClient client = appClients[appCursor];
                         appCursor = (appCursor + 1) % NUM_APPLICATIONS;
-                        String key = "user" + ((int) (totalInjected.get() % KEY_SPACE));
+                        String key = "user" + keySampler.next(random);
                         client.sendWrite(key, "v-" + now + "-" + totalInjected.get(), pickSlaId(writeSlaIdsByApp, appId));
                         totalInjected.incrementAndGet();
                     }
@@ -419,7 +445,7 @@ public class Servers {
                         int appId = appCursor + 1;
                         KvSessionClient client = appClients[appCursor];
                         appCursor = (appCursor + 1) % NUM_APPLICATIONS;
-                        client.sendRead("user" + random.nextInt(KEY_SPACE), pickSlaId(readSlaIdsByApp, appId));
+                        client.sendRead("user" + keySampler.next(random), pickSlaId(readSlaIdsByApp, appId));
                         totalInjected.incrementAndGet();
                     }
 

@@ -20,6 +20,11 @@
     "eta": 1.0,
     "lambdaMin": 0.0001
   },
+  "workload": {
+    "keySpace": 100,
+    "keyDistribution": "uniform",
+    "zipfianExponent": 1.0
+  },
   "slas": [
     {
       "applicationId": 1,

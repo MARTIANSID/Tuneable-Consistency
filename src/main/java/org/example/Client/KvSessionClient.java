@@ -25,12 +25,16 @@ import io.grpc.stub.StreamObserver;
  *
  * Owns a stream per server, the session anchors (uncommitted = highest log
  * index among this session's acknowledged writes; committed = highest index
- * among its majority-acknowledged writes), a per-node RTT estimate from
- * no-wait replies (end-to-end latency minus the server-reported service
- * time, median of a sliding window), and the session-guarantee assertions:
- * a causal-local read must return a value at least as new as this session's
- * last acknowledged write to that key, causal-majority and linearizable
- * reads at least as new as its last majority-acknowledged write.
+ * among its majority-acknowledged writes), a per-node RTT estimator fed only
+ * by no-wait replies, and the session-guarantee assertions: a causal-local
+ * read must return a value at least as new as this session's last
+ * acknowledged write to that key, causal-majority and linearizable reads at
+ * least as new as its last majority-acknowledged write.
+ *
+ * The client also carries the application's view of its SLAs (the floor
+ * strength per SLA id) so the ledger can classify a graded delivery above the
+ * floor as an upgrade, split into free vs waiting by the response's waited
+ * flag.
  *
  * Writes and linearizable reads target the leader (learned from notLeader
  * redirects); everything else round-robins. Redirected or failed requests
@@ -45,10 +49,16 @@ public final class KvSessionClient implements AutoCloseable {
     private final long lostTimeoutMs;
     private final int majority;
 
+    // Floor strength per SLA id: the weakest rung's requirement (ReadLevel
+    // ordinal for reads, write concern for writes). A graded delivery above
+    // the floor is an upgrade.
+    private final Map<Integer, Integer> readSlaFloors;
+    private final Map<Integer, Integer> writeSlaFloors;
+
     private final List<ManagedChannel> channels = new ArrayList<>();
     private final StreamObserver<KvRequest>[] streams;
     private final Object[] streamLocks;
-    private final SlidingWindow[] rttWindows;
+    private final RttEstimator rttEstimator;
 
     private final AtomicLong requestIdGen = new AtomicLong();
     private final AtomicInteger roundRobin = new AtomicInteger();
@@ -91,15 +101,18 @@ public final class KvSessionClient implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public KvSessionClient(int applicationId, List<String> hosts, int basePort, int rttWindowSize,
-            int retryLimit, long lostTimeoutMs) {
+            int retryLimit, long lostTimeoutMs,
+            Map<Integer, Integer> readSlaFloors, Map<Integer, Integer> writeSlaFloors) {
         this.applicationId = applicationId;
         this.numServers = hosts.size();
         this.retryLimit = retryLimit;
         this.lostTimeoutMs = lostTimeoutMs;
         this.majority = (numServers / 2) + 1;
+        this.readSlaFloors = Map.copyOf(readSlaFloors);
+        this.writeSlaFloors = Map.copyOf(writeSlaFloors);
         this.streams = new StreamObserver[numServers];
         this.streamLocks = new Object[numServers];
-        this.rttWindows = new SlidingWindow[numServers];
+        this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
 
         for (int i = 0; i < numServers; i++) {
             final int nodeId = i;
@@ -107,7 +120,6 @@ public final class KvSessionClient implements AutoCloseable {
                     .usePlaintext().build();
             channels.add(channel);
             streamLocks[i] = new Object();
-            rttWindows[i] = new SlidingWindow(rttWindowSize);
             streams[i] = KvClientGrpc.newStub(channel).session(new StreamObserver<>() {
                 @Override
                 public void onNext(KvResponse response) {
@@ -200,7 +212,7 @@ public final class KvSessionClient implements AutoCloseable {
         // RTT estimate rides the request so the server can subtract it from
         // SLA thresholds (used by the scorer from stage 4 on).
         KvRequest withRtt = request.toBuilder()
-                .setRttEstimateMs(rttWindows[targetNode].medianOr(0.0))
+                .setRttEstimateMs(rttEstimator.estimateMs(targetNode))
                 .build();
         try {
             synchronized (streamLocks[targetNode]) {
@@ -260,20 +272,15 @@ public final class KvSessionClient implements AutoCloseable {
 
         pending.remove(response.getRequestId());
         double latencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
-
-        // RTT sample: only replies that involved no server-side waiting, so
-        // the estimate does not absorb queueing or index waits.
-        if (!response.getWaited()) {
-            double rtt = latencyMs - response.getServiceTimeMs();
-            if (rtt >= 0) {
-                rttWindows[nodeId].add(rtt);
-            }
-        }
+        rttEstimator.observe(nodeId, latencyMs, response.getServiceTimeMs(), response.getWaited());
 
         boolean violation = false;
+        boolean upgraded;
         String executed;
         if (request.getIsRead()) {
             executed = "R:" + response.getDeliveredReadLevel().name();
+            // Upgrade: the graded delivery (step 7) exceeds the SLA's floor.
+            upgraded = response.getGradedReadStrength() > floorOf(readSlaFloors, request.getSlaId());
             violation = checkSessionGuarantee(entry, response);
             if (violation) {
                 long n = violations.incrementAndGet();
@@ -291,6 +298,7 @@ public final class KvSessionClient implements AutoCloseable {
         } else {
             int index = response.getValueIndex();
             executed = "W:" + response.getDeliveredWriteConcern();
+            upgraded = response.getDeliveredWriteConcern() > floorOf(writeSlaFloors, request.getSlaId());
             lastWriteIndexByKey.merge(request.getKey(), index, Math::max);
             uncommittedAnchor.accumulateAndGet(index, Math::max);
             if (response.getDeliveredWriteConcern() >= majority && !response.getTimedOutAndFellBack()) {
@@ -300,7 +308,9 @@ public final class KvSessionClient implements AutoCloseable {
         }
 
         ClientMetricsTracker.recordResponse(nodeId, chosen, executed, latencyMs,
-                response.getTimedOutAndFellBack(), violation);
+                response.getTimedOutAndFellBack(), violation,
+                response.getPredictedProfit(), response.getRealizedProfit(),
+                response.getSatisfiedRung(), upgraded, response.getWaited());
     }
 
     /**
@@ -320,6 +330,15 @@ public final class KvSessionClient implements AutoCloseable {
             default:
                 return false;
         }
+    }
+
+    private int floorOf(Map<Integer, Integer> floors, int slaId) {
+        Integer floor = floors.get(slaId);
+        if (floor == null) {
+            throw new IllegalStateException("No SLA floor registered on the client for applicationId="
+                    + applicationId + " slaId=" + slaId);
+        }
+        return floor;
     }
 
     private static String chosenLabel(KvRequest request) {
