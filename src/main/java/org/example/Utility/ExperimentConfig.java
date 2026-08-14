@@ -33,14 +33,11 @@ public final class ExperimentConfig {
     public ServerConfig server;
     public Chameleon chameleon;
     public ClientConfig client;
-    public Pileus pileus;
     public Workload workload;
     public List<AppSlas> slas;
     public NodeFailure nodeFailure;
     public TimedFailure timedFailure;
     public Geo geo;
-    public Experiment experiment;
-    public List<PhaseConfig> phases;
 
     public static final class Cluster {
         public Integer numServers;
@@ -69,11 +66,7 @@ public final class ExperimentConfig {
         public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
         public Integer retryLimit;         // redirect/failure resends before giving up on a request
         public Integer lostTimeoutMs;      // no response within this -> the client scores the request as lost
-    }
-
-    /** Pileus routing; consulted only by the pileus-routed modes. */
-    public static final class Pileus {
-        public Double explorationFraction; // fraction of requests routed randomly to keep windows fresh
+        public Double explorationFraction; // fraction of reads routed randomly to keep per-node windows fresh (all routing options)
     }
 
     /** Key selection for the workload; reads and writes draw from the same distribution. */
@@ -81,6 +74,9 @@ public final class ExperimentConfig {
         public Integer keySpace;        // number of distinct keys
         public String keyDistribution;  // "uniform" or "zipfian"
         public Double zipfianExponent;  // skew; weight of rank r is 1/(r+1)^exponent (used when zipfian)
+        public Integer sessionsPerApplication; // independent session clients per app, drawn uniformly per request
+        public Map<String, List<SlaShare>> mixes; // named weight vectors phases reference by key
+        public List<PhaseConfig> phases;
     }
 
     /** SLAs registered per application; requests carry only (applicationId, slaId). */
@@ -117,33 +113,43 @@ public final class ExperimentConfig {
         public Integer afterSeconds;
     }
 
+    /**
+     * Simulated geo latency, applied by run_all.sh (Linux tc/netem or macOS
+     * dnctl/pfctt dummynet), not by the Java processes. When enabled,
+     * cluster.serverHosts must be distinct literal loopback IPs (e.g.
+     * 127.0.1.1..127.0.1.5, never 127.0.0.1, which identifies the client):
+     * the (source IP, destination IP) pair is what the delay rules match on.
+     */
     public static final class Geo {
-        public Boolean enabled;      // Linux tc/netem only
-        public Integer latencyMs;
-        public String scriptPath;
-        public Integer scriptTimeoutSeconds;
-        public Boolean clearOnExit;
-        public Boolean useSudo;
-    }
-
-    public static final class Experiment {
-        public Integer bufferSeconds;      // added to the phase-duration sum for the hard deadline
-        public Boolean runSinglePhase;     // run one phase for the whole experiment
-        public Integer singlePhaseIndex;   // 0-based, used when runSinglePhase
-        public Integer singlePhaseDurationSeconds; // duration when runSinglePhase
+        public Boolean enabled;
+        // interServerLatencyMs[i][j]: one-way latency in ms added from server
+        // i to server j (numServers x numServers; the diagonal must be 0).
+        public Double[][] interServerLatencyMs;
+        // clientToServerLatencyMs[i]: one-way latency in ms added between the
+        // client and server i (numServers entries).
+        public Double[] clientToServerLatencyMs;
     }
 
     /**
-     * Phases control load and read/write mix only. The consistency-level mix
-     * is no longer configured anywhere: the server chooses levels from the
-     * registered SLAs and the current price.
+     * Phases control offered load and which named mix the traffic is drawn
+     * from: each injected request is drawn from the mix by weight, which
+     * determines the application, whether it is a read or a write, and the
+     * SLA it names. The consistency-level mix is no longer configured
+     * anywhere: the decision policy chooses levels from the registered SLAs.
      */
     public static final class PhaseConfig {
         public String name;
         public Integer durationSeconds;
         public Integer totalTPS;
-        public Double readPercentage;
-        public Double writePercentage;
+        public String mix;      // key into workload.mixes
+    }
+
+    /** One slice of a phase's traffic: a registered SLA and its relative weight. */
+    public static final class SlaShare {
+        public Integer applicationId;
+        public String type;      // read | write
+        public Integer slaId;
+        public Double weight;    // relative to the other entries; > 0
     }
 
     /** True when the server-side scorer resolves the subSLA target (chameleon* modes). */
@@ -160,10 +166,11 @@ public final class ExperimentConfig {
 
     /**
      * Shell entry point for run_all.sh: fully load and validate the config,
-     * then print cluster.numServers. The orchestrator uses it both as a
-     * preflight (a bad config fails here, before any process starts) and to
-     * learn how many ServerNode processes to launch - from the same strict
-     * parser the Java processes use, so the two can never disagree.
+     * then print the facts the orchestrator needs as key=value lines. It
+     * doubles as a preflight (a bad config fails here, before any process
+     * starts) and uses the same strict parser the Java processes use, so the
+     * two can never disagree. durationSeconds mirrors the driver's total
+     * experiment duration: active phase time plus the drain buffer.
      */
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -171,7 +178,30 @@ public final class ExperimentConfig {
             System.exit(64);
         }
         ExperimentConfig config = load(Path.of(args[0]));
-        System.out.println(config.cluster.numServers);
+        long durationSeconds = config.workload.phases.stream().mapToLong(p -> p.durationSeconds).sum();
+        System.out.println("numServers=" + config.cluster.numServers);
+        System.out.println("durationSeconds=" + durationSeconds);
+        System.out.println("serverHosts=" + String.join(",", config.cluster.serverHosts));
+        System.out.println("geoEnabled=" + config.geo.enabled);
+        if (config.geo.enabled) {
+            // Matrix rows are ';'-separated, entries ','-separated, in ms.
+            StringBuilder matrix = new StringBuilder();
+            for (int i = 0; i < config.geo.interServerLatencyMs.length; i++) {
+                if (i > 0) {
+                    matrix.append(';');
+                }
+                Double[] row = config.geo.interServerLatencyMs[i];
+                for (int j = 0; j < row.length; j++) {
+                    matrix.append(j > 0 ? "," : "").append(row[j]);
+                }
+            }
+            System.out.println("geoInterServerLatencyMs=" + matrix);
+            StringBuilder client = new StringBuilder();
+            for (int i = 0; i < config.geo.clientToServerLatencyMs.length; i++) {
+                client.append(i > 0 ? "," : "").append(config.geo.clientToServerLatencyMs[i]);
+            }
+            System.out.println("geoClientToServerLatencyMs=" + client);
+        }
     }
 
     public static ExperimentConfig load(Path path) {
@@ -261,7 +291,29 @@ public final class ExperimentConfig {
                 throw new AssertionError(e);
             }
             JsonElement value = obj.get(key);
-            if (value.isJsonObject() && !Map.class.isAssignableFrom(field.getType())) {
+            if (value.isJsonObject() && Map.class.isAssignableFrom(field.getType())) {
+                // Map keys are user-chosen names (e.g. mix names), so they are
+                // not checked; each value is walked by the map's declared
+                // value type so typos inside named entries are still rejected.
+                java.lang.reflect.Type valueType = ((ParameterizedType) field.getGenericType()).getActualTypeArguments()[1];
+                for (Map.Entry<String, JsonElement> entry : value.getAsJsonObject().entrySet()) {
+                    String entryPrefix = prefix + key + "." + entry.getKey();
+                    if (valueType instanceof ParameterizedType listType
+                            && List.class.isAssignableFrom((Class<?>) listType.getRawType())
+                            && entry.getValue().isJsonArray()) {
+                        Class<?> elementType = (Class<?>) listType.getActualTypeArguments()[0];
+                        int i = 0;
+                        for (JsonElement element : entry.getValue().getAsJsonArray()) {
+                            if (element.isJsonObject()) {
+                                rejectUnknownKeys(element.getAsJsonObject(), elementType, entryPrefix + "[" + i + "].");
+                            }
+                            i++;
+                        }
+                    } else if (valueType instanceof Class<?> valueClass && entry.getValue().isJsonObject()) {
+                        rejectUnknownKeys(entry.getValue().getAsJsonObject(), valueClass, entryPrefix + ".");
+                    }
+                }
+            } else if (value.isJsonObject()) {
                 rejectUnknownKeys(value.getAsJsonObject(), field.getType(), prefix + key + ".");
             } else if (value.isJsonArray() && List.class.isAssignableFrom(field.getType())) {
                 Class<?> elementType = (Class<?>) ((ParameterizedType) field.getGenericType()).getActualTypeArguments()[0];
@@ -383,12 +435,10 @@ public final class ExperimentConfig {
         }
         requirePositive(client.retryLimit, "client.retryLimit");
         requirePositive(client.lostTimeoutMs, "client.lostTimeoutMs");
-
-        require(pileus, "pileus");
-        require(pileus.explorationFraction, "pileus.explorationFraction");
-        if (pileus.explorationFraction < 0 || pileus.explorationFraction >= 1) {
-            throw new IllegalArgumentException("pileus.explorationFraction must be in [0, 1), got "
-                    + pileus.explorationFraction);
+        require(client.explorationFraction, "client.explorationFraction");
+        if (client.explorationFraction < 0 || client.explorationFraction >= 1) {
+            throw new IllegalArgumentException("client.explorationFraction must be in [0, 1), got "
+                    + client.explorationFraction);
         }
 
         require(workload, "workload");
@@ -401,10 +451,24 @@ public final class ExperimentConfig {
         if (workload.keyDistribution.equals("zipfian")) {
             requirePositive(workload.zipfianExponent, "workload.zipfianExponent");
         }
+        requirePositive(workload.sessionsPerApplication, "workload.sessionsPerApplication");
 
         require(slas, "slas");
         if (slas.isEmpty()) {
             throw new IllegalArgumentException("slas must register at least one application");
+        }
+        // The workload driver indexes session pools by applicationId - 1, so
+        // ids must be exactly 1..N.
+        java.util.Set<Integer> appIds = new java.util.HashSet<>();
+        for (AppSlas app : slas) {
+            require(app.applicationId, "slas[].applicationId");
+            appIds.add(app.applicationId);
+        }
+        for (int expected = 1; expected <= slas.size(); expected++) {
+            if (!appIds.contains(expected)) {
+                throw new IllegalArgumentException("slas applicationIds must be exactly 1.." + slas.size()
+                        + " (distinct, contiguous), got " + new java.util.TreeSet<>(appIds));
+            }
         }
         int majority = (cluster.numServers / 2) + 1;
         for (AppSlas app : slas) {
@@ -440,43 +504,124 @@ public final class ExperimentConfig {
 
         require(geo, "geo");
         require(geo.enabled, "geo.enabled");
-        requirePositive(geo.latencyMs, "geo.latencyMs");
-        require(geo.scriptPath, "geo.scriptPath");
-        requirePositive(geo.scriptTimeoutSeconds, "geo.scriptTimeoutSeconds");
-        require(geo.clearOnExit, "geo.clearOnExit");
-        require(geo.useSudo, "geo.useSudo");
-
-        require(experiment, "experiment");
-        require(experiment.bufferSeconds, "experiment.bufferSeconds");
-        if (experiment.bufferSeconds < 0) {
-            throw new IllegalArgumentException("experiment.bufferSeconds must be >= 0, got " + experiment.bufferSeconds);
+        require(geo.interServerLatencyMs, "geo.interServerLatencyMs");
+        if (geo.interServerLatencyMs.length != cluster.numServers) {
+            throw new IllegalArgumentException("geo.interServerLatencyMs must have " + cluster.numServers
+                    + " rows (one per server), got " + geo.interServerLatencyMs.length);
         }
-        require(experiment.runSinglePhase, "experiment.runSinglePhase");
-        require(experiment.singlePhaseIndex, "experiment.singlePhaseIndex");
-        if (experiment.runSinglePhase) {
-            requirePositive(experiment.singlePhaseDurationSeconds, "experiment.singlePhaseDurationSeconds");
+        for (int i = 0; i < geo.interServerLatencyMs.length; i++) {
+            Double[] row = geo.interServerLatencyMs[i];
+            require(row, "geo.interServerLatencyMs[" + i + "]");
+            if (row.length != cluster.numServers) {
+                throw new IllegalArgumentException("geo.interServerLatencyMs[" + i + "] must have "
+                        + cluster.numServers + " entries (one per server), got " + row.length);
+            }
+            for (int j = 0; j < row.length; j++) {
+                require(row[j], "geo.interServerLatencyMs[" + i + "][" + j + "]");
+                if (!(row[j] >= 0) || !Double.isFinite(row[j])) {
+                    throw new IllegalArgumentException("geo.interServerLatencyMs[" + i + "][" + j
+                            + "] must be a non-negative finite number, got " + row[j]);
+                }
+                if (i == j && row[j] != 0) {
+                    throw new IllegalArgumentException("geo.interServerLatencyMs[" + i + "][" + j
+                            + "] is a server's latency to itself and must be 0, got " + row[j]);
+                }
+            }
+        }
+        require(geo.clientToServerLatencyMs, "geo.clientToServerLatencyMs");
+        if (geo.clientToServerLatencyMs.length != cluster.numServers) {
+            throw new IllegalArgumentException("geo.clientToServerLatencyMs must have " + cluster.numServers
+                    + " entries (one per server), got " + geo.clientToServerLatencyMs.length);
+        }
+        for (int i = 0; i < geo.clientToServerLatencyMs.length; i++) {
+            Double v = geo.clientToServerLatencyMs[i];
+            require(v, "geo.clientToServerLatencyMs[" + i + "]");
+            if (!(v >= 0) || !Double.isFinite(v)) {
+                throw new IllegalArgumentException("geo.clientToServerLatencyMs[" + i
+                        + "] must be a non-negative finite number, got " + v);
+            }
+        }
+        if (geo.enabled) {
+            // The delay rules match on (source IP, destination IP), so every
+            // server needs its own literal loopback IP, and 127.0.0.1 is
+            // reserved as the client's identity (unbound sockets use it).
+            java.util.Set<String> distinctHosts = new java.util.HashSet<>();
+            for (int i = 0; i < cluster.serverHosts.size(); i++) {
+                String host = cluster.serverHosts.get(i);
+                if (!host.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
+                    throw new IllegalArgumentException("geo.enabled requires cluster.serverHosts[" + i
+                            + "] to be a literal IPv4 address (e.g. 127.0.1." + (i + 1) + "), got '" + host + "'");
+                }
+                if (host.equals("127.0.0.1")) {
+                    throw new IllegalArgumentException("geo.enabled forbids cluster.serverHosts[" + i
+                            + "] = 127.0.0.1: that address identifies the client in the delay rules");
+                }
+                if (!distinctHosts.add(host)) {
+                    throw new IllegalArgumentException("geo.enabled requires distinct cluster.serverHosts; '"
+                            + host + "' appears more than once");
+                }
+            }
         }
 
-        require(phases, "phases");
+        // Mixes and phases live under workload but are validated here, after
+        // slas, because every mix entry must name a registered SLA.
+        java.util.Set<String> registeredSlas = new java.util.HashSet<>();
+        for (AppSlas app : slas) {
+            for (Sla sla : app.read) {
+                registeredSlas.add(app.applicationId + "/read/" + sla.slaId);
+            }
+            for (Sla sla : app.write) {
+                registeredSlas.add(app.applicationId + "/write/" + sla.slaId);
+            }
+        }
+        require(workload.mixes, "workload.mixes");
+        if (workload.mixes.isEmpty()) {
+            throw new IllegalArgumentException("workload.mixes must define at least one mix");
+        }
+        for (Map.Entry<String, List<SlaShare>> mix : workload.mixes.entrySet()) {
+            String mixPrefix = "workload.mixes." + mix.getKey();
+            require(mix.getValue(), mixPrefix);
+            if (mix.getValue().isEmpty()) {
+                throw new IllegalArgumentException(mixPrefix + " must contain at least one entry");
+            }
+            for (int j = 0; j < mix.getValue().size(); j++) {
+                SlaShare share = mix.getValue().get(j);
+                String sharePrefix = mixPrefix + "[" + j + "]";
+                require(share.applicationId, sharePrefix + ".applicationId");
+                require(share.type, sharePrefix + ".type");
+                require(share.slaId, sharePrefix + ".slaId");
+                require(share.weight, sharePrefix + ".weight");
+                if (!share.type.equals("read") && !share.type.equals("write")) {
+                    throw new IllegalArgumentException(sharePrefix + ".type must be read or write, got '"
+                            + share.type + "'");
+                }
+                if (!(share.weight > 0) || !Double.isFinite(share.weight)) {
+                    throw new IllegalArgumentException(sharePrefix + ".weight must be a positive finite number, got "
+                            + share.weight);
+                }
+                String key = share.applicationId + "/" + share.type + "/" + share.slaId;
+                if (!registeredSlas.contains(key)) {
+                    throw new IllegalArgumentException(sharePrefix + " references unregistered SLA " + key
+                            + " (registered: " + new java.util.TreeSet<>(registeredSlas) + ")");
+                }
+            }
+        }
+        List<PhaseConfig> phases = workload.phases;
+        require(phases, "workload.phases");
         if (phases.isEmpty()) {
-            throw new IllegalArgumentException("phases must contain at least one phase");
+            throw new IllegalArgumentException("workload.phases must contain at least one phase");
         }
         for (int i = 0; i < phases.size(); i++) {
             PhaseConfig p = phases.get(i);
-            String prefix = "phases[" + i + "]";
+            String prefix = "workload.phases[" + i + "]";
             require(p.name, prefix + ".name");
             requirePositive(p.durationSeconds, prefix + ".durationSeconds");
             requirePositive(p.totalTPS, prefix + ".totalTPS");
-            require(p.readPercentage, prefix + ".readPercentage");
-            require(p.writePercentage, prefix + ".writePercentage");
-            if (Math.abs(p.readPercentage + p.writePercentage - 1.0) > 1e-6) {
-                throw new IllegalArgumentException(prefix + ": readPercentage + writePercentage must sum to 1.0, got "
-                        + (p.readPercentage + p.writePercentage));
+            require(p.mix, prefix + ".mix");
+            if (!workload.mixes.containsKey(p.mix)) {
+                throw new IllegalArgumentException(prefix + ".mix '" + p.mix + "' is not defined in workload.mixes "
+                        + new java.util.TreeSet<>(workload.mixes.keySet()));
             }
-        }
-        if (experiment.runSinglePhase && experiment.singlePhaseIndex >= phases.size()) {
-            throw new IllegalArgumentException("experiment.singlePhaseIndex " + experiment.singlePhaseIndex
-                    + " is out of range for " + phases.size() + " phases");
         }
     }
 }

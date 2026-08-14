@@ -145,11 +145,31 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     }
 
     public void setUpStubs() {
+        // When this node's configured host is a literal IPv4 address (the geo
+        // latency setup gives every server its own loopback IP), outgoing
+        // connections bind to it as their source address, so the OS-level
+        // delay rules can identify the (source, destination) server pair.
+        // Hostnames like "localhost" are never bound: they may resolve to a
+        // different family than the destination picks.
+        String ownHost = SERVER_HOSTS.get(serverId);
+        final java.net.InetSocketAddress ownSource = ownHost.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")
+                ? new java.net.InetSocketAddress(ownHost, 0)
+                : null;
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             if (i != serverId) {
-                ManagedChannel channel = ManagedChannelBuilder
+                io.grpc.netty.NettyChannelBuilder builder = io.grpc.netty.NettyChannelBuilder
                         .forAddress(SERVER_HOSTS.get(i), SERVER_BASE_PORT + (i + 1)).enableRetry()
-                        .usePlaintext().build();
+                        .usePlaintext();
+                if (ownSource != null) {
+                    builder.localSocketPicker(new io.grpc.netty.NettyChannelBuilder.LocalSocketPicker() {
+                        @Override
+                        public java.net.SocketAddress createSocketAddress(
+                                java.net.SocketAddress remoteAddress, io.grpc.Attributes attrs) {
+                            return ownSource;
+                        }
+                    });
+                }
+                ManagedChannel channel = builder.build();
                 ownedChannels.add(channel);
                 stubs[i] = RaftGrpc.newStub(channel);
             }

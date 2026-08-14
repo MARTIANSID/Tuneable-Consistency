@@ -51,6 +51,9 @@ public final class KvSessionClient implements AutoCloseable {
     private final int retryLimit;
     private final long lostTimeoutMs;
     private final boolean followerLinReads;
+    // Applied by lowest-RTT routing here and by the Pileus selector's own
+    // exploration: fraction of reads routed to a uniformly random node.
+    private final double explorationFraction;
 
     // Full SLA tables (the application's own registration) and their floors.
     private final Map<Integer, List<RungScorer.Rung>> readSlas;
@@ -125,6 +128,7 @@ public final class KvSessionClient implements AutoCloseable {
         this.writeSlas = Map.copyOf(writeSlas);
         this.readFloors = floorsOf(this.readSlas);
         this.writeFloors = floorsOf(this.writeSlas);
+        this.explorationFraction = explorationFraction;
         this.streams = new StreamObserver[numServers];
         this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
@@ -287,8 +291,17 @@ public final class KvSessionClient implements AutoCloseable {
         return best;
     }
 
-    /** Lowest estimated RTT; ties (including the all-cold start) break randomly. */
+    /**
+     * Lowest estimated RTT; ties (including the all-cold start) break
+     * randomly. A small exploration fraction goes to a uniformly random node
+     * instead, so the RTT windows of non-fastest nodes keep getting samples
+     * and a recovered node can win the routing back - the same reason the
+     * Pileus selector explores.
+     */
     private int lowestRttNode() {
+        if (explorationFraction > 0 && ThreadLocalRandom.current().nextDouble() < explorationFraction) {
+            return ThreadLocalRandom.current().nextInt(numServers);
+        }
         double best = Double.MAX_VALUE;
         int count = 0;
         int pick = 0;

@@ -17,9 +17,6 @@
 # run completes, then prints a summary. On success the tmux session is killed
 # automatically; on failure it is kept alive for inspection.
 #
-# Geo latency simulation (simulate_geo_latency.sh) is intentionally not part of
-# this script - it requires Linux tc/netem and ENABLE_GEO_SETTINGS is off anyway.
-#
 # Usage:
 #   ./run_all.sh [label] [config.yaml]     e.g. ./run_all.sh upgrades-on
 #                                               ./run_all.sh pressure my-config.yaml
@@ -34,6 +31,15 @@ SESSION="tuneable"
 CLASSPATH_FILE="$REPO_DIR/target-script/classpath.txt"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# protobuf-java 3.x uses sun.misc.Unsafe, which JDK 24+ warns about on every
+# JVM start; the acknowledgment flag does not exist before JDK 23, so it is
+# gated on the java binary's major version. Shared by both modes.
+JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
+JAVA_FLAGS=()
+if [[ "$JAVA_MAJOR" =~ ^[0-9]+$ && "$JAVA_MAJOR" -ge 24 ]]; then
+    JAVA_FLAGS+=(--sun-misc-unsafe-memory-access=allow)
+fi
 
 # ---------------------------------------------------------------------------
 # Internal mode: this is what runs inside the tmux "experiment" window.
@@ -53,19 +59,11 @@ if [[ "${1:-}" == "_experiment" ]]; then
 
     CP="$REPO_DIR/target-script/classes:$(cat "$CLASSPATH_FILE")"
 
-    # protobuf-java 3.x uses sun.misc.Unsafe, which JDK 24+ warns about on
-    # every JVM start; the acknowledgment flag does not exist before JDK 23,
-    # so it is gated on the java binary's major version.
-    JAVA_FLAGS=()
-    JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
-    if [[ "$JAVA_MAJOR" =~ ^[0-9]+$ && "$JAVA_MAJOR" -ge 24 ]]; then
-        JAVA_FLAGS+=(--sun-misc-unsafe-memory-access=allow)
-    fi
-
     # Preflight-parse the config with the same strict loader the processes
     # use; this also tells us how many server processes to launch.
-    NUM_SERVERS="$(java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Utility.ExperimentConfig "$CONFIG_PATH")" \
+    CONFIG_INFO="$(java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Utility.ExperimentConfig "$CONFIG_PATH")" \
         || { echo "=== Config rejected, aborting ==="; echo "exit_code:    65" > run_info.txt; exec bash; }
+    NUM_SERVERS="$(printf '%s\n' "$CONFIG_INFO" | sed -n 's/^numServers=//p')"
 
     echo "=== Experiment starting (label: $LABEL) ==="
     echo "=== Working directory: $RUN_DIR ==="
@@ -145,11 +143,10 @@ cd "$REPO_DIR"
 [[ -f pom.xml ]] || die "pom.xml not found in $REPO_DIR - run this from the repo"
 
 # --- Preflight ---
-command -v tmux >/dev/null || die "tmux not found. Install: brew install tmux"
-command -v mvn  >/dev/null || die "maven not found. Install: brew install maven"
-command -v java >/dev/null || die "java not found. Install: brew install openjdk@17"
+command -v tmux >/dev/null || die "tmux not found on PATH"
+command -v mvn  >/dev/null || die "maven not found on PATH"
+command -v java >/dev/null || die "java (17+) not found on PATH"
 
-JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
 [[ "$JAVA_MAJOR" =~ ^[0-9]+$ ]] || die "could not parse java version from: $(java -version 2>&1 | head -1)"
 [[ "$JAVA_MAJOR" -ge 17 ]] || die "java 17+ required, found major version $JAVA_MAJOR"
 
@@ -159,14 +156,30 @@ tmux has-session -t "$SESSION" 2>/dev/null && \
 # --- Build (foreground: a build failure should stop everything, loudly) ---
 # Built into target-script/ (see pom build.dir property) so the IDE's
 # concurrent compilation into target/ can never corrupt what we run.
-echo "Building project..."
-mvn clean install -Dbuild.dir=target-script
+# Tests are skipped: this script only runs experiments; run the suite with
+# `mvn clean install -Dbuild.dir=target-script` when changing code.
+echo "Building project (tests skipped)..."
+mvn clean install -Dbuild.dir=target-script -DskipTests
 
 # The experiment JVMs are launched with plain `java -cp`, one process per
 # Raft node plus the workload driver, so resolve the runtime classpath once.
 echo "Resolving runtime classpath..."
 mvn -q -Dbuild.dir=target-script dependency:build-classpath -Dmdep.outputFile="$CLASSPATH_FILE"
 [[ -s "$CLASSPATH_FILE" ]] || die "classpath resolution produced no output at $CLASSPATH_FILE"
+
+# Validate the config up front and learn the run's real duration, from the
+# same strict loader the experiment processes use.
+CP="$REPO_DIR/target-script/classes:$(cat "$CLASSPATH_FILE")"
+CONFIG_INFO="$(java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Utility.ExperimentConfig "$CONFIG_PATH")" \
+    || die "config validation failed: $CONFIG_PATH"
+DURATION_S="$(printf '%s\n' "$CONFIG_INFO" | sed -n 's/^durationSeconds=//p')"
+[[ "$DURATION_S" =~ ^[0-9]+$ ]] || die "could not read durationSeconds from the config helper"
+
+# Simulated geo latency needs tc/netem and is a CloudLab concern; running it
+# locally would silently produce a no-delay experiment.
+GEO_ENABLED="$(printf '%s\n' "$CONFIG_INFO" | sed -n 's/^geoEnabled=//p')"
+[[ "$GEO_ENABLED" == "true" ]] && \
+    die "geo.enabled is true; run this config with ./run_all_cloudlab.sh instead (local runs apply no delays)"
 
 mkdir -p "$RUN_DIR"
 
@@ -182,8 +195,10 @@ tmux new-window -t "$SESSION" -n metrics -c "$RUN_DIR" \
 
 echo
 echo "Experiment running (label: $LABEL). Peek anytime with: tmux attach -t $SESSION"
-echo "Waiting for completion (~250s)..."
+echo "Waiting for completion (~${DURATION_S}s)..."
 
+# On interrupt the experiment keeps running in tmux, so the delay rules must
+# stay in place; clearing them here would silently change the experiment.
 trap 'echo; echo "Interrupted. The experiment is still running in tmux session '"'"'$SESSION'"'"'."; echo "Kill it with: tmux kill-session -t $SESSION"; exit 130' INT
 
 # Block until the experiment writes run_info.txt (normal completion, success or

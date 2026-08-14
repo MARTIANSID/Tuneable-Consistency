@@ -12,9 +12,12 @@ import java.util.concurrent.atomic.DoubleAdder;
 
 /**
  * Client-side ledger: every cross-arm comparison metric lives here, measured
- * at the client from the request/response stream. Rows are cumulative per
- * (node, chosen level, executed level); consumers diff consecutive rows for
- * per-interval rates, which keeps the file lossless if a flush is skipped.
+ * at the client from the request/response stream. Every CSV row is one
+ * interval: each cell's counters are snapshotted and reset at every flush
+ * (~1 s), so rows are per-interval activity, not running totals, and the
+ * P50/P95/P99 columns are that interval's percentiles. Cells with no
+ * activity in an interval write no row. The driver's console totals come
+ * from separate cumulative counters that never reset.
  *
  * Chosen is what the workload asked for; executed is what the server
  * delivered (fallbacks make them differ). Redirect resends, hard failures,
@@ -71,6 +74,15 @@ public final class ClientMetricsTracker {
     private static final ConcurrentHashMap<Key, Cell> cells = new ConcurrentHashMap<>();
     private static final AtomicLong lastFlushMs = new AtomicLong(0);
 
+    // Run-lifetime totals for the driver's progress prints and final report;
+    // these never reset, unlike the per-interval cells above.
+    private static final AtomicLong runResponses = new AtomicLong();
+    private static final AtomicLong runRejected = new AtomicLong();
+    private static final AtomicLong runLost = new AtomicLong();
+    private static final AtomicLong runViolations = new AtomicLong();
+    private static final DoubleAdder runPredictedProfit = new DoubleAdder();
+    private static final DoubleAdder runRealizedProfit = new DoubleAdder();
+
     private static Cell cell(int nodeId, String chosen, String executed) {
         return cells.computeIfAbsent(new Key(nodeId, chosen, executed), k -> new Cell());
     }
@@ -114,7 +126,11 @@ public final class ClientMetricsTracker {
         }
         if (violation) {
             c.violations.incrementAndGet();
+            runViolations.incrementAndGet();
         }
+        runResponses.incrementAndGet();
+        runPredictedProfit.add(predictedProfit);
+        runRealizedProfit.add(realizedProfit);
         maybeFlush();
     }
 
@@ -131,74 +147,48 @@ public final class ClientMetricsTracker {
     /** Admission control shed the request; not retried by design. */
     public static void recordRejected(int nodeId, String chosen) {
         cell(nodeId, chosen, "-").rejected.incrementAndGet();
+        runRejected.incrementAndGet();
         maybeFlush();
-    }
-
-    public static long totalRejected() {
-        long total = 0;
-        for (Cell c : cells.values()) {
-            total += c.rejected.get();
-        }
-        return total;
     }
 
     public static void recordLost(int nodeId, String chosen) {
         cell(nodeId, chosen, "-").lost.incrementAndGet();
+        runLost.incrementAndGet();
         maybeFlush();
     }
 
+    public static long totalRejected() {
+        return runRejected.get();
+    }
+
     public static long totalViolations() {
-        long total = 0;
-        for (Cell c : cells.values()) {
-            total += c.violations.get();
-        }
-        return total;
+        return runViolations.get();
     }
 
     public static long totalResponses() {
-        long total = 0;
-        for (Cell c : cells.values()) {
-            total += c.count.get();
-        }
-        return total;
+        return runResponses.get();
     }
 
     public static long totalLost() {
-        long total = 0;
-        for (Cell c : cells.values()) {
-            total += c.lost.get();
-        }
-        return total;
+        return runLost.get();
     }
 
     public static double totalPredictedProfit() {
-        double total = 0;
-        for (Cell c : cells.values()) {
-            total += c.predictedProfitSum.sum();
-        }
-        return total;
+        return runPredictedProfit.sum();
     }
 
     public static double totalRealizedProfit() {
-        double total = 0;
-        for (Cell c : cells.values()) {
-            total += c.realizedProfitSum.sum();
-        }
-        return total;
+        return runRealizedProfit.sum();
     }
 
-    private static double quantileMs(AtomicLongArray buckets, double quantile) {
-        long total = 0;
-        for (int i = 0; i <= LATENCY_BUCKETS; i++) {
-            total += buckets.get(i);
-        }
+    private static double quantileMs(long[] buckets, long total, double quantile) {
         if (total == 0) {
             return 0.0;
         }
         long target = (long) Math.ceil(quantile * total);
         long cumulative = 0;
         for (int i = 0; i <= LATENCY_BUCKETS; i++) {
-            cumulative += buckets.get(i);
+            cumulative += buckets[i];
             if (cumulative >= target) {
                 return latencyBucketUpperMs(i);
             }
@@ -219,32 +209,62 @@ public final class ClientMetricsTracker {
         flush(System.currentTimeMillis());
     }
 
+    /**
+     * Write one row per cell with activity this interval, resetting each
+     * counter as it is read. Concurrent increments land in exactly one
+     * interval (getAndSet/sumThenReset), though a response racing the flush
+     * may split its fields across two adjacent rows - harmless at metric
+     * granularity.
+     */
     private static synchronized void flush(long now) {
         File file = new File(CSV_PATH);
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,NodeId,ChosenLevel,ExecutedLevel,CountTotal,AvgLatencyMs,"
+                out.println("Timestamp,NodeId,ChosenLevel,ExecutedLevel,Count,AvgLatencyMs,"
                         + "P50Ms,P95Ms,P99Ms,PredictedProfitSum,RealizedProfitSum,"
-                        + "UpgradesFreeTotal,UpgradesWaitingTotal,"
+                        + "UpgradesFree,UpgradesWaiting,"
                         + "SatisfiedRung0,SatisfiedRung1,SatisfiedRung2,SatisfiedRung3,SatisfiedNone,"
-                        + "FallbacksTotal,RedirectsTotal,FailuresTotal,RejectedTotal,LostTotal,SessionViolationsTotal");
+                        + "Fallbacks,Redirects,Failures,Rejected,Lost,SessionViolations");
             }
             for (Map.Entry<Key, Cell> e : cells.entrySet()) {
                 Key k = e.getKey();
                 Cell c = e.getValue();
-                long count = c.count.get();
-                double avg = count == 0 ? 0.0 : c.latencySumMs.sum() / count;
+                long count = c.count.getAndSet(0);
+                long fallbacks = c.fallbacks.getAndSet(0);
+                long redirects = c.redirects.getAndSet(0);
+                long failures = c.failures.getAndSet(0);
+                long rejected = c.rejected.getAndSet(0);
+                long lost = c.lost.getAndSet(0);
+                long violations = c.violations.getAndSet(0);
+                double latencySum = c.latencySumMs.sumThenReset();
+                double predicted = c.predictedProfitSum.sumThenReset();
+                double realized = c.realizedProfitSum.sumThenReset();
+                long upFree = c.upgradesFree.getAndSet(0);
+                long upWaiting = c.upgradesWaiting.getAndSet(0);
+                long[] rungs = new long[MAX_RUNGS + 1];
+                for (int i = 0; i <= MAX_RUNGS; i++) {
+                    rungs[i] = c.satisfiedRung.getAndSet(i, 0);
+                }
+                long[] buckets = new long[LATENCY_BUCKETS + 1];
+                long bucketTotal = 0;
+                for (int i = 0; i <= LATENCY_BUCKETS; i++) {
+                    buckets[i] = c.latencyBuckets.getAndSet(i, 0);
+                    bucketTotal += buckets[i];
+                }
+                if (count == 0 && fallbacks == 0 && redirects == 0 && failures == 0
+                        && rejected == 0 && lost == 0 && violations == 0) {
+                    continue; // no activity this interval
+                }
+                double avg = count == 0 ? 0.0 : latencySum / count;
                 out.printf("%d,%d,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                         now, k.nodeId(), k.chosen(), k.executed(), count, avg,
-                        quantileMs(c.latencyBuckets, 0.50), quantileMs(c.latencyBuckets, 0.95),
-                        quantileMs(c.latencyBuckets, 0.99),
-                        c.predictedProfitSum.sum(), c.realizedProfitSum.sum(),
-                        c.upgradesFree.get(), c.upgradesWaiting.get(),
-                        c.satisfiedRung.get(0), c.satisfiedRung.get(1), c.satisfiedRung.get(2),
-                        c.satisfiedRung.get(3), c.satisfiedRung.get(MAX_RUNGS),
-                        c.fallbacks.get(), c.redirects.get(), c.failures.get(), c.rejected.get(), c.lost.get(),
-                        c.violations.get());
+                        quantileMs(buckets, bucketTotal, 0.50), quantileMs(buckets, bucketTotal, 0.95),
+                        quantileMs(buckets, bucketTotal, 0.99),
+                        predicted, realized,
+                        upFree, upWaiting,
+                        rungs[0], rungs[1], rungs[2], rungs[3], rungs[MAX_RUNGS],
+                        fallbacks, redirects, failures, rejected, lost, violations);
             }
         } catch (IOException e) {
             System.err.println("Failed to write " + CSV_PATH + ": " + e.getMessage());

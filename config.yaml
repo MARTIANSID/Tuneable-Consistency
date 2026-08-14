@@ -17,7 +17,7 @@
 #                     SLA; lowest-RTT routing (greedy baseline)
 #   lowestProfit    - client statically targets the floor rung; lowest-RTT
 #                     routing (dumb baseline; upgrades happen only by luck)
-mode: pileus
+mode: chameleonPileus
 
 cluster:
   # Number of Raft nodes. Majority = numServers/2 + 1 (write concerns and the
@@ -79,24 +79,13 @@ client:
   retryLimit: 3
   # No response within this -> the client scores the request as lost.
   lostTimeoutMs: 10000
-
-# Pileus routing: consulted only when routing with the selector
-# (chameleonPileus and pileus modes).
-pileus:
-  # Fraction of requests routed to a uniformly random server so latency
-  # windows and per-server staleness estimates never freeze on old samples
-  # (rejections also file penalty samples; exploration re-probes recovery).
-  explorationFraction: 0.05
-
-# Key selection for the workload; reads and writes draw from the same
-# distribution over keys "user0" .. "user<keySpace-1>".
-workload:
-  keySpace: 100
-  # uniform | zipfian. Zipfian weight of rank r is 1/(r+1)^zipfianExponent
-  # (rank 0 is the hottest key); zipfianExponent is required either way but
-  # only used when zipfian.
-  keyDistribution: uniform
-  zipfianExponent: 1.0
+  # Fraction of reads routed to a uniformly random server instead of the
+  # routing policy's pick - applies to the Pileus selector and to lowest-RTT
+  # routing alike. Keeps per-node latency windows and staleness estimates
+  # fresh so a slow or recovered node can win the routing back (rejections
+  # also file penalty samples; exploration re-probes recovery). Writes are
+  # never explored: they must go to the leader.
+  explorationFraction: 0.15
 
 # SLAs registered per application; requests carry only (applicationId, slaId)
 # and the decision policy resolves which rung to pursue. A rung is
@@ -107,66 +96,145 @@ workload:
 # (at majority the write is committed and closes the loss window).
 # At most 4 rungs per SLA (the client ledger's satisfied-rung columns are fixed).
 slas:
-  - applicationId: 1          # "gold": pays most, wants linearizable
+  # A1: online shopping. Almost everything is browsing, worth little and
+  # stale-tolerant; checkouts must reflect what the shopper just added and
+  # pay 10-40x a browse. Two read SLAs in one application make value-ordered
+  # shedding observable inside a single app, on the same node, from the same
+  # session pool, over the same key range: under load the price should
+  # reject browses while checkouts are still being upgraded.
+  - applicationId: 1
     read:
       - slaId: 1
         rungs:
-          - level: LINEARIZABLE
-            latencyMs: 300
-            profit: 10
-          - level: CAUSAL_MAJORITY
-            latencyMs: 150
-            profit: 6
-          - level: EVENTUAL_MAJORITY
-            latencyMs: 100
-            profit: 2
-    write:
-      - slaId: 1
-        rungs:
-          - concern: 3        # majority at 5 nodes: committed, loss window closed
-            latencyMs: 300
-            profit: 8
-          - concern: 1        # leader-ack only: fast but can be lost on leader change
-            latencyMs: 150
-            profit: 3
-  - applicationId: 2          # "silver": causal reads, majority writes
-    read:
-      - slaId: 1
-        rungs:
-          - level: CAUSAL_MAJORITY
-            latencyMs: 250
-            profit: 5
           - level: CAUSAL_LOCAL
-            latencyMs: 125
-            profit: 3
+            latencyMs: 30
+            profit: 2
           - level: EVENTUAL_LOCAL
-            latencyMs: 75
-            profit: 1
+            latencyMs: 30
+            profit: 1.5
+          - level: EVENTUAL_LOCAL
+            latencyMs: 150
+            profit: 0.5
+      - slaId: 2
+        rungs:
+          - level: CAUSAL_MAJORITY
+            latencyMs: 20
+            profit: 20
+          - level: CAUSAL_LOCAL
+            latencyMs: 20
+            profit: 15
+          - level: EVENTUAL_LOCAL
+            latencyMs: 20
+            profit: 8
     write:
       - slaId: 1
         rungs:
           - concern: 3
-            latencyMs: 250
+            latencyMs: 50
             profit: 4
           - concern: 1
-            latencyMs: 125
-            profit: 2
-  - applicationId: 3          # "bronze": eventual/causal-local, wc:1 writes
+            latencyMs: 20
+            profit: 3
+          - concern: 1
+            latencyMs: 100
+            profit: 1
+  # A2: advertising-funded search/news feed. Consistency requirement never
+  # changes; revenue falls as latency rises, so the read ladder varies only
+  # in the deadline (Terry's consistency-favouring class). Writes are rare
+  # billing events that always demand full durability: every write rung
+  # requires wc:majority, so A2 never contributes an upgrade decision, only
+  # expensive load - the greedy neighbour the price must contain.
+  - applicationId: 2
     read:
       - slaId: 1
         rungs:
-          - level: CAUSAL_LOCAL
-            latencyMs: 500
-            profit: 2
-          - level: EVENTUAL_LOCAL
+          - level: CAUSAL_MAJORITY
+            latencyMs: 10
+            profit: 10
+          - level: CAUSAL_MAJORITY
+            latencyMs: 25
+            profit: 8
+          - level: CAUSAL_MAJORITY
+            latencyMs: 50
+            profit: 5
+          - level: CAUSAL_MAJORITY
             latencyMs: 200
-            profit: 1
+            profit: 0.5
     write:
       - slaId: 1
         rungs:
-          - concern: 1
+          - concern: 3
+            latencyMs: 30
+            profit: 10
+          - concern: 3
+            latencyMs: 100
+            profit: 7
+          - concern: 3
+            latencyMs: 300
+            profit: 3
+          - concern: 3
+            latencyMs: 1000
+            profit: 0.5
+  # A3: login and credential checking. Try a fast weak read first, fall back
+  # to an authoritative one: linearizable-fast beats eventual-fast beats
+  # linearizable-slow. Two rungs share the 30ms threshold, so a linearizable
+  # result must claim the higher-paying one (the only SLA exercising that
+  # deduplication). Writes are password changes / session records with a
+  # real graded durability tradeoff, and the only place wc:2 appears.
+  - applicationId: 3
+    read:
+      - slaId: 1
+        rungs:
+          - level: LINEARIZABLE
+            latencyMs: 30
+            profit: 10
+          - level: EVENTUAL_LOCAL
+            latencyMs: 30
+            profit: 5
+          - level: LINEARIZABLE
             latencyMs: 200
-            profit: 1
+            profit: 3
+    write:
+      - slaId: 1
+        rungs:
+          - concern: 3
+            latencyMs: 40
+            profit: 10
+          - concern: 2
+            latencyMs: 40
+            profit: 7
+          - concern: 1
+            latencyMs: 40
+            profit: 5
+          - concern: 3
+            latencyMs: 300
+            profit: 3
+  # A4: payments and account balances. Low volume, high stakes: a stale
+  # balance or a lost acknowledged transfer is a real financial loss, so
+  # every rung is worth an order of magnitude more than anything else. A4
+  # should still be served and upgraded at prices that shed everyone else.
+  - applicationId: 4
+    read:
+      - slaId: 1
+        rungs:
+          - level: LINEARIZABLE
+            latencyMs: 50
+            profit: 100
+          - level: CAUSAL_MAJORITY
+            latencyMs: 50
+            profit: 20
+          - level: CAUSAL_MAJORITY
+            latencyMs: 200
+            profit: 10
+    write:
+      - slaId: 1
+        rungs:
+          - concern: 3
+            latencyMs: 100
+            profit: 100
+          - concern: 3
+            latencyMs: 500
+            profit: 40
 
 # Failure injection: drop all inter-server RPCs on one node from the start.
 nodeFailure:
@@ -180,44 +248,117 @@ timedFailure:
   afterSeconds: 40
 
 # Geo latency simulation (Linux tc/netem only; requires root or sudo).
+# Simulated geo latency, applied and cleared by run_all.sh (Linux tc/netem or
+# macOS dnctl/pfctl dummynet; needs sudo). When enabled, cluster.serverHosts
+# must be distinct literal loopback IPs (e.g. 127.0.1.1 .. 127.0.1.5, never
+# 127.0.0.1, which identifies the client): the delay rules match on the
+# (source IP, destination IP) pair, and each server binds its outgoing
+# connections to its own address.
 geo:
   enabled: false
-  latencyMs: 50
-  scriptPath: ./simulate_geo_latency.sh
-  scriptTimeoutSeconds: 10
-  clearOnExit: true
-  useSudo: true
+  # One-way latency in ms added from server i to server j (row i, column j);
+  # numServers x numServers, the diagonal must be 0. The example topology:
+  # servers 0-1 co-located, 2-3 in a second region, 4 in a third.
+  interServerLatencyMs:
+    - [0,  20,  10, 10, 5]
+    - [20,  0,  10, 10, 5]
+    - [10, 10, 0,  20,  10]
+    - [10, 10, 20,  0,  10]
+    - [5, 5, 10, 10, 0]
+  # One-way latency in ms added between the client and each server (the
+  # client sits in the first region in this example).
+  clientToServerLatencyMs: [10, 10, 5, 5, 2]
 
-experiment:
-  # Added to the phase-duration sum for the hard experiment deadline, giving
-  # in-flight requests time to drain before the final report.
-  bufferSeconds: 20
-  # Run a single phase (by index) for singlePhaseDurationSeconds instead of
-  # the whole phase sequence; used by the sweep scripts.
-  runSinglePhase: false
-  singlePhaseIndex: 0
-  singlePhaseDurationSeconds: 60
-
-# Phases control offered load and read/write mix only. The consistency-level
-# mix is never configured: the active decision policy chooses per request.
-phases:
-  - name: Light
-    durationSeconds: 70
-    totalTPS: 30000
-    readPercentage: 0.9
-    writePercentage: 0.1
-  - name: Medium
-    durationSeconds: 60
-    totalTPS: 45000
-    readPercentage: 0.9
-    writePercentage: 0.1
-  - name: Heavy
-    durationSeconds: 60
-    totalTPS: 70000
-    readPercentage: 0.9
-    writePercentage: 0.1
-  - name: Recovery
-    durationSeconds: 60
-    totalTPS: 30000
-    readPercentage: 0.9
-    writePercentage: 0.1
+# The simulated workload: keys, session population, and the phase schedule.
+workload:
+  # Key selection; reads and writes draw from the same distribution over the
+  # shared keys "user0" .. "user<keySpace-1>" (all applications contend on
+  # the same dataset; session guarantees stay per-session).
+  keySpace: 10000
+  # uniform | zipfian. Zipfian weight of rank r is 1/(r+1)^zipfianExponent
+  # (rank 0 is the hottest key); zipfianExponent is required either way but
+  # only used when zipfian.
+  keyDistribution: uniform
+  zipfianExponent: 1.0
+  # Independent session clients per application. Each session keeps its own
+  # full client state - session anchors and per-key floors (so causal
+  # guarantees are per session), RTT windows, Pileus windows, gRPC streams -
+  # and each request picks a session uniformly within its application.
+  # Sessions persist across phases, so history carries forward. Only the
+  # metrics ledger is shared.
+  sessionsPerApplication: 50
+  # Named weight vectors the phases reference. Each injected request is drawn
+  # from the active phase's mix by weight: the entry fixes the application,
+  # whether it is a read or a write, and the SLA it names, so the read/write
+  # ratio and the per-app shares both fall out of the weights. Weights are
+  # relative and global across the whole mix (they need not sum to 100, and
+  # they are normalised over all entries, not per application); every entry
+  # must reference an SLA registered above. The consistency-level mix is
+  # never configured: the active decision policy chooses the rung per request.
+  mixes:
+    # The default. Roughly 13% writes.
+    balanced:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 32 }   # browse
+      - { applicationId: 1, type: read,  slaId: 2, weight: 4 }    # checkout
+      - { applicationId: 1, type: write, slaId: 1, weight: 4 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 33 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 2 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 14 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 6 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 4 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 1 }
+    # Write weights tripled, roughly 31% writes: drives replication lag up so
+    # causal upgrades that were free start having to wait, at unchanged load.
+    writeHeavy:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 25 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 3 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 10 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 27 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 5 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 11 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 14 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 3 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 2 }
+    # A4 and A1-checkout tripled: high-value traffic rises from 9% to 23% at
+    # the same request rate. Tests whether the price responds to what the
+    # work is worth rather than only to how much of it there is.
+    valueHeavy:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 27 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 10 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 3 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 28 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 2 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 12 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 5 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 10 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 3 }
+  # The phase run tests adaptation (a static load sweep is a separate
+  # experiment). TPS values are fractions of the measured capacity C = 60000
+  # (the sweep's latency knee): 0.4C = 24000, 0.8C = 48000, 1.5C = 90000.
+  # Light2 repeats Light exactly so recovery is measurable: does the price
+  # fall back and do upgrades resume at the Light level.
+  phases:
+    - name: Light           # price near its floor, nearly everything upgrades
+      durationSeconds: 60
+      totalTPS: 24000
+      mix: balanced
+    - name: WriteSurge      # composition alone moves the mechanism: lag grows, free upgrades become waiting ones
+      durationSeconds: 60
+      totalTPS: 24000
+      mix: writeHeavy
+    - name: Medium          # price begins to bind, cheap applications lose upgrades first
+      durationSeconds: 60
+      totalTPS: 48000
+      mix: balanced
+    - name: ValueSurge      # price responds to value, not volume: browses shed while checkouts still upgrade
+      durationSeconds: 60
+      totalTPS: 48000
+      mix: valueHeavy
+    - name: Heavy           # shedding, and it should be in value order, not arrival order
+      durationSeconds: 60
+      totalTPS: 90000
+      mix: balanced
+    - name: Light2          # recovery: repeats Light exactly
+      durationSeconds: 60
+      totalTPS: 24000
+      mix: balanced
