@@ -142,3 +142,36 @@ message KvResponse {
   string committedValue = 21;        // this node's majority-committed view; "" = absent
   int32 committedValueIndex = 22;    // log index of the committed value's write; -1 = absent
 }
+
+// ============================================================
+// Cluster administration (workload driver to server node)
+// ============================================================
+//
+// Each Raft node runs in its own OS process, so the parts of the experiment
+// harness that used to reach into ServerImpl objects directly - leader
+// detection, simulated-failure injection, orderly teardown - go over this
+// service instead. It is an experiment-harness interface, not part of the
+// protocol under study.
+
+service Admin {
+  rpc GetStatus(AdminStatusRequest) returns (AdminStatusReply);
+  rpc SetDropTraffic(SetDropTrafficRequest) returns (AdminAck);
+  // Ack, then gracefully stop the node's gRPC server and exit the process.
+  rpc Shutdown(ShutdownRequest) returns (AdminAck);
+}
+
+message AdminStatusRequest {}
+
+message AdminStatusReply {
+  int32 nodeId = 1;
+  string role = 2;          // ServerCurrentStatus name: LEADER | FOLLOWER | CANDIDATE
+  bool trafficDropped = 3;  // inter-server RPCs currently dropped (simulated failure)
+}
+
+message SetDropTrafficRequest {
+  bool drop = 1;
+}
+
+message ShutdownRequest {}
+
+message AdminAck {}

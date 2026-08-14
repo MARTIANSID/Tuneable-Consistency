@@ -158,6 +158,22 @@ public final class ExperimentConfig {
 
     // --- Loading ---
 
+    /**
+     * Shell entry point for run_all.sh: fully load and validate the config,
+     * then print cluster.numServers. The orchestrator uses it both as a
+     * preflight (a bad config fails here, before any process starts) and to
+     * learn how many ServerNode processes to launch - from the same strict
+     * parser the Java processes use, so the two can never disagree.
+     */
+    public static void main(String[] args) {
+        if (args.length != 1) {
+            System.err.println("Usage: ExperimentConfig <config.yaml|config.json>");
+            System.exit(64);
+        }
+        ExperimentConfig config = load(Path.of(args[0]));
+        System.out.println(config.cluster.numServers);
+    }
+
     public static ExperimentConfig load(Path path) {
         String raw;
         try {

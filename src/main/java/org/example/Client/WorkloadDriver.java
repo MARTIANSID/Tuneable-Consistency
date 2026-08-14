@@ -1,4 +1,4 @@
-package org.example.Server;
+package org.example.Client;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -7,32 +7,40 @@ import java.io.InputStreamReader;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.example.Client.ClientMetricsTracker;
-import org.example.Client.KvSessionClient;
 import org.example.Utility.ExperimentConfig;
 import org.example.Utility.KeySampler;
-import org.example.Utility.ServerStatus.ServerCurrentStatus;
+import org.example.raft.AdminGrpc;
+import org.example.raft.AdminStatusReply;
+import org.example.raft.AdminStatusRequest;
+import org.example.raft.SetDropTrafficRequest;
+import org.example.raft.ShutdownRequest;
 import org.example.raft.ReadLevel;
 
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.StatusRuntimeException;
 
 /**
- * Experiment entry point: boots the cluster (Raft service + client-facing KV
- * service per node), then drives the phased workload through per-application
- * KvSessionClients over real gRPC streams. All comparison metrics are
- * client-side (ClientMetricsTracker).
+ * Experiment entry point for the workload side: drives the phased workload
+ * through per-application KvSessionClients over real gRPC streams against a
+ * cluster of server processes (org.example.Server.ServerNode, one per node).
+ * Cluster orchestration that used to happen on in-process ServerImpl
+ * references - leader detection, failure injection, teardown - goes over the
+ * Admin service instead. All comparison metrics are client-side
+ * (ClientMetricsTracker).
  */
-public class Servers {
+public class WorkloadDriver {
 
-    // ===== Configuration (loaded from JSON at startup, see ExperimentConfig) =====
+    // ===== Configuration (loaded from YAML/JSON at startup, see ExperimentConfig) =====
     public static int NUM_OF_SERVERS;
     private static int SERVER_BASE_PORT;
     private static List<String> SERVER_HOSTS;
@@ -62,6 +70,10 @@ public class Servers {
 
     private static final int NUM_APPLICATIONS = 3;
     private static final int TICK_MS = 100;
+
+    private static final long CLUSTER_REACHABLE_TIMEOUT_MS = 30_000;
+    private static final long LEADER_ELECTION_TIMEOUT_MS = 15_000;
+    private static final long ADMIN_RPC_DEADLINE_MS = 2_000;
 
     private static KeySampler keySampler;
 
@@ -95,9 +107,10 @@ public class Servers {
     private static final Object phaseLock = new Object();
 
     private static final Random random = new Random();
-    private static List<ServerImpl> serversImpl = new ArrayList<>();
+    private static AdminGrpc.AdminBlockingStub[] adminStubs;
+    private static final List<ManagedChannel> adminChannels = new ArrayList<>();
     private static KvSessionClient[] appClients;
-    private static org.example.Client.ClientMode CLIENT_MODE;
+    private static ClientMode CLIENT_MODE;
     private static double PILEUS_EXPLORATION_FRACTION;
     private static boolean FOLLOWER_LIN_READS;
     private static Map<Integer, List<Integer>> readSlaIdsByApp;
@@ -127,7 +140,7 @@ public class Servers {
         RTT_WINDOW_SIZE = config.client.rttWindowSize;
         CLIENT_RETRY_LIMIT = config.client.retryLimit;
         CLIENT_LOST_TIMEOUT_MS = config.client.lostTimeoutMs;
-        CLIENT_MODE = org.example.Client.ClientMode.fromConfig(config.mode);
+        CLIENT_MODE = ClientMode.fromConfig(config.mode);
         PILEUS_EXPLORATION_FRACTION = config.pileus.explorationFraction;
         FOLLOWER_LIN_READS = config.server.followerLinearizableReads;
 
@@ -177,37 +190,18 @@ public class Servers {
         TOTAL_EXPERIMENT_DURATION_MS = (activeSeconds + config.experiment.bufferSeconds) * 1000L;
     }
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws InterruptedException {
         Path configPath = Path.of(args.length > 0 ? args[0] : "config.yaml");
         ExperimentConfig config = ExperimentConfig.load(configPath);
         applyConfig(config);
-        ServerImpl.applyConfig(config);
-        KvClientService.applyConfig(config);
-        MeasurementPlane.applyConfig(config);
-        SlaRegistry.applyConfig(config);
         System.out.println("Loaded config from " + configPath.toAbsolutePath());
 
         clearCSVFiles();
         applyGeoSettingsIfEnabled();
 
-        List<Server> servers = new ArrayList<>();
-        serversImpl = new ArrayList<>();
-        for (int i = 1; i <= NUM_OF_SERVERS; i++) {
-            int port = SERVER_BASE_PORT + i;
-            ServerImpl serverImpl = new ServerImpl(i - 1, NUM_OF_SERVERS);
-            MeasurementPlane plane = new MeasurementPlane(i - 1, NUM_OF_SERVERS);
-            Server server = ServerBuilder.forPort(port)
-                    .addService(serverImpl)
-                    .addService(new KvClientService(serverImpl, plane))
-                    .build()
-                    .start();
-            System.out.println("Server" + (i - 1) + " started on port " + port);
-            serverImpl.setUpStubs();
-            servers.add(server);
-            serversImpl.add(serverImpl);
-        }
-
-        applyNodeFailureConfig(serversImpl);
+        connectAdminStubs();
+        waitForClusterReachable();
+        applyNodeFailureConfig();
 
         appClients = new KvSessionClient[NUM_APPLICATIONS];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
@@ -217,55 +211,136 @@ public class Servers {
                     PILEUS_EXPLORATION_FRACTION, FOLLOWER_LIN_READS);
         }
 
-        startPhasedInjection();
+        Thread injector = startPhasedInjection();
+        // The injector thread ends the run: final report, cluster shutdown,
+        // System.exit with the violation-derived exit code.
+        injector.join();
+    }
 
-        for (Server server : servers) {
-            try {
-                server.awaitTermination();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+    // ===== Cluster admin (over gRPC; the servers are separate processes) =====
+
+    private static void connectAdminStubs() {
+        adminStubs = new AdminGrpc.AdminBlockingStub[NUM_OF_SERVERS];
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            ManagedChannel channel = ManagedChannelBuilder
+                    .forAddress(SERVER_HOSTS.get(i), SERVER_BASE_PORT + i + 1)
+                    .usePlaintext().build();
+            adminChannels.add(channel);
+            adminStubs[i] = AdminGrpc.newBlockingStub(channel);
+        }
+    }
+
+    private static AdminStatusReply statusOf(int nodeId) throws StatusRuntimeException {
+        return adminStubs[nodeId]
+                .withDeadlineAfter(ADMIN_RPC_DEADLINE_MS, TimeUnit.MILLISECONDS)
+                .getStatus(AdminStatusRequest.getDefaultInstance());
+    }
+
+    /** Block until every server process answers its admin status probe. */
+    private static void waitForClusterReachable() {
+        System.out.printf("Waiting for %d server processes...%n", NUM_OF_SERVERS);
+        Set<Integer> reachable = new HashSet<>();
+        long deadline = System.currentTimeMillis() + CLUSTER_REACHABLE_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline && reachable.size() < NUM_OF_SERVERS) {
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (reachable.contains(i)) {
+                    continue;
+                }
+                try {
+                    statusOf(i);
+                    reachable.add(i);
+                } catch (StatusRuntimeException e) {
+                    // Not up yet; retried until the deadline.
+                }
             }
+            if (reachable.size() < NUM_OF_SERVERS) {
+                sleepQuietly(200);
+            }
+        }
+        if (reachable.size() < NUM_OF_SERVERS) {
+            List<Integer> missing = new ArrayList<>();
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (!reachable.contains(i)) {
+                    missing.add(i);
+                }
+            }
+            System.err.println("Server processes unreachable after "
+                    + CLUSTER_REACHABLE_TIMEOUT_MS + "ms: " + missing
+                    + " (are the ServerNode processes running? check server_<id>.log)");
+            System.exit(1);
+        }
+        System.out.println("All server processes reachable.");
+    }
+
+    /** The id of the current healthy leader, or -1 if none is visible. */
+    private static int findLeaderId() {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            try {
+                AdminStatusReply status = statusOf(i);
+                if ("LEADER".equals(status.getRole()) && !status.getTrafficDropped()) {
+                    return i;
+                }
+            } catch (StatusRuntimeException e) {
+                // Unreachable node cannot be the healthy leader; keep looking.
+            }
+        }
+        return -1;
+    }
+
+    private static int waitForLeader(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            int leader = findLeaderId();
+            if (leader >= 0) {
+                return leader;
+            }
+            sleepQuietly(50);
+        }
+        return -1;
+    }
+
+    private static void setDropTraffic(int nodeId, boolean drop) {
+        adminStubs[nodeId]
+                .withDeadlineAfter(ADMIN_RPC_DEADLINE_MS, TimeUnit.MILLISECONDS)
+                .setDropTraffic(SetDropTrafficRequest.newBuilder().setDrop(drop).build());
+    }
+
+    /** Ask every server process to shut down; failures are reported, not fatal. */
+    private static void shutdownCluster() {
+        for (int i = 0; i < NUM_OF_SERVERS; i++) {
+            try {
+                adminStubs[i]
+                        .withDeadlineAfter(ADMIN_RPC_DEADLINE_MS, TimeUnit.MILLISECONDS)
+                        .shutdown(ShutdownRequest.getDefaultInstance());
+            } catch (StatusRuntimeException e) {
+                System.err.printf("Shutdown request to server %d failed: %s%n", i, e.getStatus());
+            }
+        }
+        for (ManagedChannel channel : adminChannels) {
+            channel.shutdown();
+        }
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
     // ===== Failure injection =====
 
-    private static ServerImpl findLeader() {
-        for (ServerImpl node : serversImpl) {
-            if (node.status == ServerCurrentStatus.LEADER && !node.isDropAllServerNetworkTraffic()) {
-                return node;
-            }
-        }
-        return null;
-    }
-
-    private static ServerImpl waitForLeader(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            ServerImpl leader = findLeader();
-            if (leader != null) {
-                return leader;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return null;
-            }
-        }
-        return null;
-    }
-
-    private static void applyNodeFailureConfig(List<ServerImpl> nodes) {
+    private static void applyNodeFailureConfig() {
         if (!ENABLE_NODE_NETWORK_FAILURE) {
             return;
         }
-        if (FAILED_NODE_ID < 0 || FAILED_NODE_ID >= nodes.size()) {
+        if (FAILED_NODE_ID < 0 || FAILED_NODE_ID >= NUM_OF_SERVERS) {
             System.err.printf("Invalid FAILED_NODE_ID=%d (valid range: 0 to %d)%n",
-                    FAILED_NODE_ID, Math.max(0, nodes.size() - 1));
+                    FAILED_NODE_ID, Math.max(0, NUM_OF_SERVERS - 1));
             return;
         }
-        nodes.get(FAILED_NODE_ID).setDropAllServerNetworkTraffic(true);
+        setDropTraffic(FAILED_NODE_ID, true);
         System.out.printf("Simulated node failure enabled on server %d (inter-server RPCs are dropped)%n",
                 FAILED_NODE_ID);
     }
@@ -294,29 +369,34 @@ public class Servers {
     }
 
     private static void injectTimedFailure() {
-        ServerImpl leader = findLeader();
-        ServerImpl target = null;
+        int leaderId = findLeaderId();
+        int targetId = -1;
 
         if (FAILURE_TARGET_ROLE == FailureTargetRole.LEADER) {
-            target = leader;
+            targetId = leaderId;
         } else {
-            for (ServerImpl node : serversImpl) {
-                if (node != leader) {
-                    target = node;
+            for (int i = 0; i < NUM_OF_SERVERS; i++) {
+                if (i != leaderId) {
+                    targetId = i;
                     break;
                 }
             }
         }
 
-        if (target == null) {
+        if (targetId < 0) {
             System.err.printf("Timed failure skipped at t=%ds: could not resolve target=%s%n",
                     FAILURE_AFTER_SECONDS, FAILURE_TARGET_ROLE);
             return;
         }
 
-        target.setDropAllServerNetworkTraffic(true);
+        try {
+            setDropTraffic(targetId, true);
+        } catch (StatusRuntimeException e) {
+            System.err.printf("Timed failure injection on server %d failed: %s%n", targetId, e.getStatus());
+            return;
+        }
         System.out.printf("Timed failure injected at t=%ds on %s node (serverId=%d)%n",
-                FAILURE_AFTER_SECONDS, FAILURE_TARGET_ROLE, target.nodeId());
+                FAILURE_AFTER_SECONDS, FAILURE_TARGET_ROLE, targetId);
     }
 
     // ===== Geo latency (Linux tc/netem) =====
@@ -385,15 +465,14 @@ public class Servers {
 
     // ===== Phased workload =====
 
-    private static void startPhasedInjection() {
+    private static Thread startPhasedInjection() {
         System.out.println("Waiting for leader election...");
-        ServerImpl leader = waitForLeader(15_000);
-        if (leader == null) {
+        int leaderId = waitForLeader(LEADER_ELECTION_TIMEOUT_MS);
+        if (leaderId < 0) {
             System.err.println("No leader elected, aborting injection");
             System.exit(1);
-            return;
         }
-        System.out.println("Leader elected: server " + leader.nodeId());
+        System.out.println("Leader elected: server " + leaderId);
 
         System.out.println("Starting phased workload experiment...");
         printPhaseConfig();
@@ -528,11 +607,12 @@ public class Servers {
             for (KvSessionClient client : appClients) {
                 client.close();
             }
-            System.out.println("Shutting down servers...");
+            System.out.println("Shutting down server processes...");
+            shutdownCluster();
             System.exit(violations == 0 ? 0 : 2);
         }, "SystemInjector");
-        systemInjector.setDaemon(true);
         systemInjector.start();
+        return systemInjector;
     }
 
     private static void selectAndStartNewPhase() {
@@ -608,18 +688,11 @@ public class Servers {
         return (int) Math.round(total * (read / sum));
     }
 
-    /** Clear result CSVs at startup so every run starts from a clean slate. */
+    /** Clear this process's result CSV at startup; each server process clears its own. */
     private static void clearCSVFiles() {
-        List<String> files = new ArrayList<>(List.of("client_metrics_global.csv"));
-        for (int sid = 0; sid < 10; sid++) {
-            files.add("occupancy_" + sid + ".csv");
-            files.add("histograms_" + sid + ".csv");
-        }
-        for (String filename : files) {
-            File file = new File(filename);
-            if (file.exists() && !file.delete()) {
-                System.out.println("Warning: could not delete " + filename);
-            }
+        File file = new File("client_metrics_global.csv");
+        if (file.exists() && !file.delete()) {
+            System.out.println("Warning: could not delete client_metrics_global.csv");
         }
     }
 }

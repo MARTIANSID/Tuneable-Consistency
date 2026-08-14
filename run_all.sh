@@ -4,12 +4,14 @@
 #
 #   1. Preflight checks (java 17+, maven, tmux) - fails fast, no silent fallbacks
 #   2. Builds the project (foreground, so build errors stop everything immediately)
+#      and writes the runtime classpath to target-script/classpath.txt
 #   3. Runs the experiment inside a detached tmux session "tuneable":
-#        experiment - the run itself
+#        experiment - one ServerNode JVM per Raft node (logs to server_<id>.log)
+#                     plus the WorkloadDriver JVM in the foreground
 #        metrics    - live tail of client_metrics_global.csv
-#   4. The experiment executes with runs/<label>_<timestamp>/ as its working
-#      directory, so every CSV plus run.log and run_info.txt is written there
-#      directly and the repo root stays clean.
+#   4. Every process runs with runs/<label>_<timestamp>/ as its working
+#      directory, so all CSVs plus run.log, server_<id>.log, run_info.txt are
+#      written there directly and the repo root stays clean.
 #
 # The calling terminal is never attached to tmux. The script blocks until the
 # run completes, then prints a summary. On success the tmux session is killed
@@ -22,25 +24,16 @@
 #   ./run_all.sh [label] [config.yaml]     e.g. ./run_all.sh upgrades-on
 #                                               ./run_all.sh pressure my-config.yaml
 # The config file (default: repo config.yaml; .json also accepted) is passed
-# to the experiment and archived alongside the results for provenance.
+# to every process and archived alongside the results for provenance.
 #
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$REPO_DIR/run_all.sh"
 SESSION="tuneable"
+CLASSPATH_FILE="$REPO_DIR/target-script/classpath.txt"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-
-# protobuf-java 3.x uses sun.misc.Unsafe, which JDK 24+ warns about on every
-# JVM start. exec:java runs inside Maven's own JVM, so the acknowledgment flag
-# must reach it via MAVEN_OPTS - gated on Maven's JVM version because the flag
-# does not exist before JDK 23. (Surefire-forked test JVMs get it from the
-# pom's jdk24-plus profile.)
-MVN_JAVA_MAJOR="$(mvn -version 2>/dev/null | sed -nE 's/^Java version: ([0-9]+).*/\1/p')"
-if [[ "${MVN_JAVA_MAJOR:-0}" -ge 24 ]]; then
-    export MAVEN_OPTS="${MAVEN_OPTS:-} --sun-misc-unsafe-memory-access=allow"
-fi
 
 # ---------------------------------------------------------------------------
 # Internal mode: this is what runs inside the tmux "experiment" window.
@@ -58,17 +51,58 @@ if [[ "${1:-}" == "_experiment" ]]; then
     esac
     cp "$CONFIG_PATH" "$CONFIG_ARCHIVE"
 
+    CP="$REPO_DIR/target-script/classes:$(cat "$CLASSPATH_FILE")"
+
+    # protobuf-java 3.x uses sun.misc.Unsafe, which JDK 24+ warns about on
+    # every JVM start; the acknowledgment flag does not exist before JDK 23,
+    # so it is gated on the java binary's major version.
+    JAVA_FLAGS=()
+    JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
+    if [[ "$JAVA_MAJOR" =~ ^[0-9]+$ && "$JAVA_MAJOR" -ge 24 ]]; then
+        JAVA_FLAGS+=(--sun-misc-unsafe-memory-access=allow)
+    fi
+
+    # Preflight-parse the config with the same strict loader the processes
+    # use; this also tells us how many server processes to launch.
+    NUM_SERVERS="$(java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Utility.ExperimentConfig "$CONFIG_PATH")" \
+        || { echo "=== Config rejected, aborting ==="; echo "exit_code:    65" > run_info.txt; exec bash; }
+
     echo "=== Experiment starting (label: $LABEL) ==="
     echo "=== Working directory: $RUN_DIR ==="
     echo "=== Config: $CONFIG_PATH ==="
+    echo "=== Cluster: $NUM_SERVERS server processes ==="
     echo
 
+    # One process per Raft node. Their stdout goes to server_<id>.log; the
+    # WorkloadDriver stops them over the Admin service when the run ends.
+    SERVER_PIDS=()
+    for ((i = 0; i < NUM_SERVERS; i++)); do
+        java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Server.ServerNode "$CONFIG_PATH" "$i" \
+            > "server_$i.log" 2>&1 &
+        SERVER_PIDS+=($!)
+    done
+    echo "Started $NUM_SERVERS server processes (pids: ${SERVER_PIDS[*]})"
+
     set +e
-    mvn -f "$REPO_DIR/pom.xml" -Dbuild.dir=target-script exec:java \
-        -Dexec.mainClass="org.example.Server.Servers" \
-        -Dexec.args="$CONFIG_PATH" 2>&1 | tee run.log
+    java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$CP" org.example.Client.WorkloadDriver "$CONFIG_PATH" 2>&1 | tee run.log
     RUN_EXIT=${PIPESTATUS[0]}
     set -e
+
+    # The driver already requested shutdown over the Admin service; give the
+    # server processes a moment to flush and exit, then escalate. SIGTERM
+    # still triggers their orderly-teardown hook; SIGKILL is the last resort.
+    DEADLINE=$(( $(date +%s) + 10 ))
+    for pid in "${SERVER_PIDS[@]}"; do
+        while kill -0 "$pid" 2>/dev/null && [[ $(date +%s) -lt $DEADLINE ]]; do
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Server process $pid still alive, sending SIGTERM"
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
 
     # Record what was run so results stay comparable across config edits.
     # Written last: the orchestrator polls for this file to detect completion.
@@ -79,7 +113,8 @@ if [[ "${1:-}" == "_experiment" ]]; then
         echo "git revision: $(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
         echo "git status:   $(git -C "$REPO_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ') modified/untracked files"
         echo "java:         $(java -version 2>&1 | head -1)"
-        echo "config:       $CONFIG_PATH (archived as config.json in this directory)"
+        echo "processes:    $NUM_SERVERS ServerNode + 1 WorkloadDriver"
+        echo "config:       $CONFIG_PATH (archived as $CONFIG_ARCHIVE in this directory)"
     } > run_info.txt
 
     if [[ $RUN_EXIT -eq 0 ]]; then
@@ -89,6 +124,7 @@ if [[ "${1:-}" == "_experiment" ]]; then
     else
         echo
         echo "=== Experiment FAILED (exit code $RUN_EXIT) - session kept alive for inspection ==="
+        echo "=== Driver log: run.log | Server logs: server_<id>.log ==="
         echo "=== Kill it with: tmux kill-session -t $SESSION ==="
         exec bash
     fi
@@ -126,6 +162,12 @@ tmux has-session -t "$SESSION" 2>/dev/null && \
 echo "Building project..."
 mvn clean install -Dbuild.dir=target-script
 
+# The experiment JVMs are launched with plain `java -cp`, one process per
+# Raft node plus the workload driver, so resolve the runtime classpath once.
+echo "Resolving runtime classpath..."
+mvn -q -Dbuild.dir=target-script dependency:build-classpath -Dmdep.outputFile="$CLASSPATH_FILE"
+[[ -s "$CLASSPATH_FILE" ]] || die "classpath resolution produced no output at $CLASSPATH_FILE"
+
 mkdir -p "$RUN_DIR"
 
 # --- tmux session (detached; the calling terminal is never attached) ---
@@ -162,7 +204,7 @@ if [[ -f "$RUN_DIR/run_info.txt" ]]; then
         echo "Analyze with: python3 analyze_run.py ${RUN_DIR#"$REPO_DIR"/}"
         echo "tmux session terminated."
     else
-        echo "Run FAILED (exit code $RUN_EXIT). Partial data ($CSV_COUNT CSV files) and run.log in ${RUN_DIR#"$REPO_DIR"/}"
+        echo "Run FAILED (exit code $RUN_EXIT). Partial data ($CSV_COUNT CSV files), run.log and server_<id>.log in ${RUN_DIR#"$REPO_DIR"/}"
         echo "tmux session '$SESSION' kept alive for inspection: tmux attach -t $SESSION"
         exit 1
     fi

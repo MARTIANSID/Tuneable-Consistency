@@ -127,14 +127,16 @@ mvn clean install
 From the repository root:
 
 ```bash
-mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
+./run_all.sh [label] [config.yaml]
 ```
+
+This builds the project and launches one `ServerNode` process per Raft node plus a `WorkloadDriver` process inside a tmux session, with all results written to `runs/<label>_<timestamp>/`. To launch the processes by hand instead, start each node with `java -cp <classpath> org.example.Server.ServerNode config.yaml <serverId>` and then run `java -cp <classpath> org.example.Client.WorkloadDriver config.yaml` (the classpath is written to `target-script/classpath.txt` by `run_all.sh`).
 
 ---
 
-# What `Servers.java` Does
+# What the Experiment Runner Does
 
-`Servers.java` is the main distributed experiment runner for the system.
+Each Raft node runs in its own OS process (`ServerNode`); the workload driver (`WorkloadDriver`) runs in another and controls the cluster over an admin gRPC service.
 
 It automatically:
 
@@ -437,7 +439,7 @@ mvn clean install
 ## 4. Run the Experiment
 
 ```bash
-mvn exec:java -Dexec.mainClass="org.example.Server.Servers"
+./run_all.sh
 ```
 
 ---
