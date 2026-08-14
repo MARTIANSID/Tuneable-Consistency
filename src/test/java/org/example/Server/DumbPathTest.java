@@ -78,6 +78,7 @@ class DumbPathTest {
         try (TestCluster cluster = new TestCluster(19770)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+            cluster.awaitLeaderHint(follower, leader, 5_000);
             try (TestSession leaderSession = new TestSession(cluster.portOf(leader.nodeId()));
                     TestSession followerSession = new TestSession(cluster.portOf(follower.nodeId()))) {
                 KvResponse write = leaderSession.call(

@@ -178,7 +178,7 @@ public class Servers {
     }
 
     public static void main(String[] args) throws IOException {
-        Path configPath = Path.of(args.length > 0 ? args[0] : "config.json");
+        Path configPath = Path.of(args.length > 0 ? args[0] : "config.yaml");
         ExperimentConfig config = ExperimentConfig.load(configPath);
         applyConfig(config);
         ServerImpl.applyConfig(config);
@@ -429,6 +429,14 @@ public class Servers {
             AtomicLong totalInjected = new AtomicLong(0);
             long lastReportTime = System.currentTimeMillis();
             int appCursor = 0;
+            // Progress lines report per-interval deltas, not running totals.
+            long lastSent = 0;
+            long lastServed = 0;
+            long lastRejected = 0;
+            long lastLost = 0;
+            long lastViolations = 0;
+            double lastPredicted = 0;
+            double lastRealized = 0;
 
             while (!Thread.currentThread().isInterrupted() && experimentRunning) {
                 try {
@@ -464,11 +472,26 @@ public class Servers {
                     long currentTime = System.currentTimeMillis();
                     if (currentTime - lastReportTime >= 3000) {
                         long elapsedSeconds = (currentTime - experimentStartTime) / 1000;
+                        long sent = totalInjected.get();
+                        long served = ClientMetricsTracker.totalResponses();
+                        long rejectedNow = ClientMetricsTracker.totalRejected();
+                        long lostNow = ClientMetricsTracker.totalLost();
+                        long violationsNow = ClientMetricsTracker.totalViolations();
+                        double predictedNow = ClientMetricsTracker.totalPredictedProfit();
+                        double realizedNow = ClientMetricsTracker.totalRealizedProfit();
                         System.out.printf(
-                                "[%02ds] Sent=%d | Responses=%d | Rejected=%d | Lost=%d | Violations=%d | Phase=%s | TotalTPS=%d%n",
-                                elapsedSeconds, totalInjected.get(), ClientMetricsTracker.totalResponses(),
-                                ClientMetricsTracker.totalRejected(), ClientMetricsTracker.totalLost(),
-                                ClientMetricsTracker.totalViolations(), phase.name, phase.totalTPS);
+                                "[%02ds] Sent=%d | Served=%d | Rejected=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
+                                elapsedSeconds, sent - lastSent, served - lastServed,
+                                rejectedNow - lastRejected, lostNow - lastLost, violationsNow - lastViolations,
+                                predictedNow - lastPredicted, realizedNow - lastRealized,
+                                phase.name, phase.totalTPS);
+                        lastSent = sent;
+                        lastServed = served;
+                        lastRejected = rejectedNow;
+                        lastLost = lostNow;
+                        lastViolations = violationsNow;
+                        lastPredicted = predictedNow;
+                        lastRealized = realizedNow;
                         lastReportTime = currentTime;
                     }
 

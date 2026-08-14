@@ -24,6 +24,7 @@ class ReadIndexBatchTest {
         try (TestCluster cluster = new TestCluster(19850)) {
             ServerImpl leader = cluster.awaitLeader(15_000);
             ServerImpl follower = cluster.nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+            cluster.awaitLeaderHint(follower, leader, 5_000);
 
             cluster.append(leader, "b-key", "b-value", "b-op", 5_000);
             int committedFloor = leader.currentCommitIndex();

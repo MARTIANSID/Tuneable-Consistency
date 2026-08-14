@@ -62,6 +62,23 @@ final class TestCluster implements AutoCloseable {
         throw new AssertionError("no leader elected within " + timeoutMs + " ms");
     }
 
+    /**
+     * Wait until a follower has learned the leader from a heartbeat. Right
+     * after an election a follower's leader hint can still be -1, so tests
+     * that make the follower contact the leader (read-index rounds) must not
+     * race the first AppendEntries.
+     */
+    void awaitLeaderHint(ServerImpl follower, ServerImpl leader, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (follower.leaderIdHint() == leader.nodeId()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("follower " + follower.nodeId() + " never learned leader " + leader.nodeId());
+    }
+
     /** Wait until every live (non-dropped) node has committed up to index. */
     void awaitCommitted(int index, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;

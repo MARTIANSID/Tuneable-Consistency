@@ -1,0 +1,223 @@
+# Experiment configuration.
+#
+# The loader is strict: a missing key, an unknown key (usually a typo), or an
+# invalid value fails fast with an explicit error instead of falling back to a
+# default. Every key below is required unless noted otherwise.
+
+# The experiment arm: who resolves each request's subSLA target and how the
+# client picks the contact server.
+#   chameleon       - server-side scorer decides level and write concern;
+#                     client routes reads to the lowest-RTT node
+#   chameleonPileus - server-side scorer decides; client routes with the
+#                     Pileus selector (expected-profit server choice)
+#   pileus          - client picks (server, rung) jointly by expected profit;
+#                     requests carry the target (wantLinearizable / write
+#                     concern) and the server serves without deciding anything
+#   highestProfit   - client statically targets the max-profit rung of each
+#                     SLA; lowest-RTT routing (greedy baseline)
+#   lowestProfit    - client statically targets the floor rung; lowest-RTT
+#                     routing (dumb baseline; upgrades happen only by luck)
+mode: pileus
+
+cluster:
+  # Number of Raft nodes. Majority = numServers/2 + 1 (write concerns and the
+  # SLA validation are checked against it).
+  numServers: 5
+  # One host per node; node i listens on serverBasePort + i + 1.
+  serverHosts:
+    - localhost
+    - localhost
+    - localhost
+    - localhost
+    - localhost
+  serverBasePort: 8000
+
+# Mode-independent server mechanics (apply to every arm).
+server:
+  # Clamp on every server-side wait (causal/read-index waits, write-concern
+  # acks). A request whose wait expires falls back to the strongest no-wait
+  # level of the same view (reads) or acks with the replication reached so
+  # far (writes). Client-sent wait bounds are clamped to this too.
+  maxWaitMs: 400
+  # Occupancy slot budget: the time-weighted average number of requests in
+  # flight the node is calibrated for (sweep_smax.sh measures it at the
+  # latency knee). Utilization u = slot-time / (sMax * interval); the hard
+  # admission cap rejects outright above 1.5x sMax in-flight - in every mode.
+  sMax: 10000
+  # Leader-side write admission: entries per second charged one per admitted
+  # write, refilled continuously, never returned. Calibrated from the
+  # measured max commit rate (sweep_smax.sh, ~80% of it). Universal.
+  replicationBudgetPerSecond: 31000
+  # Followers may serve linearizable reads by fetching a confirmed read index
+  # from the leader (batched rounds) and waiting for their own commit index
+  # to catch up. Relieves leader concentration at the cost of an extra hop.
+  followerLinearizableReads: true
+
+# Chameleon economics: consulted only by the chameleon* modes (the price
+# controller still runs otherwise, but nothing reads lambda).
+chameleon:
+  # Occupancy/price control interval: utilization is computed and lambda
+  # updated once per interval; occupancy_<n>.csv gets one row per interval.
+  controlIntervalMs: 100
+  # Utilization target the shadow price regulates toward.
+  uTarget: 0.85
+  # Multiplicative controller gain: lambda <- max(lambdaMin, lambda * exp(eta * (u - uTarget))).
+  eta: 1.0
+  # Price floor. It lets lambda start from zero and stops it decaying so far
+  # during idle periods that recovery takes many intervals; only its order of
+  # magnitude matters relative to the rung profits.
+  lambdaMin: 0.0001
+
+# Mode-independent client mechanics.
+client:
+  # Sliding-window size for the per-node RTT estimator (fed only by replies
+  # that involved no server-side waiting) and for the Pileus response-time
+  # windows.
+  rttWindowSize: 64
+  # Redirect/failure resends before a request is given up (rejections are
+  # terminal by design and never retried).
+  retryLimit: 3
+  # No response within this -> the client scores the request as lost.
+  lostTimeoutMs: 10000
+
+# Pileus routing: consulted only when routing with the selector
+# (chameleonPileus and pileus modes).
+pileus:
+  # Fraction of requests routed to a uniformly random server so latency
+  # windows and per-server staleness estimates never freeze on old samples
+  # (rejections also file penalty samples; exploration re-probes recovery).
+  explorationFraction: 0.05
+
+# Key selection for the workload; reads and writes draw from the same
+# distribution over keys "user0" .. "user<keySpace-1>".
+workload:
+  keySpace: 100
+  # uniform | zipfian. Zipfian weight of rank r is 1/(r+1)^zipfianExponent
+  # (rank 0 is the hottest key); zipfianExponent is required either way but
+  # only used when zipfian.
+  keyDistribution: uniform
+  zipfianExponent: 1.0
+
+# SLAs registered per application; requests carry only (applicationId, slaId)
+# and the decision policy resolves which rung to pursue. A rung is
+# (consistency requirement, end-to-end latency threshold in ms, profit).
+# Read rung levels, weakest to strongest:
+#   EVENTUAL_LOCAL < EVENTUAL_MAJORITY < CAUSAL_LOCAL < CAUSAL_MAJORITY < LINEARIZABLE
+# Write rungs use concern instead: acknowledgments to wait for, 1..majority
+# (at majority the write is committed and closes the loss window).
+# At most 4 rungs per SLA (the client ledger's satisfied-rung columns are fixed).
+slas:
+  - applicationId: 1          # "gold": pays most, wants linearizable
+    read:
+      - slaId: 1
+        rungs:
+          - level: LINEARIZABLE
+            latencyMs: 300
+            profit: 10
+          - level: CAUSAL_MAJORITY
+            latencyMs: 150
+            profit: 6
+          - level: EVENTUAL_MAJORITY
+            latencyMs: 100
+            profit: 2
+    write:
+      - slaId: 1
+        rungs:
+          - concern: 3        # majority at 5 nodes: committed, loss window closed
+            latencyMs: 300
+            profit: 8
+          - concern: 1        # leader-ack only: fast but can be lost on leader change
+            latencyMs: 150
+            profit: 3
+  - applicationId: 2          # "silver": causal reads, majority writes
+    read:
+      - slaId: 1
+        rungs:
+          - level: CAUSAL_MAJORITY
+            latencyMs: 250
+            profit: 5
+          - level: CAUSAL_LOCAL
+            latencyMs: 125
+            profit: 3
+          - level: EVENTUAL_LOCAL
+            latencyMs: 75
+            profit: 1
+    write:
+      - slaId: 1
+        rungs:
+          - concern: 3
+            latencyMs: 250
+            profit: 4
+          - concern: 1
+            latencyMs: 125
+            profit: 2
+  - applicationId: 3          # "bronze": eventual/causal-local, wc:1 writes
+    read:
+      - slaId: 1
+        rungs:
+          - level: CAUSAL_LOCAL
+            latencyMs: 500
+            profit: 2
+          - level: EVENTUAL_LOCAL
+            latencyMs: 200
+            profit: 1
+    write:
+      - slaId: 1
+        rungs:
+          - concern: 1
+            latencyMs: 200
+            profit: 1
+
+# Failure injection: drop all inter-server RPCs on one node from the start.
+nodeFailure:
+  enabled: false
+  failedNodeId: 0
+
+# Failure injection: fail one node (by role) N seconds into the experiment.
+timedFailure:
+  enabled: false
+  targetRole: FOLLOWER        # LEADER | FOLLOWER
+  afterSeconds: 40
+
+# Geo latency simulation (Linux tc/netem only; requires root or sudo).
+geo:
+  enabled: false
+  latencyMs: 50
+  scriptPath: ./simulate_geo_latency.sh
+  scriptTimeoutSeconds: 10
+  clearOnExit: true
+  useSudo: true
+
+experiment:
+  # Added to the phase-duration sum for the hard experiment deadline, giving
+  # in-flight requests time to drain before the final report.
+  bufferSeconds: 20
+  # Run a single phase (by index) for singlePhaseDurationSeconds instead of
+  # the whole phase sequence; used by the sweep scripts.
+  runSinglePhase: false
+  singlePhaseIndex: 0
+  singlePhaseDurationSeconds: 60
+
+# Phases control offered load and read/write mix only. The consistency-level
+# mix is never configured: the active decision policy chooses per request.
+phases:
+  - name: Light
+    durationSeconds: 70
+    totalTPS: 30000
+    readPercentage: 0.9
+    writePercentage: 0.1
+  - name: Medium
+    durationSeconds: 60
+    totalTPS: 45000
+    readPercentage: 0.9
+    writePercentage: 0.1
+  - name: Heavy
+    durationSeconds: 60
+    totalTPS: 70000
+    readPercentage: 0.9
+    writePercentage: 0.1
+  - name: Recovery
+    durationSeconds: 60
+    totalTPS: 30000
+    readPercentage: 0.9
+    writePercentage: 0.1

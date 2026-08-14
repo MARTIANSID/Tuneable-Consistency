@@ -19,10 +19,10 @@
 # this script - it requires Linux tc/netem and ENABLE_GEO_SETTINGS is off anyway.
 #
 # Usage:
-#   ./run_all.sh [label] [config.json]     e.g. ./run_all.sh upgrades-on
-#                                               ./run_all.sh pressure my-config.json
-# The config file (default: repo config.json) is passed to the experiment and
-# archived alongside the results for provenance.
+#   ./run_all.sh [label] [config.yaml]     e.g. ./run_all.sh upgrades-on
+#                                               ./run_all.sh pressure my-config.yaml
+# The config file (default: repo config.yaml; .json also accepted) is passed
+# to the experiment and archived alongside the results for provenance.
 #
 set -euo pipefail
 
@@ -31,6 +31,16 @@ SCRIPT_PATH="$REPO_DIR/run_all.sh"
 SESSION="tuneable"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# protobuf-java 3.x uses sun.misc.Unsafe, which JDK 24+ warns about on every
+# JVM start. exec:java runs inside Maven's own JVM, so the acknowledgment flag
+# must reach it via MAVEN_OPTS - gated on Maven's JVM version because the flag
+# does not exist before JDK 23. (Surefire-forked test JVMs get it from the
+# pom's jdk24-plus profile.)
+MVN_JAVA_MAJOR="$(mvn -version 2>/dev/null | sed -nE 's/^Java version: ([0-9]+).*/\1/p')"
+if [[ "${MVN_JAVA_MAJOR:-0}" -ge 24 ]]; then
+    export MAVEN_OPTS="${MAVEN_OPTS:-} --sun-misc-unsafe-memory-access=allow"
+fi
 
 # ---------------------------------------------------------------------------
 # Internal mode: this is what runs inside the tmux "experiment" window.
@@ -42,7 +52,11 @@ if [[ "${1:-}" == "_experiment" ]]; then
     RUN_DIR="$(pwd)"
 
     # Archive the exact config used before the run, for provenance.
-    cp "$CONFIG_PATH" config.json
+    case "$CONFIG_PATH" in
+        *.yaml|*.yml) CONFIG_ARCHIVE="config.yaml" ;;
+        *)            CONFIG_ARCHIVE="config.json" ;;
+    esac
+    cp "$CONFIG_PATH" "$CONFIG_ARCHIVE"
 
     echo "=== Experiment starting (label: $LABEL) ==="
     echo "=== Working directory: $RUN_DIR ==="
@@ -55,10 +69,6 @@ if [[ "${1:-}" == "_experiment" ]]; then
         -Dexec.args="$CONFIG_PATH" 2>&1 | tee run.log
     RUN_EXIT=${PIPESTATUS[0]}
     set -e
-
-    # Copy (not move) the analysis notebook next to the data, matching how
-    # previous result folders (Baseline_*, Chamaleon_*) were laid out.
-    [[ -f "$REPO_DIR/graphs.ipynb" ]] && cp "$REPO_DIR/graphs.ipynb" .
 
     # Record what was run so results stay comparable across config edits.
     # Written last: the orchestrator polls for this file to detect completion.
@@ -90,8 +100,8 @@ fi
 # ---------------------------------------------------------------------------
 LABEL="${1:-run}"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label must match [A-Za-z0-9._-]+, got: $LABEL"
-CONFIG_PATH="${2:-$REPO_DIR/config.json}"
-CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found: ${2:-$REPO_DIR/config.json}"
+CONFIG_PATH="${2:-$REPO_DIR/config.yaml}"
+CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found: ${2:-$REPO_DIR/config.yaml}"
 [[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
 STAMP="$(date '+%Y%m%d_%H%M%S')"
 RUN_DIR="$REPO_DIR/runs/${LABEL}_${STAMP}"
@@ -149,6 +159,7 @@ if [[ -f "$RUN_DIR/run_info.txt" ]]; then
     CSV_COUNT="$(find "$RUN_DIR" -maxdepth 1 -name "*.csv" | wc -l | tr -d ' ')"
     if [[ "$RUN_EXIT" == "0" ]]; then
         echo "Run complete: $CSV_COUNT CSV files in ${RUN_DIR#"$REPO_DIR"/}"
+        echo "Analyze with: python3 analyze_run.py ${RUN_DIR#"$REPO_DIR"/}"
         echo "tmux session terminated."
     else
         echo "Run FAILED (exit code $RUN_EXIT). Partial data ($CSV_COUNT CSV files) and run.log in ${RUN_DIR#"$REPO_DIR"/}"

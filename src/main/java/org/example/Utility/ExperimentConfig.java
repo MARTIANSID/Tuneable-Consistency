@@ -159,21 +159,19 @@ public final class ExperimentConfig {
     // --- Loading ---
 
     public static ExperimentConfig load(Path path) {
-        String json;
+        String raw;
         try {
-            json = Files.readString(path);
+            raw = Files.readString(path);
         } catch (IOException e) {
             throw new IllegalArgumentException("Cannot read config file: " + path.toAbsolutePath(), e);
         }
 
-        JsonElement root;
-        try {
-            root = JsonParser.parseString(json);
-        } catch (JsonSyntaxException e) {
-            throw new IllegalArgumentException("Config file is not valid JSON: " + path.toAbsolutePath() + " - " + e.getMessage(), e);
-        }
+        String fileName = path.getFileName().toString().toLowerCase();
+        JsonElement root = (fileName.endsWith(".yaml") || fileName.endsWith(".yml"))
+                ? parseYaml(raw, path)
+                : parseJson(raw, path);
         if (!root.isJsonObject()) {
-            throw new IllegalArgumentException("Config root must be a JSON object: " + path.toAbsolutePath());
+            throw new IllegalArgumentException("Config root must be a mapping/object: " + path.toAbsolutePath());
         }
 
         rejectUnknownKeys(root.getAsJsonObject(), ExperimentConfig.class, "");
@@ -181,6 +179,56 @@ public final class ExperimentConfig {
         ExperimentConfig config = new Gson().fromJson(root, ExperimentConfig.class);
         config.validate();
         return config;
+    }
+
+    private static JsonElement parseJson(String raw, Path path) {
+        try {
+            return JsonParser.parseString(raw);
+        } catch (JsonSyntaxException e) {
+            throw new IllegalArgumentException("Config file is not valid JSON: " + path.toAbsolutePath() + " - " + e.getMessage(), e);
+        }
+    }
+
+    private static JsonElement parseYaml(String raw, Path path) {
+        Object tree;
+        try {
+            tree = new org.yaml.snakeyaml.Yaml(new org.yaml.snakeyaml.constructor.SafeConstructor(
+                    new org.yaml.snakeyaml.LoaderOptions())).load(raw);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("Config file is not valid YAML: " + path.toAbsolutePath() + " - " + e.getMessage(), e);
+        }
+        if (tree == null) {
+            throw new IllegalArgumentException("Config file is empty: " + path.toAbsolutePath());
+        }
+        return yamlToJsonTree(tree);
+    }
+
+    /** Convert a SnakeYAML tree into a Gson tree so both formats share the strict loader. */
+    private static JsonElement yamlToJsonTree(Object node) {
+        if (node == null) {
+            return com.google.gson.JsonNull.INSTANCE;
+        }
+        if (node instanceof Map<?, ?> map) {
+            JsonObject obj = new JsonObject();
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                obj.add(String.valueOf(e.getKey()), yamlToJsonTree(e.getValue()));
+            }
+            return obj;
+        }
+        if (node instanceof List<?> list) {
+            com.google.gson.JsonArray array = new com.google.gson.JsonArray();
+            for (Object item : list) {
+                array.add(yamlToJsonTree(item));
+            }
+            return array;
+        }
+        if (node instanceof Boolean bool) {
+            return new com.google.gson.JsonPrimitive(bool);
+        }
+        if (node instanceof Number number) {
+            return new com.google.gson.JsonPrimitive(number);
+        }
+        return new com.google.gson.JsonPrimitive(node.toString());
     }
 
     /** Recursively reject keys that do not correspond to a schema field (typo protection). */

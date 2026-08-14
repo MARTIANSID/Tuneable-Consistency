@@ -15,6 +15,9 @@
         <build.dir>target</build.dir>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
+        <!-- Overridden by the jdk24-plus profile; a harmless no-op flag on
+             older JDKs where the real option does not exist. -->
+        <sunMiscUnsafeArg>-Dsun.misc.unsafe.flag=unused</sunMiscUnsafeArg>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <grpc.version>1.83.1</grpc.version>
         <protoc.version>3.25.9</protoc.version>
@@ -57,6 +60,14 @@
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
             <version>2.14.0</version>
+        </dependency>
+
+        <!-- SnakeYAML for the YAML config (parsed into a Gson tree so the
+             strict unknown-key rejection works identically for both formats) -->
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+            <version>2.2</version>
         </dependency>
 
         <!-- ✅ JUnit 5 (Jupiter) -->
@@ -128,8 +139,26 @@
                     <!-- Server nodes write metrics CSVs into the working
                          directory; keep test runs from polluting the repo root. -->
                     <workingDirectory>${project.build.directory}</workingDirectory>
+                    <argLine>${sunMiscUnsafeArg}</argLine>
                 </configuration>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- protobuf-java 3.x still uses sun.misc.Unsafe memory access, which
+             JDK 24+ warns about on every JVM start. This flag acknowledges the
+             usage and silences the warning; it only exists on JDK 23+, hence
+             the version-gated profile (the default property is a harmless
+             no-op system property for older JDKs). -->
+        <profile>
+            <id>jdk24-plus</id>
+            <activation>
+                <jdk>[24,)</jdk>
+            </activation>
+            <properties>
+                <sunMiscUnsafeArg>--sun-misc-unsafe-memory-access=allow</sunMiscUnsafeArg>
+            </properties>
+        </profile>
+    </profiles>
 </project>
