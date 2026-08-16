@@ -41,17 +41,23 @@ final class PileusSelector {
     private final boolean followerLinReads;
     private final double explorationFraction;
     private final Random random;
+    // Admission-aware routing (null when disabled): expected profit is
+    // multiplied by the node's decayed admit probability, so a rejecting node
+    // loses attractiveness in profit space instead of through latency-window
+    // penalty samples.
+    private final AdmitRates admitRates;
 
     record Choice(int node, int rungIndex, double expectedProfit) {
     }
 
     PileusSelector(int numServers, int majority, int windowSize, boolean followerLinReads,
-            double explorationFraction, Random random) {
+            double explorationFraction, Random random, AdmitRates admitRates) {
         this.numServers = numServers;
         this.majority = majority;
         this.followerLinReads = followerLinReads;
         this.explorationFraction = explorationFraction;
         this.random = random;
+        this.admitRates = admitRates;
         this.plainWindows = new SlidingWindow[numServers];
         this.linWindows = new SlidingWindow[numServers];
         for (int i = 0; i < numServers; i++) {
@@ -123,6 +129,7 @@ final class PileusSelector {
     /** The best rung to target at one specific server (used for exploration too). */
     private Choice bestRungForNode(List<RungScorer.Rung> sla, int node, int uncommittedAnchor,
             int committedAnchor, int leaderHint) {
+        double admitFactor = admitRates == null ? 1.0 : admitRates.pAdmit(node);
         Choice best = null;
         int bestStrength = Integer.MAX_VALUE;
         for (int i = 0; i < sla.size(); i++) {
@@ -133,7 +140,7 @@ final class PileusSelector {
             }
             double feasible = readFeasible(rung.strength(), node, uncommittedAnchor, committedAnchor) ? 1.0 : 0.0;
             SlidingWindow window = lin ? linWindows[node] : plainWindows[node];
-            double expected = rung.profit() * feasible * window.fractionAtMost(rung.thresholdMs());
+            double expected = rung.profit() * feasible * window.fractionAtMost(rung.thresholdMs()) * admitFactor;
             // Strictly-greater keeps the weakest requirement on ties.
             if (best == null || expected > best.expectedProfit()
                     || (expected == best.expectedProfit() && rung.strength() < bestStrength)) {

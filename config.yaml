@@ -47,7 +47,7 @@ server:
   # Leader-side write admission: entries per second charged one per admitted
   # write, refilled continuously, never returned. Calibrated from the
   # measured max commit rate (sweep_smax.sh, ~80% of it). Universal.
-  replicationBudgetPerSecond: 31000
+  replicationBudgetPerSecond: 200000
   # Followers may serve linearizable reads by fetching a confirmed read index
   # from the leader (batched rounds) and waiting for their own commit index
   # to catch up. Relieves leader concentration at the cost of an extra hop.
@@ -86,6 +86,16 @@ client:
   # also file penalty samples; exploration re-probes recovery). Writes are
   # never explored: they must go to the leader.
   explorationFraction: 0.15
+  # Admission-aware routing: each session keeps a per-node admit/reject ratio
+  # (decayed, with a prior of 1 so no evidence means pAdmit = 1 and pAdmit
+  # never reaches 0). Pileus multiplies each node's expected profit by
+  # pAdmit(node); lowest-RTT routing minimizes rtt/pAdmit. Tracked per node,
+  # not per (node, SLA). When enabled it replaces the Pileus rejection
+  # latency-penalty samples.
+  admissionAwareRouting: true
+  # Per-second decay of the admit/reject counters, in (0, 1); smaller
+  # forgets faster (0.9 = a rejection loses half its weight in ~7 s).
+  admitRateGamma: 0.9
 
 # SLAs registered per application; requests carry only (applicationId, slaId)
 # and the decision policy resolves which rung to pursue. A rung is

@@ -163,13 +163,23 @@ public final class MeasurementPlane implements AutoCloseable {
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,U,CrossCheckU,AvgInFlight,InFlightAtClose,Lambda");
+                out.println("Timestamp,U,CrossCheckU,AvgInFlight,InFlightAtClose,Lambda,Role");
             }
-            out.printf("%d,%.6f,%.6f,%.3f,%d,%.8f%n", System.currentTimeMillis(), utilization, crossCheck,
-                    interval.averageInFlight(), interval.inFlightAtClose(), priceController.lambda());
+            out.printf("%d,%.6f,%.6f,%.3f,%d,%.8f,%s%n", System.currentTimeMillis(), utilization, crossCheck,
+                    interval.averageInFlight(), interval.inFlightAtClose(), priceController.lambda(),
+                    roleSupplier.get());
         } catch (IOException e) {
             System.err.println("Failed to write " + csvPath + ": " + e.getMessage());
         }
+    }
+
+    // This node's own view of its Raft role, stamped into each occupancy row
+    // so the analysis can reconstruct the leadership timeline (including a
+    // deposed leader that still believes it leads during a partition).
+    private volatile java.util.function.Supplier<String> roleSupplier = () -> "-";
+
+    public void setRoleSupplier(java.util.function.Supplier<String> supplier) {
+        this.roleSupplier = supplier;
     }
 
     /** The shadow price (profit per ms of slot time); up to one interval stale. */

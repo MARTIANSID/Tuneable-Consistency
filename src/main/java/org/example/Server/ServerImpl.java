@@ -95,8 +95,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // Every gRPC channel this node opens, so shutdown() can close them all.
     private final List<ManagedChannel> ownedChannels = Collections.synchronizedList(new ArrayList<>());
 
-    private static final int HEARTBEAT_INTERVAL_MS = 30;
-    private static final int MAX_ENTRIES_PER_RPC = 7000;
+    private static final int HEARTBEAT_INTERVAL_MS = 20;
+    private static final int MAX_ENTRIES_PER_RPC = 10000;
     private static final int ELECTION_TIMEOUT_BASE_MS = 2000;
     private static final int ELECTION_TIMEOUT_JITTER_MS = 700;
 

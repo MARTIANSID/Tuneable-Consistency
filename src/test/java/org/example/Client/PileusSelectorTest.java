@@ -16,7 +16,7 @@ class PileusSelectorTest {
     private static final int EL = ReadLevel.EVENTUAL_LOCAL.getNumber();
 
     private static PileusSelector selector() {
-        return new PileusSelector(3, 2, 16, false, 0.0, new Random(7));
+        return new PileusSelector(3, 2, 16, false, 0.0, new Random(7), null);
     }
 
     @Test

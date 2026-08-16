@@ -54,6 +54,11 @@ public final class KvSessionClient implements AutoCloseable {
     // Applied by lowest-RTT routing here and by the Pileus selector's own
     // exploration: fraction of reads routed to a uniformly random node.
     private final double explorationFraction;
+    // Admission-aware routing (null when disabled): decayed per-node
+    // admit/reject ratio; Pileus multiplies expected profit by pAdmit(node),
+    // lowest-RTT routing minimizes rtt/pAdmit. When enabled it replaces the
+    // selector's rejection penalty samples.
+    private final AdmitRates admitRates;
 
     // Full SLA tables (the application's own registration) and their floors.
     private final Map<Integer, List<RungScorer.Rung>> readSlas;
@@ -116,7 +121,8 @@ public final class KvSessionClient implements AutoCloseable {
     public KvSessionClient(int applicationId, List<String> hosts, int basePort, ClientMode mode,
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
-            double explorationFraction, boolean followerLinReads) {
+            double explorationFraction, boolean followerLinReads,
+            boolean admissionAwareRouting, double admitRateGamma) {
         this.applicationId = applicationId;
         this.numServers = hosts.size();
         this.majority = (numServers / 2) + 1;
@@ -129,12 +135,13 @@ public final class KvSessionClient implements AutoCloseable {
         this.readFloors = floorsOf(this.readSlas);
         this.writeFloors = floorsOf(this.writeSlas);
         this.explorationFraction = explorationFraction;
+        this.admitRates = admissionAwareRouting ? new AdmitRates(numServers, admitRateGamma) : null;
         this.streams = new StreamObserver[numServers];
         this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
         this.selector = mode.pileusRouting()
                 ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
-                        explorationFraction, new Random())
+                        explorationFraction, new Random(), admitRates)
                 : null;
 
         for (int i = 0; i < numServers; i++) {
@@ -297,6 +304,12 @@ public final class KvSessionClient implements AutoCloseable {
      * instead, so the RTT windows of non-fastest nodes keep getting samples
      * and a recovered node can win the routing back - the same reason the
      * Pileus selector explores.
+     *
+     * With admission-aware routing the score is rtt / pAdmit instead of raw
+     * rtt: a node rejecting half its requests looks twice as expensive, so
+     * rejections push traffic away without poisoning the RTT estimates. The
+     * prior keeps pAdmit above 0, and cold nodes (rtt estimate 0) still score
+     * 0 and win their first probes through the random tie-break.
      */
     private int lowestRttNode() {
         if (explorationFraction > 0 && ThreadLocalRandom.current().nextDouble() < explorationFraction) {
@@ -306,12 +319,15 @@ public final class KvSessionClient implements AutoCloseable {
         int count = 0;
         int pick = 0;
         for (int i = 0; i < numServers; i++) {
-            double estimate = rttEstimator.estimateMs(i);
-            if (estimate < best) {
-                best = estimate;
+            double score = rttEstimator.estimateMs(i);
+            if (admitRates != null) {
+                score /= admitRates.pAdmit(i);
+            }
+            if (score < best) {
+                best = score;
                 count = 1;
                 pick = i;
-            } else if (estimate == best && ThreadLocalRandom.current().nextInt(++count) == 0) {
+            } else if (score == best && ThreadLocalRandom.current().nextInt(++count) == 0) {
                 pick = i;
             }
         }
@@ -386,10 +402,14 @@ public final class KvSessionClient implements AutoCloseable {
 
         if (response.getRejected()) {
             // Admission shed this request; retrying would defeat the shedding,
-            // but the selector must see the rejection or it would keep
-            // targeting the rejecting node on cold-start optimism.
+            // but routing must see the rejection or it would keep targeting
+            // the rejecting node on cold-start optimism. With admission-aware
+            // routing the decayed admit/reject ratio carries that signal;
+            // otherwise the selector's latency-penalty samples do.
             pending.remove(response.getRequestId());
-            if (selector != null) {
+            if (admitRates != null) {
+                admitRates.onReject(nodeId);
+            } else if (selector != null) {
                 if (request.getIsRead()) {
                     selector.observeReadRejected(nodeId, request.getWantLinearizable());
                 } else {
@@ -414,6 +434,9 @@ public final class KvSessionClient implements AutoCloseable {
         pending.remove(response.getRequestId());
         double latencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
         rttEstimator.observe(nodeId, latencyMs, response.getServiceTimeMs(), response.getWaited());
+        if (admitRates != null) {
+            admitRates.onAdmit(nodeId);
+        }
         if (selector != null) {
             selector.observeIndices(nodeId, response.getLogIndex(), response.getCommitIndex());
         }
@@ -472,6 +495,9 @@ public final class KvSessionClient implements AutoCloseable {
     }
 
     private void sweepLost() {
+        if (admitRates != null) {
+            admitRates.decay();
+        }
         long now = System.currentTimeMillis();
         Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();
         while (it.hasNext()) {

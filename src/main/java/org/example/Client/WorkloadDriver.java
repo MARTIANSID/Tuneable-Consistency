@@ -153,6 +153,8 @@ public class WorkloadDriver {
     private static int SESSIONS_PER_APPLICATION;
     private static ClientMode CLIENT_MODE;
     private static double EXPLORATION_FRACTION;
+    private static boolean ADMISSION_AWARE_ROUTING;
+    private static double ADMIT_RATE_GAMMA;
     private static boolean FOLLOWER_LIN_READS;
     private static Map<Integer, Map<Integer, List<org.example.Utility.RungScorer.Rung>>> readSlasByApp;
     private static Map<Integer, Map<Integer, List<org.example.Utility.RungScorer.Rung>>> writeSlasByApp;
@@ -174,6 +176,8 @@ public class WorkloadDriver {
         CLIENT_LOST_TIMEOUT_MS = config.client.lostTimeoutMs;
         CLIENT_MODE = ClientMode.fromConfig(config.mode);
         EXPLORATION_FRACTION = config.client.explorationFraction;
+        ADMISSION_AWARE_ROUTING = config.client.admissionAwareRouting;
+        ADMIT_RATE_GAMMA = config.client.admitRateGamma;
         FOLLOWER_LIN_READS = config.server.followerLinearizableReads;
 
         SESSIONS_PER_APPLICATION = config.workload.sessionsPerApplication;
@@ -238,7 +242,8 @@ public class WorkloadDriver {
                 appSessions[app][session] = new KvSessionClient(app + 1, SERVER_HOSTS, SERVER_BASE_PORT, CLIENT_MODE,
                         RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
                         readSlasByApp.get(app + 1), writeSlasByApp.get(app + 1),
-                        EXPLORATION_FRACTION, FOLLOWER_LIN_READS);
+                        EXPLORATION_FRACTION, FOLLOWER_LIN_READS,
+                        ADMISSION_AWARE_ROUTING, ADMIT_RATE_GAMMA);
             }
         }
         System.out.println("Started " + NUM_APPLICATIONS + " applications x " + SESSIONS_PER_APPLICATION

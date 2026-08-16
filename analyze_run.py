@@ -240,6 +240,41 @@ def plot_upgrades(run, out):
         plt.close(fig)
 
 
+def plot_leadership(run, out):
+    """Each node's self-reported Raft role per control interval: small dots
+    while a node believes it is the leader, a red circle at every leader
+    change (the first one is the initial election). During a partition a
+    deposed leader that still believes it leads shows up as two rows at once,
+    which is deliberate - the column records each node's own belief."""
+    frames = []
+    for node, df in run.occupancy.items():
+        if "Role" not in df.columns:
+            print("note: occupancy CSVs have no Role column (older run); skipping leadership plot")
+            return
+        frames.append((node, df[df["Role"] == "LEADER"]))
+    fig, ax = plt.subplots(figsize=(12, 2.8))
+    for node, led in frames:
+        ax.plot(led["Time_s"], [node] * len(led), ".", markersize=3,
+                color=NODE_COLORS[node % 8], label=f"node {node}")
+    merged = pd.concat(
+        [led.assign(Node=node)[["Time_s", "Node"]] for node, led in frames],
+        ignore_index=True).sort_values("Time_s")
+    if not merged.empty:
+        changes = merged[merged["Node"].ne(merged["Node"].shift())]
+        ax.plot(changes["Time_s"], changes["Node"], "o", markersize=11,
+                markerfacecolor="none", markeredgewidth=1.8, color="#c22f2f",
+                label="leader change")
+    run.phase_lines(ax)
+    ax.set_yticks(sorted(run.occupancy.keys()))
+    ax.set_ylim(min(run.occupancy.keys()) - 0.5, max(run.occupancy.keys()) + 0.5)
+    style(ax, "time [s]", "node", f"Leadership timeline ({run.mode}) - each node's own belief")
+    ax.legend(ncol=6, fontsize=8)
+    fig.tight_layout()
+    if out:
+        fig.savefig(out("leadership.png"), dpi=120)
+        plt.close(fig)
+
+
 def print_tables(run):
     totals = run.whole_run()
 
@@ -311,8 +346,9 @@ def main():
     plot_level_mix(run, out)
     plot_latency(run, out)
     plot_upgrades(run, out)
+    plot_leadership(run, out)
     if save:
-        print(f"wrote 6 figures to {out_dir}/")
+        print(f"wrote 7 figures to {out_dir}/")
 
     print_tables(run)
 

@@ -49,6 +49,7 @@ public final class ServerNode {
         int port = config.cluster.serverBasePort + serverId + 1;
         ServerImpl serverImpl = new ServerImpl(serverId, numServers);
         MeasurementPlane plane = new MeasurementPlane(serverId, numServers);
+        plane.setRoleSupplier(() -> serverImpl.status.name());
 
         AtomicReference<Server> serverRef = new AtomicReference<>();
         AtomicBoolean stopping = new AtomicBoolean(false);

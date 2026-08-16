@@ -67,6 +67,8 @@ public final class ExperimentConfig {
         public Integer retryLimit;         // redirect/failure resends before giving up on a request
         public Integer lostTimeoutMs;      // no response within this -> the client scores the request as lost
         public Double explorationFraction; // fraction of reads routed randomly to keep per-node windows fresh (all routing options)
+        public Boolean admissionAwareRouting; // route by decayed per-node admit/reject ratio (Pileus and lowest-RTT alike)
+        public Double admitRateGamma;      // per-second decay of the admit/reject counters, in (0, 1)
     }
 
     /** Key selection for the workload; reads and writes draw from the same distribution. */
@@ -440,6 +442,12 @@ public final class ExperimentConfig {
             throw new IllegalArgumentException("client.explorationFraction must be in [0, 1), got "
                     + client.explorationFraction);
         }
+        require(client.admissionAwareRouting, "client.admissionAwareRouting");
+        require(client.admitRateGamma, "client.admitRateGamma");
+        if (!(client.admitRateGamma > 0) || !(client.admitRateGamma < 1)) {
+            throw new IllegalArgumentException("client.admitRateGamma must be in (0, 1), got "
+                    + client.admitRateGamma);
+        }
 
         require(workload, "workload");
         requirePositive(workload.keySpace, "workload.keySpace");
@@ -541,27 +549,11 @@ public final class ExperimentConfig {
                         + "] must be a non-negative finite number, got " + v);
             }
         }
-        if (geo.enabled) {
-            // The delay rules match on (source IP, destination IP), so every
-            // server needs its own literal loopback IP, and 127.0.0.1 is
-            // reserved as the client's identity (unbound sockets use it).
-            java.util.Set<String> distinctHosts = new java.util.HashSet<>();
-            for (int i = 0; i < cluster.serverHosts.size(); i++) {
-                String host = cluster.serverHosts.get(i);
-                if (!host.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
-                    throw new IllegalArgumentException("geo.enabled requires cluster.serverHosts[" + i
-                            + "] to be a literal IPv4 address (e.g. 127.0.1." + (i + 1) + "), got '" + host + "'");
-                }
-                if (host.equals("127.0.0.1")) {
-                    throw new IllegalArgumentException("geo.enabled forbids cluster.serverHosts[" + i
-                            + "] = 127.0.0.1: that address identifies the client in the delay rules");
-                }
-                if (!distinctHosts.add(host)) {
-                    throw new IllegalArgumentException("geo.enabled requires distinct cluster.serverHosts; '"
-                            + host + "' appears more than once");
-                }
-            }
-        }
+        // No host-shape requirements for geo here: run_all_cloudlab.sh
+        // rewrites cluster.serverHosts to distinct literal loopback IPs
+        // (127.0.1.1..N) before the config reaches any process, which is what
+        // the delay rules and the servers' source binding key on. A local
+        // run_all.sh run refuses geo-enabled configs outright.
 
         // Mixes and phases live under workload but are validated here, after
         // slas, because every mix entry must name a registered SLA.

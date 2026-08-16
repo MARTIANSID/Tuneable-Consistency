@@ -47,7 +47,7 @@ class ModeSmokeTest {
             cluster.awaitLeader(15_000);
             try (KvSessionClient client = new KvSessionClient(70,
                     List.of("localhost", "localhost", "localhost"), basePort, mode, 32, 3, 8_000,
-                    Map.of(1, READ_SLA), Map.of(1, WRITE_SLA), 0.05, false)) {
+                    Map.of(1, READ_SLA), Map.of(1, WRITE_SLA), 0.05, false, true, 0.9)) {
 
                 for (int i = 0; i < 200; i++) {
                     String key = "m" + (i % 8);
