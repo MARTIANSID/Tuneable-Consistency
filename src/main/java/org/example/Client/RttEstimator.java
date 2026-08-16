@@ -3,10 +3,13 @@ package org.example.Client;
 /**
  * Per-node RTT estimation (stage 5, protocol rho): RTT = end-to-end latency
  * minus the server-reported service time, sampled only from replies that
- * involved no server-side waiting, so the estimate never absorbs queueing or
- * index waits. The estimate is the median of a sliding window per node; empty
- * windows report 0 (optimistic cold start, consistent with the scorer's
- * free-and-certain rule for empty cells).
+ * involved no server-side waiting, so the estimate never absorbs server-side
+ * queueing or index waits. Rejections qualify too (score and reply, no wait)
+ * and must be fed: they are the only samples still flowing when a node
+ * rejects everything, and without them an estimate poisoned by an overload
+ * burst could never recover. The estimate is the median of a sliding window
+ * per node; empty windows report 0 (optimistic cold start, consistent with
+ * the scorer's free-and-certain rule for empty cells).
  */
 public final class RttEstimator {
 

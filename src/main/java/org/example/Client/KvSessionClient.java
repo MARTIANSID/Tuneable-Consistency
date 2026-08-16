@@ -429,6 +429,14 @@ public final class KvSessionClient implements AutoCloseable {
             // routing the decayed admit/reject ratio carries that signal;
             // otherwise the selector's latency-penalty samples do.
             pending.remove(response.getRequestId());
+            // A rejection is also a clean RTT sample: the server scores and
+            // replies immediately, with no server-side waiting. Feeding it
+            // keeps the estimator live under total rejection - otherwise
+            // windows poisoned by an overload burst freeze (nothing is served,
+            // so nothing updates rho) and the scorer keeps rejecting on the
+            // stale estimate long after the queues have drained.
+            double rejectLatencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
+            rttEstimator.observe(nodeId, rejectLatencyMs, response.getServiceTimeMs(), response.getWaited());
             AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
             if (admitRates != null) {
                 admitRates.onReject(nodeId);
