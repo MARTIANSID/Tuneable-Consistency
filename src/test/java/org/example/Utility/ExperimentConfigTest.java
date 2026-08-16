@@ -47,15 +47,18 @@ class ExperimentConfigTest {
 
     @Test
     void mixEntriesMustReferenceRegisteredSlas() throws IOException {
-        // Point one mix entry at an application that registers no SLAs.
+        // Point one mix entry at an application that registers no SLAs. The
+        // pattern matches only uncommented entries (a comment line cannot
+        // start with "- {"), so the test holds regardless of which entries
+        // the repo config currently has commented out.
         String yaml = Files.readString(REPO_CONFIG)
-                .replaceFirst("applicationId: 4, type: read", "applicationId: 9, type: read");
+                .replaceFirst("(?m)^(\\s*)- \\{ applicationId: \\d+", "$1- { applicationId: 9");
         Path tmp = Files.createTempFile("config-test", ".yaml");
         try {
             Files.writeString(tmp, yaml);
             IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                     () -> ExperimentConfig.load(tmp));
-            assertTrue(e.getMessage().contains("unregistered SLA 9/read/1"), e.getMessage());
+            assertTrue(e.getMessage().contains("unregistered SLA 9/"), e.getMessage());
         } finally {
             Files.delete(tmp);
         }

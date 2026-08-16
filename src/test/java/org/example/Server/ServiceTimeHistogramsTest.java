@@ -38,7 +38,7 @@ class ServiceTimeHistogramsTest {
 
     @Test
     void samplesBecomeVisibleOnTickAndDecayGeometrically() {
-        ServiceTimeHistograms h = new ServiceTimeHistograms(1);
+        ServiceTimeHistograms h = new ServiceTimeHistograms(1, 0.95);
         for (int i = 0; i < 100; i++) {
             h.file(0, 0, 10.0);
         }
@@ -58,7 +58,7 @@ class ServiceTimeHistogramsTest {
 
     @Test
     void cdfAndQuantilesInterpolate() {
-        ServiceTimeHistograms h = new ServiceTimeHistograms(1);
+        ServiceTimeHistograms h = new ServiceTimeHistograms(1, 0.95);
         for (int i = 0; i < 50; i++) {
             h.file(0, 0, 1.0);
         }
@@ -79,7 +79,7 @@ class ServiceTimeHistogramsTest {
 
     @Test
     void emptyCellIsFreeAndCertain() {
-        ServiceTimeHistograms h = new ServiceTimeHistograms(1);
+        ServiceTimeHistograms h = new ServiceTimeHistograms(1, 0.95);
         h.refreshTick();
         ServiceTimeHistograms.Snapshot s = h.snapshot(0, 0);
         assertEquals(1.0, s.fractionAtMost(5.0), 1e-9, "cold-start rule: empty cell is certain");

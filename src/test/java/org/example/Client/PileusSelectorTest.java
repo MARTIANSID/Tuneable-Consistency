@@ -16,7 +16,7 @@ class PileusSelectorTest {
     private static final int EL = ReadLevel.EVENTUAL_LOCAL.getNumber();
 
     private static PileusSelector selector() {
-        return new PileusSelector(3, 2, 16, false, 0.0, new Random(7), null);
+        return new PileusSelector(3, 2, 16, false, 0.0, new Random(7));
     }
 
     @Test
@@ -29,13 +29,13 @@ class PileusSelectorTest {
                 new RungScorer.Rung(LIN, 300, 10),
                 new RungScorer.Rung(CM, 150, 6),
                 new RungScorer.Rung(EL, 100, 6));
-        PileusSelector.Choice choice = selector.chooseRead(sla, -1, -1, 1);
+        PileusSelector.Choice choice = selector.chooseRead(sla, -1, -1, 1, null);
         assertEquals(1, choice.node(), "only the leader can serve the top-paying LIN rung");
         assertEquals(0, choice.rungIndex());
         assertEquals(10.0, choice.expectedProfit(), 1e-9);
 
         // Without the LIN rung, CM and EL tie at 6: the weaker EL rung wins.
-        PileusSelector.Choice tie = selector.chooseRead(sla.subList(1, 3), -1, -1, 1);
+        PileusSelector.Choice tie = selector.chooseRead(sla.subList(1, 3), -1, -1, 1, null);
         assertEquals(2, tie.rungIndex() + 1, "profit tie must resolve to the weakest requirement");
     }
 
@@ -48,10 +48,10 @@ class PileusSelectorTest {
         // The session's committed anchor is 50; no server has reported
         // reaching it, so the CM rung is infeasible everywhere and the EL
         // rung wins by default.
-        assertEquals(1, selector.chooseRead(sla, -1, 50, 0).rungIndex());
+        assertEquals(1, selector.chooseRead(sla, -1, 50, 0, null).rungIndex());
         // One server reports commit index 60: CM becomes feasible there.
         selector.observeIndices(2, 70, 60);
-        PileusSelector.Choice choice = selector.chooseRead(sla, -1, 50, 0);
+        PileusSelector.Choice choice = selector.chooseRead(sla, -1, 50, 0, null);
         assertEquals(0, choice.rungIndex());
         assertEquals(2, choice.node());
     }
@@ -69,7 +69,7 @@ class PileusSelectorTest {
         }
         // Server 2 stays cold (optimistic), so it ties with server 1 at full
         // certainty; either way the slow server 0 must lose the 100 ms rung.
-        PileusSelector.Choice choice = selector.chooseRead(sla, -1, -1, 0);
+        PileusSelector.Choice choice = selector.chooseRead(sla, -1, -1, 0, null);
         assertEquals(0, choice.rungIndex());
         assertEquals(5.0, choice.expectedProfit(), 1e-9);
         // On server 0 itself the 500 ms rung is the better target.
@@ -77,7 +77,7 @@ class PileusSelectorTest {
             selector.observeRead(2, false, 400);
             selector.observeRead(1, false, 400);
         }
-        assertEquals(1, selector.chooseRead(sla, -1, -1, 0).rungIndex(),
+        assertEquals(1, selector.chooseRead(sla, -1, -1, 0, null).rungIndex(),
                 "with every server slow, the loose rung is the best target");
     }
 

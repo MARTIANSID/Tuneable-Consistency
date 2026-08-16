@@ -51,6 +51,7 @@ public final class ExperimentConfig {
         public Double sMax;                // occupancy slot budget; the hard cap rejects above 1.5x this in every mode
         public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s (universal admission)
         public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round (all modes)
+        public Double histogramDecay;      // service-time histogram decay per 100 ms refresh tick, in (0, 1)
     }
 
     /** Chameleon economics; consulted only by the chameleon* modes. */
@@ -77,6 +78,7 @@ public final class ExperimentConfig {
         public String keyDistribution;  // "uniform" or "zipfian"
         public Double zipfianExponent;  // skew; weight of rank r is 1/(r+1)^exponent (used when zipfian)
         public Integer sessionsPerApplication; // independent session clients per app, drawn uniformly per request
+        public Integer injectorThreads; // injection threads; sessions are sharded across them (each session stays single-threaded)
         public Map<String, List<SlaShare>> mixes; // named weight vectors phases reference by key
         public List<PhaseConfig> phases;
     }
@@ -423,6 +425,11 @@ public final class ExperimentConfig {
         requirePositive(server.sMax, "server.sMax");
         requirePositive(server.replicationBudgetPerSecond, "server.replicationBudgetPerSecond");
         require(server.followerLinearizableReads, "server.followerLinearizableReads");
+        require(server.histogramDecay, "server.histogramDecay");
+        if (!(server.histogramDecay > 0) || !(server.histogramDecay < 1)) {
+            throw new IllegalArgumentException("server.histogramDecay must be in (0, 1), got "
+                    + server.histogramDecay);
+        }
 
         require(chameleon, "chameleon");
         requirePositive(chameleon.controlIntervalMs, "chameleon.controlIntervalMs");
@@ -460,6 +467,13 @@ public final class ExperimentConfig {
             requirePositive(workload.zipfianExponent, "workload.zipfianExponent");
         }
         requirePositive(workload.sessionsPerApplication, "workload.sessionsPerApplication");
+        requirePositive(workload.injectorThreads, "workload.injectorThreads");
+        // Sessions are sharded across injector threads; every thread must own
+        // at least one session of every application or it could inject nothing.
+        if (workload.injectorThreads > workload.sessionsPerApplication) {
+            throw new IllegalArgumentException("workload.injectorThreads must be <= workload.sessionsPerApplication ("
+                    + workload.sessionsPerApplication + "), got " + workload.injectorThreads);
+        }
 
         require(slas, "slas");
         if (slas.isEmpty()) {

@@ -55,10 +55,13 @@ public final class KvSessionClient implements AutoCloseable {
     // exploration: fraction of reads routed to a uniformly random node.
     private final double explorationFraction;
     // Admission-aware routing (null when disabled): decayed per-node
-    // admit/reject ratio; Pileus multiplies expected profit by pAdmit(node),
-    // lowest-RTT routing minimizes rtt/pAdmit. When enabled it replaces the
-    // selector's rejection penalty samples.
-    private final AdmitRates admitRates;
+    // admit/reject ratios, one tracker per registered SLA (read and write
+    // separately) so admission pressure is per (node, SLA). Pileus multiplies
+    // expected profit by pAdmit(node), lowest-RTT routing minimizes
+    // rtt/pAdmit. When enabled it replaces the selector's rejection penalty
+    // samples.
+    private final Map<Integer, AdmitRates> readAdmitRates;
+    private final Map<Integer, AdmitRates> writeAdmitRates;
 
     // Full SLA tables (the application's own registration) and their floors.
     private final Map<Integer, List<RungScorer.Rung>> readSlas;
@@ -135,13 +138,14 @@ public final class KvSessionClient implements AutoCloseable {
         this.readFloors = floorsOf(this.readSlas);
         this.writeFloors = floorsOf(this.writeSlas);
         this.explorationFraction = explorationFraction;
-        this.admitRates = admissionAwareRouting ? new AdmitRates(numServers, admitRateGamma) : null;
+        this.readAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.readSlas, admitRateGamma) : null;
+        this.writeAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.writeSlas, admitRateGamma) : null;
         this.streams = new StreamObserver[numServers];
         this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
         this.selector = mode.pileusRouting()
                 ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
-                        explorationFraction, new Random(), admitRates)
+                        explorationFraction, new Random())
                 : null;
 
         for (int i = 0; i < numServers; i++) {
@@ -183,6 +187,20 @@ public final class KvSessionClient implements AutoCloseable {
         return floors;
     }
 
+    /** One admission tracker per registered SLA (keyed by slaId). */
+    private AdmitRates admitRatesFor(boolean isRead, int slaId) {
+        Map<Integer, AdmitRates> rates = isRead ? readAdmitRates : writeAdmitRates;
+        return rates == null ? null : rates.get(slaId);
+    }
+
+    private Map<Integer, AdmitRates> admitRatesPerSla(Map<Integer, List<RungScorer.Rung>> slas, double gamma) {
+        Map<Integer, AdmitRates> rates = new ConcurrentHashMap<>();
+        for (Integer slaId : slas.keySet()) {
+            rates.put(slaId, new AdmitRates(numServers, gamma));
+        }
+        return rates;
+    }
+
     private List<RungScorer.Rung> slaOf(Map<Integer, List<RungScorer.Rung>> slas, int slaId) {
         List<RungScorer.Rung> rungs = slas.get(slaId);
         if (rungs == null) {
@@ -205,19 +223,22 @@ public final class KvSessionClient implements AutoCloseable {
                 keyMajorityWriteSnapshot == null ? -1 : keyMajorityWriteSnapshot);
 
         List<RungScorer.Rung> sla = slaOf(readSlas, slaId);
+        AdmitRates admitRates = admitRatesFor(true, slaId);
         int targetNode;
         RungScorer.Rung targetRung = null;
         double predicted = 0;
         switch (mode) {
-            case CHAMELEON -> targetNode = lowestRttNode();
+            case CHAMELEON -> targetNode = lowestRttNode(admitRates);
             case CHAMELEON_PILEUS -> {
-                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint);
-                targetNode = choice == null ? lowestRttNode() : choice.node();
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint,
+                        admitRates);
+                targetNode = choice == null ? lowestRttNode(admitRates) : choice.node();
             }
             case PILEUS -> {
-                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint);
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint,
+                        admitRates);
                 if (choice == null) {
-                    targetNode = lowestRttNode();
+                    targetNode = lowestRttNode(admitRates);
                 } else {
                     targetNode = choice.node();
                     targetRung = sla.get(choice.rungIndex());
@@ -229,7 +250,7 @@ public final class KvSessionClient implements AutoCloseable {
                 predicted = targetRung.profit();
                 boolean linOnLeaderOnly = targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber()
                         && !followerLinReads;
-                targetNode = (linOnLeaderOnly && leaderHint >= 0) ? leaderHint : lowestRttNode();
+                targetNode = (linOnLeaderOnly && leaderHint >= 0) ? leaderHint : lowestRttNode(admitRates);
             }
         }
 
@@ -306,12 +327,13 @@ public final class KvSessionClient implements AutoCloseable {
      * Pileus selector explores.
      *
      * With admission-aware routing the score is rtt / pAdmit instead of raw
-     * rtt: a node rejecting half its requests looks twice as expensive, so
+     * rtt (admitRates is the requesting SLA's tracker, null when disabled): a
+     * node rejecting half its requests looks twice as expensive, so
      * rejections push traffic away without poisoning the RTT estimates. The
      * prior keeps pAdmit above 0, and cold nodes (rtt estimate 0) still score
      * 0 and win their first probes through the random tie-break.
      */
-    private int lowestRttNode() {
+    private int lowestRttNode(AdmitRates admitRates) {
         if (explorationFraction > 0 && ThreadLocalRandom.current().nextDouble() < explorationFraction) {
             return ThreadLocalRandom.current().nextInt(numServers);
         }
@@ -407,6 +429,7 @@ public final class KvSessionClient implements AutoCloseable {
             // routing the decayed admit/reject ratio carries that signal;
             // otherwise the selector's latency-penalty samples do.
             pending.remove(response.getRequestId());
+            AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
             if (admitRates != null) {
                 admitRates.onReject(nodeId);
             } else if (selector != null) {
@@ -434,6 +457,7 @@ public final class KvSessionClient implements AutoCloseable {
         pending.remove(response.getRequestId());
         double latencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
         rttEstimator.observe(nodeId, latencyMs, response.getServiceTimeMs(), response.getWaited());
+        AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
         if (admitRates != null) {
             admitRates.onAdmit(nodeId);
         }
@@ -495,8 +519,11 @@ public final class KvSessionClient implements AutoCloseable {
     }
 
     private void sweepLost() {
-        if (admitRates != null) {
-            admitRates.decay();
+        if (readAdmitRates != null) {
+            readAdmitRates.values().forEach(AdmitRates::decay);
+        }
+        if (writeAdmitRates != null) {
+            writeAdmitRates.values().forEach(AdmitRates::decay);
         }
         long now = System.currentTimeMillis();
         Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();

@@ -10,8 +10,10 @@ package org.example.Client;
  * and keeps it strictly above 0 under any number of rejections, so a
  * rejecting node always retains a re-probe incentive. decay() runs once per
  * second from the session's sweeper thread, forgetting old evidence so a
- * recovered node earns its traffic back. Tracked per node, not per
- * (node, SLA): from one session's perspective admission is a node property.
+ * recovered node earns its traffic back. The session keeps one instance per
+ * registered SLA (read and write separately), so admission pressure is
+ * tracked per (node, SLA): the scorer rejects low-profit SLAs sooner, and a
+ * node shedding browses may still be accepting checkouts.
  */
 final class AdmitRates {
 

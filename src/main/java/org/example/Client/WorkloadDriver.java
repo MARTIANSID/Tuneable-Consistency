@@ -11,7 +11,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 import org.example.Utility.ExperimentConfig;
 import org.example.Utility.KeySampler;
@@ -142,7 +142,6 @@ public class WorkloadDriver {
     private static volatile long phaseEndTime = 0;
     private static final Object phaseLock = new Object();
 
-    private static final Random random = new Random();
     private static AdminGrpc.AdminBlockingStub[] adminStubs;
     private static final List<ManagedChannel> adminChannels = new ArrayList<>();
     // appSessions[app][session]: independent session clients per application,
@@ -151,6 +150,9 @@ public class WorkloadDriver {
     // gRPC streams); only the metrics ledger is shared.
     private static KvSessionClient[][] appSessions;
     private static int SESSIONS_PER_APPLICATION;
+    // Injection threads; sessions are sharded across them so every session
+    // stays driven by exactly one thread (a session is one logical actor).
+    private static int INJECTOR_THREADS;
     private static ClientMode CLIENT_MODE;
     private static double EXPLORATION_FRACTION;
     private static boolean ADMISSION_AWARE_ROUTING;
@@ -181,6 +183,7 @@ public class WorkloadDriver {
         FOLLOWER_LIN_READS = config.server.followerLinearizableReads;
 
         SESSIONS_PER_APPLICATION = config.workload.sessionsPerApplication;
+        INJECTOR_THREADS = config.workload.injectorThreads;
         NUM_APPLICATIONS = config.slas.size();
 
         PHASES.clear();
@@ -249,10 +252,10 @@ public class WorkloadDriver {
         System.out.println("Started " + NUM_APPLICATIONS + " applications x " + SESSIONS_PER_APPLICATION
                 + " sessions (" + (NUM_APPLICATIONS * SESSIONS_PER_APPLICATION) + " session clients)");
 
-        Thread injector = startPhasedInjection();
-        // The injector thread ends the run: final report, cluster shutdown,
+        Thread coordinator = startPhasedInjection();
+        // The coordinator thread ends the run: final report, cluster shutdown,
         // System.exit with the violation-derived exit code.
-        injector.join();
+        coordinator.join();
     }
 
     // ===== Cluster admin (over gRPC; the servers are separate processes) =====
@@ -478,8 +481,20 @@ public class WorkloadDriver {
         phaseManager.setDaemon(true);
         phaseManager.start();
 
-        Thread systemInjector = new Thread(() -> {
-            AtomicLong totalInjected = new AtomicLong(0);
+        // The injection workers share nothing but the phase schedule and the
+        // sent counter: sessions are sharded across them, so every session
+        // keeps a single driving thread.
+        LongAdder totalInjected = new LongAdder();
+        Thread[] workers = new Thread[INJECTOR_THREADS];
+        for (int t = 0; t < INJECTOR_THREADS; t++) {
+            int shard = t;
+            workers[t] = new Thread(() -> injectShard(shard, totalInjected), "SystemInjector-" + shard);
+            workers[t].start();
+        }
+
+        // The coordinator reports progress while the workers run, then ends
+        // the run: final report, cluster shutdown, violation-derived exit code.
+        Thread coordinator = new Thread(() -> {
             long lastReportTime = System.currentTimeMillis();
             // Progress lines report per-interval deltas, not running totals.
             long lastSent = 0;
@@ -492,73 +507,44 @@ public class WorkloadDriver {
 
             while (!Thread.currentThread().isInterrupted() && experimentRunning) {
                 try {
-                    Phase phase = currentPhase;
-                    long tickStart = System.currentTimeMillis();
-                    int perTick = Math.max(1, phase.totalTPS * TICK_MS / 1000);
-
-                    // The workload no longer picks consistency levels: each
-                    // request is drawn from the phase's SLA mix, which fixes
-                    // the application, read vs write, and the SLA it names;
-                    // the decision policy chooses the rung. Keys come from
-                    // the configured distribution (uniform or zipfian), the
-                    // same for reads and writes.
-                    long now = System.currentTimeMillis();
-                    for (int i = 0; i < perTick; i++) {
-                        MixEntry entry = phase.sample(random);
-                        KvSessionClient client = appSessions[entry.applicationId - 1][SESSIONS_PER_APPLICATION == 1
-                                ? 0
-                                : random.nextInt(SESSIONS_PER_APPLICATION)];
-                        String key = "user" + keySampler.next(random);
-                        if (entry.isRead) {
-                            client.sendRead(key, entry.slaId);
-                        } else {
-                            client.sendWrite(key, "v-" + now + "-" + totalInjected.get(), entry.slaId);
-                        }
-                        totalInjected.incrementAndGet();
-                    }
-
-                    long currentTime = System.currentTimeMillis();
-                    if (currentTime - lastReportTime >= 5000) {
-                        long elapsedSeconds = (currentTime - experimentStartTime) / 1000;
-                        long sent = totalInjected.get();
-                        long served = ClientMetricsTracker.totalResponses();
-                        long rejectedNow = ClientMetricsTracker.totalRejected();
-                        long lostNow = ClientMetricsTracker.totalLost();
-                        long violationsNow = ClientMetricsTracker.totalViolations();
-                        double predictedNow = ClientMetricsTracker.totalPredictedProfit();
-                        double realizedNow = ClientMetricsTracker.totalRealizedProfit();
-                        System.out.printf(
-                                "[%02ds] Sent=%d | Served=%d | Rejected=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
-                                elapsedSeconds, sent - lastSent, served - lastServed,
-                                rejectedNow - lastRejected, lostNow - lastLost, violationsNow - lastViolations,
-                                predictedNow - lastPredicted, realizedNow - lastRealized,
-                                phase.name, phase.totalTPS);
-                        lastSent = sent;
-                        lastServed = served;
-                        lastRejected = rejectedNow;
-                        lastLost = lostNow;
-                        lastViolations = violationsNow;
-                        lastPredicted = predictedNow;
-                        lastRealized = realizedNow;
-                        lastReportTime = currentTime;
-                    }
-
-                    long elapsed = System.currentTimeMillis() - tickStart;
-                    long sleepTime = TICK_MS - elapsed;
-                    if (sleepTime > 0) {
-                        Thread.sleep(sleepTime);
-                    }
+                    Thread.sleep(200);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
-                } catch (Exception e) {
-                    System.err.println("System injection error: " + e.getMessage());
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
+                }
+                long currentTime = System.currentTimeMillis();
+                if (currentTime - lastReportTime >= 5000) {
+                    Phase phase = currentPhase;
+                    long elapsedSeconds = (currentTime - experimentStartTime) / 1000;
+                    long sent = totalInjected.sum();
+                    long served = ClientMetricsTracker.totalResponses();
+                    long rejectedNow = ClientMetricsTracker.totalRejected();
+                    long lostNow = ClientMetricsTracker.totalLost();
+                    long violationsNow = ClientMetricsTracker.totalViolations();
+                    double predictedNow = ClientMetricsTracker.totalPredictedProfit();
+                    double realizedNow = ClientMetricsTracker.totalRealizedProfit();
+                    System.out.printf(
+                            "[%02ds] Sent=%d | Served=%d | Rejected=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
+                            elapsedSeconds, sent - lastSent, served - lastServed,
+                            rejectedNow - lastRejected, lostNow - lastLost, violationsNow - lastViolations,
+                            predictedNow - lastPredicted, realizedNow - lastRealized,
+                            phase.name, phase.totalTPS);
+                    lastSent = sent;
+                    lastServed = served;
+                    lastRejected = rejectedNow;
+                    lastLost = lostNow;
+                    lastViolations = violationsNow;
+                    lastPredicted = predictedNow;
+                    lastRealized = realizedNow;
+                    lastReportTime = currentTime;
+                }
+            }
+
+            for (Thread worker : workers) {
+                try {
+                    worker.join(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             }
 
@@ -571,7 +557,7 @@ public class WorkloadDriver {
             ClientMetricsTracker.flushNow();
             long violations = ClientMetricsTracker.totalViolations();
             System.out.printf("%nExperiment completed. Sent=%d Responses=%d Rejected=%d Lost=%d SessionViolations=%d%n",
-                    totalInjected.get(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalRejected(),
+                    totalInjected.sum(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalRejected(),
                     ClientMetricsTracker.totalLost(), violations);
             for (KvSessionClient[] sessions : appSessions) {
                 for (KvSessionClient client : sessions) {
@@ -581,9 +567,76 @@ public class WorkloadDriver {
             System.out.println("Shutting down server processes...");
             shutdownCluster();
             System.exit(violations == 0 ? 0 : 2);
-        }, "SystemInjector");
-        systemInjector.start();
-        return systemInjector;
+        }, "InjectionCoordinator");
+        coordinator.start();
+        return coordinator;
+    }
+
+    /**
+     * One injection worker. It owns sessions shard, shard + K, ... of every
+     * application (K = injectorThreads) and injects its slice of each 100ms
+     * tick's request budget, with the division remainder spread over the
+     * lowest shards so the per-tick total stays exact.
+     */
+    private static void injectShard(int shard, LongAdder totalInjected) {
+        Random random = new Random();
+        KvSessionClient[][] ownSessions = new KvSessionClient[NUM_APPLICATIONS][];
+        for (int app = 0; app < NUM_APPLICATIONS; app++) {
+            int count = (SESSIONS_PER_APPLICATION - shard + INJECTOR_THREADS - 1) / INJECTOR_THREADS;
+            ownSessions[app] = new KvSessionClient[count];
+            int j = 0;
+            for (int s = shard; s < SESSIONS_PER_APPLICATION; s += INJECTOR_THREADS) {
+                ownSessions[app][j++] = appSessions[app][s];
+            }
+        }
+        long localSeq = 0;
+
+        while (!Thread.currentThread().isInterrupted() && experimentRunning) {
+            try {
+                Phase phase = currentPhase;
+                long tickStart = System.currentTimeMillis();
+                int perTick = Math.max(1, phase.totalTPS * TICK_MS / 1000);
+                int share = perTick / INJECTOR_THREADS + (shard < perTick % INJECTOR_THREADS ? 1 : 0);
+
+                // The workload no longer picks consistency levels: each
+                // request is drawn from the phase's SLA mix, which fixes
+                // the application, read vs write, and the SLA it names;
+                // the decision policy chooses the rung. Keys come from
+                // the configured distribution (uniform or zipfian), the
+                // same for reads and writes.
+                long now = System.currentTimeMillis();
+                for (int i = 0; i < share; i++) {
+                    MixEntry entry = phase.sample(random);
+                    KvSessionClient[] pool = ownSessions[entry.applicationId - 1];
+                    KvSessionClient client = pool.length == 1 ? pool[0] : pool[random.nextInt(pool.length)];
+                    String key = "user" + keySampler.next(random);
+                    if (entry.isRead) {
+                        client.sendRead(key, entry.slaId);
+                    } else {
+                        client.sendWrite(key, "v-" + now + "-" + shard + "-" + localSeq, entry.slaId);
+                    }
+                    localSeq++;
+                    totalInjected.increment();
+                }
+
+                long elapsed = System.currentTimeMillis() - tickStart;
+                long sleepTime = TICK_MS - elapsed;
+                if (sleepTime > 0) {
+                    Thread.sleep(sleepTime);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                System.err.println("System injection error: " + e.getMessage());
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
     }
 
     private static void selectAndStartNewPhase() {

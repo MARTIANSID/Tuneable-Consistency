@@ -31,6 +31,9 @@ public final class MeasurementPlane implements AutoCloseable {
     private static volatile double U_TARGET = 0.85;
     private static volatile double ETA = 1.0;
     private static volatile double LAMBDA_MIN = 0.0001;
+    // From config (server.histogramDecay): service-time histogram decay per
+    // refresh tick; effective memory ~ HISTOGRAM_REFRESH_MS / (1 - decay).
+    private static volatile double HISTOGRAM_DECAY = 0.95;
 
     private static final int HISTOGRAM_REFRESH_MS = 100;
     private static final int HISTOGRAM_DUMP_INTERVAL_MS = 5000;
@@ -42,6 +45,7 @@ public final class MeasurementPlane implements AutoCloseable {
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
         applyEconomics(config.server.sMax, config.chameleon.controlIntervalMs,
                 config.chameleon.uTarget, config.chameleon.eta, config.chameleon.lambdaMin);
+        HISTOGRAM_DECAY = config.server.histogramDecay;
     }
 
     /** Direct knob access for tests (overload shedding needs artificial pressure). */
@@ -82,7 +86,7 @@ public final class MeasurementPlane implements AutoCloseable {
     public MeasurementPlane(int nodeId, int numServers) {
         this.nodeId = nodeId;
         this.majority = (numServers / 2) + 1;
-        this.histograms = new ServiceTimeHistograms(5 + majority);
+        this.histograms = new ServiceTimeHistograms(5 + majority, HISTOGRAM_DECAY);
         this.uncalibratedRiders = new java.util.concurrent.atomic.AtomicInteger[5 + majority][ServiceTimeHistograms.GAP_BUCKETS];
         for (int l = 0; l < 5 + majority; l++) {
             for (int g = 0; g < ServiceTimeHistograms.GAP_BUCKETS; g++) {

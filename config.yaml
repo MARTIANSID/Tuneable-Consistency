@@ -52,6 +52,13 @@ server:
   # from the leader (batched rounds) and waiting for their own commit index
   # to catch up. Relieves leader concentration at the cost of an extra hop.
   followerLinearizableReads: true
+  # Decay of the service-time histograms (the scorer's per-(level, gap) CDFs
+  # and omega means) per 100 ms refresh tick, in (0, 1). Effective memory is
+  # about 100 ms / (1 - decay): 0.95 = ~2 s, 0.99 = ~10 s. Larger remembers
+  # longer (steadier estimates, slower to adapt after load shifts or leader
+  # changes); smaller forgets faster and drifts back to cold-start optimism
+  # sooner when a level stops being chosen.
+  histogramDecay: 0.9
 
 # Chameleon economics: consulted only by the chameleon* modes (the price
 # controller still runs otherwise, but nothing reads lambda).
@@ -86,12 +93,12 @@ client:
   # also file penalty samples; exploration re-probes recovery). Writes are
   # never explored: they must go to the leader.
   explorationFraction: 0.15
-  # Admission-aware routing: each session keeps a per-node admit/reject ratio
-  # (decayed, with a prior of 1 so no evidence means pAdmit = 1 and pAdmit
-  # never reaches 0). Pileus multiplies each node's expected profit by
-  # pAdmit(node); lowest-RTT routing minimizes rtt/pAdmit. Tracked per node,
-  # not per (node, SLA). When enabled it replaces the Pileus rejection
-  # latency-penalty samples.
+  # Admission-aware routing: each session keeps a decayed admit/reject ratio
+  # per (node, SLA) - one tracker per registered SLA, read and write
+  # separately, with a prior of 1 so no evidence means pAdmit = 1 and pAdmit
+  # never reaches 0. Pileus multiplies each node's expected profit by the
+  # requesting SLA's pAdmit(node); lowest-RTT routing minimizes rtt/pAdmit.
+  # When enabled it replaces the Pileus rejection latency-penalty samples.
   admissionAwareRouting: true
   # Per-second decay of the admit/reject counters, in (0, 1); smaller
   # forgets faster (0.9 = a rejection loses half its weight in ~7 s).
@@ -284,7 +291,7 @@ workload:
   # Key selection; reads and writes draw from the same distribution over the
   # shared keys "user0" .. "user<keySpace-1>" (all applications contend on
   # the same dataset; session guarantees stay per-session).
-  keySpace: 10000
+  keySpace: 100000
   # uniform | zipfian. Zipfian weight of rank r is 1/(r+1)^zipfianExponent
   # (rank 0 is the hottest key); zipfianExponent is required either way but
   # only used when zipfian.
@@ -297,6 +304,13 @@ workload:
   # Sessions persist across phases, so history carries forward. Only the
   # metrics ledger is shared.
   sessionsPerApplication: 50
+  # Threads injecting the workload. One thread caps at roughly 200-400k
+  # requests/s (per-request cost on a single core); the configured TPS is
+  # split evenly across threads each 100ms tick. Sessions are sharded across
+  # threads (thread t owns sessions t, t+K, ... of every application), so each
+  # session is still driven by exactly one thread. Must be
+  # <= sessionsPerApplication.
+  injectorThreads: 25
   # Named weight vectors the phases reference. Each injected request is drawn
   # from the active phase's mix by weight: the entry fixes the application,
   # whether it is a read or a write, and the SLA it names, so the read/write

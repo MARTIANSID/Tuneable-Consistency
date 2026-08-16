@@ -41,23 +41,17 @@ final class PileusSelector {
     private final boolean followerLinReads;
     private final double explorationFraction;
     private final Random random;
-    // Admission-aware routing (null when disabled): expected profit is
-    // multiplied by the node's decayed admit probability, so a rejecting node
-    // loses attractiveness in profit space instead of through latency-window
-    // penalty samples.
-    private final AdmitRates admitRates;
 
     record Choice(int node, int rungIndex, double expectedProfit) {
     }
 
     PileusSelector(int numServers, int majority, int windowSize, boolean followerLinReads,
-            double explorationFraction, Random random, AdmitRates admitRates) {
+            double explorationFraction, Random random) {
         this.numServers = numServers;
         this.majority = majority;
         this.followerLinReads = followerLinReads;
         this.explorationFraction = explorationFraction;
         this.random = random;
-        this.admitRates = admitRates;
         this.plainWindows = new SlidingWindow[numServers];
         this.linWindows = new SlidingWindow[numServers];
         for (int i = 0; i < numServers; i++) {
@@ -108,14 +102,23 @@ final class PileusSelector {
 
     // ===== Selection =====
 
-    Choice chooseRead(List<RungScorer.Rung> sla, int uncommittedAnchor, int committedAnchor, int leaderHint) {
+    /**
+     * Admission-aware routing passes the requesting SLA's admit tracker
+     * (null when disabled): expected profit is multiplied by the node's
+     * decayed admit probability for that SLA, so a rejecting node loses
+     * attractiveness in profit space instead of through latency-window
+     * penalty samples.
+     */
+    Choice chooseRead(List<RungScorer.Rung> sla, int uncommittedAnchor, int committedAnchor, int leaderHint,
+            AdmitRates admitRates) {
         if (explorationFraction > 0 && random.nextDouble() < explorationFraction) {
             int node = random.nextInt(numServers);
-            return bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint);
+            return bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint, admitRates);
         }
         Choice best = null;
         for (int node = 0; node < numServers; node++) {
-            Choice candidate = bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint);
+            Choice candidate = bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint,
+                    admitRates);
             if (candidate == null) {
                 continue;
             }
@@ -128,7 +131,7 @@ final class PileusSelector {
 
     /** The best rung to target at one specific server (used for exploration too). */
     private Choice bestRungForNode(List<RungScorer.Rung> sla, int node, int uncommittedAnchor,
-            int committedAnchor, int leaderHint) {
+            int committedAnchor, int leaderHint, AdmitRates admitRates) {
         double admitFactor = admitRates == null ? 1.0 : admitRates.pAdmit(node);
         Choice best = null;
         int bestStrength = Integer.MAX_VALUE;

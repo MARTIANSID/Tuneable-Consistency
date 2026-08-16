@@ -18,14 +18,14 @@ import java.util.concurrent.atomic.DoubleAdder;
  * stale by design.
  *
  * With decay d per tick of length t, the effective memory is roughly
- * t / (1 - d): 100 ms and 0.95 gives about 2 seconds.
+ * t / (1 - d): 100 ms and 0.95 gives about 2 seconds. The decay comes from
+ * config (server.histogramDecay).
  */
 public final class ServiceTimeHistograms {
 
     public static final int LATENCY_BUCKETS = 64;
     public static final double MIN_LATENCY_MS = 0.5;
     public static final double BUCKET_RATIO = 1.15;
-    public static final double DECAY = 0.95;
 
     // Gap buckets: <= 0 (already satisfiable), two coarse waiting bands sized
     // to the replication batch (MAX_ENTRIES_PER_RPC-scale), and far behind.
@@ -38,6 +38,7 @@ public final class ServiceTimeHistograms {
     private static final double LOG_RATIO = Math.log(BUCKET_RATIO);
 
     private final int numLevels;
+    private final double decay;
 
     // Hot path: lock-free pending samples.
     private final DoubleAdder[][][] pendingBuckets;
@@ -51,8 +52,12 @@ public final class ServiceTimeHistograms {
 
     private volatile Snapshot[][] snapshots;
 
-    public ServiceTimeHistograms(int numLevels) {
+    public ServiceTimeHistograms(int numLevels, double decay) {
+        if (!(decay > 0) || !(decay < 1)) {
+            throw new IllegalArgumentException("histogram decay must be in (0, 1), got " + decay);
+        }
         this.numLevels = numLevels;
+        this.decay = decay;
         this.pendingBuckets = new DoubleAdder[numLevels][GAP_BUCKETS][LATENCY_BUCKETS];
         this.pendingSum = new DoubleAdder[numLevels][GAP_BUCKETS];
         this.pendingCount = new DoubleAdder[numLevels][GAP_BUCKETS];
@@ -126,12 +131,12 @@ public final class ServiceTimeHistograms {
                 double[] cumulative = new double[LATENCY_BUCKETS];
                 double running = 0.0;
                 for (int b = 0; b < LATENCY_BUCKETS; b++) {
-                    state[b] = (state[b] + pendingBuckets[l][g][b].sumThenReset()) * DECAY;
+                    state[b] = (state[b] + pendingBuckets[l][g][b].sumThenReset()) * decay;
                     running += state[b];
                     cumulative[b] = running;
                 }
-                stateSum[l][g] = (stateSum[l][g] + pendingSum[l][g].sumThenReset()) * DECAY;
-                stateCount[l][g] = (stateCount[l][g] + pendingCount[l][g].sumThenReset()) * DECAY;
+                stateSum[l][g] = (stateSum[l][g] + pendingSum[l][g].sumThenReset()) * decay;
+                stateCount[l][g] = (stateCount[l][g] + pendingCount[l][g].sumThenReset()) * decay;
                 double mean = stateCount[l][g] <= 0 ? 0.0 : stateSum[l][g] / stateCount[l][g];
                 fresh[l][g] = new Snapshot(cumulative, stateCount[l][g], mean);
             }
