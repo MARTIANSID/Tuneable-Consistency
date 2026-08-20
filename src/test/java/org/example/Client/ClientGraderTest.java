@@ -12,8 +12,8 @@ import org.example.raft.ReadLevel;
 import org.junit.jupiter.api.Test;
 
 /**
- * The client-side SLA check: both views graded, the best-paying rung wins,
- * session assertions ride whichever view makes a causal claim.
+ * The client-side SLA check: both views are graded, the best-paying rung
+ * wins, and successful responses missing all applicable deadlines are marked.
  */
 class ClientGraderTest {
 
@@ -34,11 +34,11 @@ class ClientGraderTest {
                 .setLogIndex(10).setCommitIndex(10)
                 .setLocalValueIndex(9).setCommittedValueIndex(9)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 8, 8, null, null, 50);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 8, 8, 50);
         assertEquals(0, verdict.satisfiedRung());
         assertEquals(6.0, verdict.realizedProfit(), 1e-9);
         assertFalse(verdict.viaLocalView());
-        assertFalse(verdict.violation());
+        assertFalse(verdict.deadlineViolation());
     }
 
     @Test
@@ -50,11 +50,11 @@ class ClientGraderTest {
                 .setLogIndex(12).setCommitIndex(5)
                 .setLocalValueIndex(11).setCommittedValueIndex(4)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 10, 10, 10, null, 50);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 10, 10, 50);
         assertEquals(1, verdict.satisfiedRung());
         assertEquals(3.0, verdict.realizedProfit(), 1e-9);
         assertTrue(verdict.viaLocalView());
-        assertFalse(verdict.violation());
+        assertFalse(verdict.deadlineViolation());
     }
 
     @Test
@@ -63,28 +63,10 @@ class ClientGraderTest {
                 .setLogIndex(10).setCommitIndex(10)
                 .setLocalValueIndex(9).setCommittedValueIndex(9)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, -1, -1, null, null, 500);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, -1, -1, 500);
         assertEquals(-1, verdict.satisfiedRung());
         assertEquals(0.0, verdict.realizedProfit(), 1e-9);
-    }
-
-    @Test
-    void causalClaimsAreAssertedAgainstTheClaimingView() {
-        // The local frontier covers the anchor (a causal-local claim) but the
-        // local value predates this session's write to the key: violation.
-        KvResponse stale = response(ReadLevel.EVENTUAL_LOCAL)
-                .setLogIndex(20).setCommitIndex(3)
-                .setLocalValueIndex(2).setCommittedValueIndex(2)
-                .build();
-        assertTrue(ClientGrader.gradeRead(SLA, stale, 10, -1, 10, null, 50).violation());
-
-        // Same shape on the committed side: commit index covers the anchor
-        // but the committed value predates the majority-acked write.
-        KvResponse staleCommitted = response(ReadLevel.EVENTUAL_MAJORITY)
-                .setLogIndex(20).setCommitIndex(20)
-                .setLocalValueIndex(15).setCommittedValueIndex(2)
-                .build();
-        assertTrue(ClientGrader.gradeRead(SLA, staleCommitted, -1, 10, null, 10, 50).violation());
+        assertTrue(verdict.deadlineViolation());
     }
 
     @Test
@@ -96,6 +78,9 @@ class ClientGraderTest {
         ClientGrader.Verdict verdict = ClientGrader.gradeWrite(writeSla, ack, 100);
         assertEquals(0, verdict.satisfiedRung());
         assertEquals(8.0, verdict.realizedProfit(), 1e-9);
-        assertEquals(-1, ClientGrader.gradeWrite(writeSla, ack, 400).satisfiedRung());
+        assertFalse(verdict.deadlineViolation());
+        ClientGrader.Verdict late = ClientGrader.gradeWrite(writeSla, ack, 400);
+        assertEquals(-1, late.satisfiedRung());
+        assertTrue(late.deadlineViolation());
     }
 }

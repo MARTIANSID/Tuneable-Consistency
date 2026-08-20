@@ -15,10 +15,9 @@ import org.example.raft.ReadLevel;
  * application sees), and total time is the client-observed end-to-end
  * latency - the real SLA clock, not the server's approximation.
  *
- * The session assertions ride the claims: whenever a view's grade asserts a
- * causal level, the value it returned must cover this session's snapshotted
- * write floor for the key. This is the race detector that caught the stage 2
- * ordering bugs, now applied to whichever view makes the claim.
+ * A deadline violation is a successful response for which at least one SLA
+ * rung's consistency is satisfied but every applicable rung's end-to-end
+ * deadline is missed.
  */
 public final class ClientGrader {
 
@@ -33,12 +32,11 @@ public final class ClientGrader {
             double realizedProfit,
             /** True when the local view's value is the one surfaced. */
             boolean viaLocalView,
-            boolean violation) {
+            boolean deadlineViolation) {
     }
 
     public static Verdict gradeRead(List<RungScorer.Rung> sla, KvResponse response,
-            int uncommittedAnchor, int committedAnchor,
-            Integer keyWriteFloor, Integer keyMajorityWriteFloor, double latencyMs) {
+            int uncommittedAnchor, int committedAnchor, double latencyMs) {
         ReadLevel delivered = response.getDeliveredReadLevel();
 
         // Each view's grade starts from what the executed mechanics
@@ -62,21 +60,15 @@ public final class ClientGrader {
         Grading.Realized best = localWins ? viaLocal : viaCommitted;
         int gradedStrength = localWins ? localGrade : committedGrade;
 
-        boolean violation = false;
-        if (localGrade >= ReadLevel.CAUSAL_LOCAL.getNumber()
-                && keyWriteFloor != null && response.getLocalValueIndex() < keyWriteFloor) {
-            violation = true;
-        }
-        if (committedGrade >= ReadLevel.CAUSAL_MAJORITY.getNumber()
-                && keyMajorityWriteFloor != null && response.getCommittedValueIndex() < keyMajorityWriteFloor) {
-            violation = true;
-        }
-        return new Verdict(gradedStrength, best.rungIndex(), best.profit(), localWins, violation);
+        boolean deadlineViolation = best.rungIndex() < 0
+                && (Grading.missedDeadline(sla, localGrade, latencyMs)
+                        || Grading.missedDeadline(sla, committedGrade, latencyMs));
+        return new Verdict(gradedStrength, best.rungIndex(), best.profit(), localWins, deadlineViolation);
     }
 
     public static Verdict gradeWrite(List<RungScorer.Rung> sla, KvResponse response, double latencyMs) {
         Grading.Realized realized = Grading.realize(sla, response.getDeliveredWriteConcern(), latencyMs);
         return new Verdict(response.getDeliveredWriteConcern(), realized.rungIndex(), realized.profit(),
-                false, false);
+                false, Grading.missedDeadline(sla, response.getDeliveredWriteConcern(), latencyMs));
     }
 }

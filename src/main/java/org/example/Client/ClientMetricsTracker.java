@@ -21,8 +21,8 @@ import java.util.concurrent.atomic.DoubleAdder;
  *
  * Chosen is what the workload asked for; executed is what the server
  * delivered (fallbacks make them differ). Redirect resends, hard failures,
- * lost requests (no response), and session-guarantee violations are counted
- * per cell.
+ * lost requests (no response), and successful responses that miss every
+ * applicable SLA deadline are counted per cell.
  *
  * Stage 5 adds the four instrumentation streams: predicted vs realized profit
  * (sums per cell; a misprediction is an accounting error, not just a missed
@@ -108,7 +108,7 @@ public final class ClientMetricsTracker {
      * above the SLA's floor, split into free vs waiting by {@code waited}.
      */
     public static void recordResponse(int nodeId, String chosen, String executed, double latencyMs,
-            boolean fellBack, boolean violation, double predictedProfit, double realizedProfit,
+            boolean fellBack, boolean deadlineViolation, double predictedProfit, double realizedProfit,
             int satisfiedRung, boolean upgraded, boolean waited) {
         Cell c = cell(nodeId, chosen, executed);
         c.count.incrementAndGet();
@@ -126,7 +126,7 @@ public final class ClientMetricsTracker {
         if (fellBack) {
             c.fallbacks.incrementAndGet();
         }
-        if (violation) {
+        if (deadlineViolation) {
             c.violations.incrementAndGet();
             runViolations.incrementAndGet();
         }
@@ -243,7 +243,7 @@ public final class ClientMetricsTracker {
                         + "P50Ms,P90Ms,P95Ms,P99Ms,PredictedProfitSum,RealizedProfitSum,"
                         + "UpgradesFree,UpgradesWaiting,"
                         + "SatisfiedRung0,SatisfiedRung1,SatisfiedRung2,SatisfiedRung3,SatisfiedNone,"
-                        + "Fallbacks,Redirects,Failures,Rejected,ShedAtClient,Lost,SessionViolations");
+                        + "Fallbacks,Redirects,Failures,Rejected,ShedAtClient,Lost,Violations");
             }
             for (Map.Entry<Key, Cell> e : cells.entrySet()) {
                 Key k = e.getKey();

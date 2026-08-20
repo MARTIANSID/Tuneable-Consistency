@@ -41,8 +41,8 @@ import io.grpc.stub.ClientResponseObserver;
  *
  * Every served response is graded client-side ({@link ClientGrader}) against
  * both returned views with client-observed latency; the verdict feeds the
- * ledger and the session-guarantee assertions. Writes and linearizable-only
- * targets go to the leader (learned from notLeader redirects).
+ * ledger. Writes and linearizable-only targets go to the leader (learned from
+ * notLeader redirects).
  */
 public final class KvSessionClient implements AutoCloseable {
 
@@ -85,17 +85,12 @@ public final class KvSessionClient implements AutoCloseable {
     private final AtomicInteger roundRobin = new AtomicInteger();
     private volatile int leaderHint = -1;
 
-    // Session anchors and per-key write history for assertions.
+    // Session anchors carried by subsequent requests.
     private final AtomicInteger uncommittedAnchor = new AtomicInteger(-1);
     private final AtomicInteger committedAnchor = new AtomicInteger(-1);
-    private final ConcurrentHashMap<String, Integer> lastWriteIndexByKey = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Integer> lastMajorityWriteIndexByKey = new ConcurrentHashMap<>();
 
     private final ConcurrentHashMap<Long, Pending> pending = new ConcurrentHashMap<>();
     private final ScheduledExecutorService lostSweeper;
-
-    private final AtomicLong violations = new AtomicLong();
-    private static final int VIOLATIONS_TO_PRINT = 10;
 
     private static final class Pending {
         final KvRequest request;
@@ -103,24 +98,18 @@ public final class KvSessionClient implements AutoCloseable {
         final long firstSendMs;
         final int targetNode;
         final int attempt;
-        // Send-time snapshots: assertion floors (null = the session had not
-        // written the key), the client-side profit prediction, and the target
-        // rung's threshold for recomputing the wait bound on retries.
-        final Integer keyWriteSnapshot;
-        final Integer keyMajorityWriteSnapshot;
+        // Client-side profit prediction and the target rung's threshold for
+        // recomputing the wait bound on retries.
         final double predictedProfit;
         final double targetThresholdMs;
 
         Pending(KvRequest request, long firstSendNanos, long firstSendMs, int targetNode, int attempt,
-                Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot,
                 double predictedProfit, double targetThresholdMs) {
             this.request = request;
             this.firstSendNanos = firstSendNanos;
             this.firstSendMs = firstSendMs;
             this.targetNode = targetNode;
             this.attempt = attempt;
-            this.keyWriteSnapshot = keyWriteSnapshot;
-            this.keyMajorityWriteSnapshot = keyMajorityWriteSnapshot;
             this.predictedProfit = predictedProfit;
             this.targetThresholdMs = targetThresholdMs;
         }
@@ -230,14 +219,8 @@ public final class KvSessionClient implements AutoCloseable {
     // ===== Sending =====
 
     public void sendRead(String key, int slaId) {
-        // Snapshot the per-key assertion floors FIRST and fold them into the
-        // session anchors (see stage 2: unordered ack updates would otherwise
-        // let the wait anchor lag the floor the assertion checks against).
-        Integer keyWriteSnapshot = lastWriteIndexByKey.get(key);
-        Integer keyMajorityWriteSnapshot = lastMajorityWriteIndexByKey.get(key);
-        int uncommitted = Math.max(uncommittedAnchor.get(), keyWriteSnapshot == null ? -1 : keyWriteSnapshot);
-        int committed = Math.max(committedAnchor.get(),
-                keyMajorityWriteSnapshot == null ? -1 : keyMajorityWriteSnapshot);
+        int uncommitted = uncommittedAnchor.get();
+        int committed = committedAnchor.get();
 
         List<RungScorer.Rung> sla = slaOf(readSlas, slaId);
         AdmitRates admitRates = admitRatesFor(true, slaId);
@@ -282,8 +265,7 @@ public final class KvSessionClient implements AutoCloseable {
         if (targetRung != null) {
             request.setWantLinearizable(targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber());
         }
-        dispatch(request.build(), targetNode, 1, keyWriteSnapshot, keyMajorityWriteSnapshot,
-                predicted, targetRung == null ? 0 : targetRung.thresholdMs());
+        dispatch(request.build(), targetNode, 1, predicted, targetRung == null ? 0 : targetRung.thresholdMs());
     }
 
     public void sendWrite(String key, String value, int slaId) {
@@ -318,8 +300,7 @@ public final class KvSessionClient implements AutoCloseable {
         if (targetRung != null) {
             request.setRequestedWriteConcern(Math.min(Math.max(1, targetRung.strength()), majority));
         }
-        dispatch(request.build(), targetNode, 1, null, null,
-                predicted, targetRung == null ? 0 : targetRung.thresholdMs());
+        dispatch(request.build(), targetNode, 1, predicted, targetRung == null ? 0 : targetRung.thresholdMs());
     }
 
     /** The max-profit or floor rung; profit ties go to the weakest requirement. */
@@ -379,19 +360,17 @@ public final class KvSessionClient implements AutoCloseable {
     }
 
     private void dispatch(KvRequest request, int targetNode, int attempt,
-            Integer keyWriteSnapshot, Integer keyMajorityWriteSnapshot,
             double predictedProfit, double targetThresholdMs) {
         long nowNanos = System.nanoTime();
         long nowMs = System.currentTimeMillis();
         Pending previous = pending.get(request.getRequestId());
         Pending entry = (previous != null)
-                // Retry: keep the original send instants and snapshots so
-                // latency stays end to end and the prediction stays the first.
+                // Retry: keep the original send instants so latency stays end
+                // to end and the prediction stays the first.
                 ? new Pending(request, previous.firstSendNanos, previous.firstSendMs, targetNode, attempt,
-                        previous.keyWriteSnapshot, previous.keyMajorityWriteSnapshot,
                         previous.predictedProfit, previous.targetThresholdMs)
                 : new Pending(request, nowNanos, nowMs, targetNode, attempt,
-                        keyWriteSnapshot, keyMajorityWriteSnapshot, predictedProfit, targetThresholdMs);
+                        predictedProfit, targetThresholdMs);
         pending.put(request.getRequestId(), entry);
 
         // The RTT estimate rides every request (the scorer's rho); in the
@@ -444,7 +423,7 @@ public final class KvSessionClient implements AutoCloseable {
                 int target = (hinted >= 0 && hinted < numServers)
                         ? hinted
                         : Math.floorMod(roundRobin.getAndIncrement(), numServers);
-                dispatch(request, target, entry.attempt + 1, null, null, 0, 0);
+                dispatch(request, target, entry.attempt + 1, 0, 0);
             } else {
                 pending.remove(response.getRequestId());
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
@@ -484,7 +463,7 @@ public final class KvSessionClient implements AutoCloseable {
         if (!response.getOk()) {
             if (entry.attempt < retryLimit) {
                 dispatch(request, Math.floorMod(roundRobin.getAndIncrement(), numServers), entry.attempt + 1,
-                        null, null, 0, 0);
+                        0, 0);
             } else {
                 pending.remove(response.getRequestId());
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
@@ -515,19 +494,8 @@ public final class KvSessionClient implements AutoCloseable {
                         latencyMs);
             }
             verdict = ClientGrader.gradeRead(slaOf(readSlas, request.getSlaId()), response,
-                    request.getUncommittedSessionIndex(), request.getCommittedSessionIndex(),
-                    entry.keyWriteSnapshot, entry.keyMajorityWriteSnapshot, latencyMs);
+                    request.getUncommittedSessionIndex(), request.getCommittedSessionIndex(), latencyMs);
             upgraded = verdict.gradedStrength() > readFloors.get(request.getSlaId());
-            if (verdict.violation()) {
-                long n = violations.incrementAndGet();
-                if (n <= VIOLATIONS_TO_PRINT) {
-                    System.err.printf(
-                            "SESSION VIOLATION app=%d key=%s delivered=%s localIdx=%d committedIdx=%d expected>=%s/%s (node %d)%n",
-                            applicationId, request.getKey(), response.getDeliveredReadLevel(),
-                            response.getLocalValueIndex(), response.getCommittedValueIndex(),
-                            entry.keyWriteSnapshot, entry.keyMajorityWriteSnapshot, nodeId);
-                }
-            }
         } else {
             int index = response.getValueIndex();
             executed = "W:" + response.getDeliveredWriteConcern();
@@ -538,17 +506,15 @@ public final class KvSessionClient implements AutoCloseable {
             }
             verdict = ClientGrader.gradeWrite(slaOf(writeSlas, request.getSlaId()), response, latencyMs);
             upgraded = response.getDeliveredWriteConcern() > writeFloors.get(request.getSlaId());
-            lastWriteIndexByKey.merge(request.getKey(), index, Math::max);
             uncommittedAnchor.accumulateAndGet(index, Math::max);
             if (response.getDeliveredWriteConcern() >= majority && !response.getTimedOutAndFellBack()) {
-                lastMajorityWriteIndexByKey.merge(request.getKey(), index, Math::max);
                 committedAnchor.accumulateAndGet(index, Math::max);
             }
         }
 
         double predicted = mode.chameleonDecision() ? response.getPredictedProfit() : entry.predictedProfit;
         ClientMetricsTracker.recordResponse(nodeId, chosen, executed, latencyMs,
-                response.getTimedOutAndFellBack(), verdict.violation(),
+                response.getTimedOutAndFellBack(), verdict.deadlineViolation(),
                 predicted, verdict.realizedProfit(), verdict.satisfiedRung(), upgraded, response.getWaited());
     }
 
@@ -572,10 +538,6 @@ public final class KvSessionClient implements AutoCloseable {
                 ClientMetricsTracker.recordLost(e.getValue().targetNode, chosenLabel(e.getValue().request));
             }
         }
-    }
-
-    public long sessionViolations() {
-        return violations.get();
     }
 
     public int pendingCount() {

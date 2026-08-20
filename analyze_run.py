@@ -64,6 +64,8 @@ class Run:
             sys.exit("ERROR: this run's ledger uses the old cumulative schema "
                      "(CountTotal columns); analyze it with analyze_run.py from "
                      "an older git revision")
+        if "Violations" not in self.ledger.columns and "SessionViolations" in self.ledger.columns:
+            self.ledger = self.ledger.rename(columns={"SessionViolations": "Violations"})
         self.t0 = self.ledger["Timestamp"].min()
         self.ledger["Time_s"] = (self.ledger["Timestamp"] - self.t0) / 1000.0
 
@@ -332,7 +334,7 @@ def print_tables(run):
     print(f"lost:              {totals['Lost'].sum():,.0f}")
     print(f"fallbacks:         {totals['Fallbacks'].sum():,.0f}")
     print(f"redirects:         {totals['Redirects'].sum():,.0f}")
-    print(f"violations:        {totals['SessionViolations'].sum():,.0f}")
+    print(f"violations:        {totals['Violations'].sum():,.0f}")
     print(f"predicted profit:  {totals['PredictedProfitSum'].sum():,.0f}")
     print(f"realized profit:   {totals['RealizedProfitSum'].sum():,.0f}")
     print(f"upgrades:          {up_free + up_wait:,.0f}  "
@@ -356,7 +358,7 @@ def print_phase_tables(run):
     has_shed = "ShedAtClient" in run.ledger.columns
     if has_shed:
         outcomes.insert(1, "ShedAtClient")
-    extras = ["Fallbacks", "Redirects", "SessionViolations",
+    extras = ["Fallbacks", "Redirects", "Violations",
               "UpgradesFree", "UpgradesWaiting", "PredictedProfitSum"]
 
     names, edges = [], [0.0]
@@ -393,7 +395,7 @@ def print_phase_tables(run):
         columns["Lost"] = g["Lost"].astype(int)
         columns["Fallbacks"] = g["Fallbacks"].astype(int)
         columns["Redirects"] = g["Redirects"].astype(int)
-        columns["Viol"] = g["SessionViolations"].astype(int)
+        columns["Viol"] = g["Violations"].astype(int)
         columns["ExecRate%"] = (100.0 * g["Count"] / attempted).round(1)
         columns["ExecShare%"] = (100.0 * g["Count"] / phase_served).round(1)
         columns["Upgrades"] = upgrades.astype(int)

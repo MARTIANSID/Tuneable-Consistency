@@ -88,4 +88,18 @@ public final class Grading {
         }
         return bestIndex < 0 ? Realized.NONE : new Realized(bestIndex, bestProfit);
     }
+
+    /** True when at least one rung's consistency is satisfied but all such deadlines were missed. */
+    public static boolean missedDeadline(List<RungScorer.Rung> slaRungs, int gradedStrength, double totalMs) {
+        boolean hasApplicableRung = false;
+        for (RungScorer.Rung rung : slaRungs) {
+            if (gradedStrength >= rung.strength()) {
+                hasApplicableRung = true;
+                if (totalMs <= rung.thresholdMs()) {
+                    return false;
+                }
+            }
+        }
+        return hasApplicableRung;
+    }
 }
