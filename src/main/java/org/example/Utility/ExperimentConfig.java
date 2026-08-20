@@ -43,6 +43,7 @@ public final class ExperimentConfig {
         public Integer numServers;
         public List<String> serverHosts; // one entry per server
         public Integer serverBasePort;   // server i listens on basePort + i + 1
+        public Integer preferredLeaderId; // first-election cue (-1 = none): this node gets a shorter election timeout
     }
 
     /** Mode-independent server mechanics. */
@@ -414,6 +415,11 @@ public final class ExperimentConfig {
                     + cluster.numServers + ") entries, got " + cluster.serverHosts.size());
         }
         requirePositive(cluster.serverBasePort, "cluster.serverBasePort");
+        require(cluster.preferredLeaderId, "cluster.preferredLeaderId");
+        if (cluster.preferredLeaderId < -1 || cluster.preferredLeaderId >= cluster.numServers) {
+            throw new IllegalArgumentException("cluster.preferredLeaderId must be -1 (no preference) or a server id"
+                    + " in 0.." + (cluster.numServers - 1) + ", got " + cluster.preferredLeaderId);
+        }
 
         require(mode, "mode");
         if (!MODES.contains(mode)) {

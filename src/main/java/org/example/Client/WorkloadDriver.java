@@ -500,6 +500,7 @@ public class WorkloadDriver {
             long lastSent = 0;
             long lastServed = 0;
             long lastRejected = 0;
+            long lastShed = 0;
             long lastLost = 0;
             long lastViolations = 0;
             double lastPredicted = 0;
@@ -519,19 +520,22 @@ public class WorkloadDriver {
                     long sent = totalInjected.sum();
                     long served = ClientMetricsTracker.totalResponses();
                     long rejectedNow = ClientMetricsTracker.totalRejected();
+                    long shedNow = ClientMetricsTracker.totalShedAtClient();
                     long lostNow = ClientMetricsTracker.totalLost();
                     long violationsNow = ClientMetricsTracker.totalViolations();
                     double predictedNow = ClientMetricsTracker.totalPredictedProfit();
                     double realizedNow = ClientMetricsTracker.totalRealizedProfit();
                     System.out.printf(
-                            "[%02ds] Sent=%d | Served=%d | Rejected=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
+                            "[%02ds] Sent=%d | Served=%d | Rejected=%d | Shed=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
                             elapsedSeconds, sent - lastSent, served - lastServed,
-                            rejectedNow - lastRejected, lostNow - lastLost, violationsNow - lastViolations,
+                            rejectedNow - lastRejected, shedNow - lastShed, lostNow - lastLost,
+                            violationsNow - lastViolations,
                             predictedNow - lastPredicted, realizedNow - lastRealized,
                             phase.name, phase.totalTPS);
                     lastSent = sent;
                     lastServed = served;
                     lastRejected = rejectedNow;
+                    lastShed = shedNow;
                     lastLost = lostNow;
                     lastViolations = violationsNow;
                     lastPredicted = predictedNow;
@@ -556,9 +560,10 @@ public class WorkloadDriver {
             }
             ClientMetricsTracker.flushNow();
             long violations = ClientMetricsTracker.totalViolations();
-            System.out.printf("%nExperiment completed. Sent=%d Responses=%d Rejected=%d Lost=%d SessionViolations=%d%n",
+            System.out.printf(
+                    "%nExperiment completed. Sent=%d Responses=%d Rejected=%d ShedAtClient=%d Lost=%d SessionViolations=%d%n",
                     totalInjected.sum(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalRejected(),
-                    ClientMetricsTracker.totalLost(), violations);
+                    ClientMetricsTracker.totalShedAtClient(), ClientMetricsTracker.totalLost(), violations);
             for (KvSessionClient[] sessions : appSessions) {
                 for (KvSessionClient client : sessions) {
                     client.close();

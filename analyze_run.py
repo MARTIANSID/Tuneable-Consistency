@@ -7,9 +7,9 @@ Data sources (per run directory):
   client_metrics_global.csv  client-side ledger, one row per (node, chosen,
                              executed) cell per ~1 s interval; counters reset
                              at every flush, so rows are per-interval activity
-                             and the P50/P95/P99 columns are that interval's
-                             percentiles - all cross-arm comparison numbers
-                             come from here
+                             and the P50/P90/P95/P99 columns are that
+                             interval's percentiles - all cross-arm comparison
+                             numbers come from here
   occupancy_<n>.csv          per node, per control interval: utilization U,
                              average in-flight, shadow price lambda
   config.yaml                the exact config of this run (mode, phases)
@@ -98,17 +98,30 @@ class Run:
         out["dt_s"] = out["Timestamp"].diff().fillna(1000) / 1000.0
         return out
 
+    def percentile_cols(self):
+        """The typical-latency percentile columns this ledger has: P90Ms only
+        exists in runs recorded after it was added to the tracker."""
+        return ["P50Ms"] + (["P90Ms"] if "P90Ms" in self.ledger.columns else [])
+
     def whole_run(self):
         """Whole-run totals per cell: the sum of every interval row."""
         sum_cols = [c for c in self.ledger.columns
                     if c not in CELL_KEY + ["Timestamp", "Time_s", "AvgLatencyMs",
-                                            "P50Ms", "P95Ms", "P99Ms"]]
+                                            "P50Ms", "P90Ms", "P95Ms", "P99Ms"]]
         df = self.ledger.copy()
         df["LatencySum"] = df["AvgLatencyMs"] * df["Count"]
         agg = df.groupby(CELL_KEY)[sum_cols + ["LatencySum"]].sum().reset_index()
         agg["AvgLatencyMs"] = agg["LatencySum"] / agg["Count"].clip(lower=1)
-        # Percentiles cannot be merged across intervals; report the worst
-        # (count-weighted percentiles would need the raw buckets).
+        # True percentiles cannot be merged across intervals (that would need
+        # the raw buckets): P50/P90 are reported as the count-weighted mean of
+        # the per-interval percentiles (a "typical interval" figure), P95/P99
+        # as the worst interval.
+        for col in self.percentile_cols():
+            df[col + "_w"] = df[col] * df["Count"]
+            weighted = df.groupby(CELL_KEY)[col + "_w"].sum().reset_index()
+            agg = agg.merge(weighted, on=CELL_KEY)
+            agg[col] = agg[col + "_w"] / agg["Count"].clip(lower=1)
+            agg = agg.drop(columns=[col + "_w"])
         worst = df.groupby(CELL_KEY)[["P95Ms", "P99Ms"]].max().reset_index()
         return agg.merge(worst, on=CELL_KEY)
 
@@ -129,12 +142,19 @@ def style(ax, xlabel, ylabel, title):
 
 
 def plot_throughput(run, out):
-    rates = run.interval_rates(["Count", "Rejected", "Lost", "Fallbacks"])
+    cols = ["Count", "Rejected", "Lost", "Fallbacks"]
+    has_shed = "ShedAtClient" in run.ledger.columns
+    if has_shed:
+        cols.append("ShedAtClient")
+    rates = run.interval_rates(cols)
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(rates["Time_s"], rates["Count"] / rates["dt_s"], label="served/s",
             color=PALETTE[0], **LINE)
     ax.plot(rates["Time_s"], rates["Rejected"] / rates["dt_s"], label="rejected/s",
             color=PALETTE[1], **LINE)
+    if has_shed:
+        ax.plot(rates["Time_s"], rates["ShedAtClient"] / rates["dt_s"], label="shed at client/s",
+                color=PALETTE[2], **LINE)
     ax.plot(rates["Time_s"], rates["Fallbacks"] / rates["dt_s"], label="fallbacks/s",
             color=PALETTE[3], **LINE)
     run.phase_lines(ax)
@@ -206,16 +226,24 @@ def plot_level_mix(run, out):
 
 
 def plot_latency(run, out):
+    # Count-weighted P50/P90 across the interval's cells (an approximation of
+    # the pooled percentile; exact pooling would need the raw buckets).
+    cols = run.percentile_cols()
     lat = run.ledger.copy()
-    lat["LatencySum"] = lat["AvgLatencyMs"] * lat["Count"]
-    by_t = lat.groupby("Timestamp")[["LatencySum", "Count"]].sum()
-    by_t["avg_ms"] = by_t["LatencySum"] / by_t["Count"].clip(lower=1)
+    for col in cols:
+        lat[col + "_w"] = lat[col] * lat["Count"]
+    by_t = lat.groupby("Timestamp")[[c + "_w" for c in cols] + ["Count"]].sum()
+    for col in cols:
+        by_t[col] = by_t[col + "_w"] / by_t["Count"].clip(lower=1)
     by_t.index = (by_t.index - run.t0) / 1000.0
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(by_t.index, by_t["avg_ms"], color=PALETTE[6], **LINE)
+    for col, color in zip(cols, [PALETTE[0], PALETTE[6]]):
+        ax.plot(by_t.index, by_t[col],
+                label=col.replace("Ms", "").lower(), color=color, **LINE)
     run.phase_lines(ax)
-    style(ax, "time [s]", "avg latency [ms]",
-          f"Client-observed average latency per interval ({run.mode})")
+    style(ax, "time [s]", "latency [ms]",
+          f"Client-observed latency per interval ({run.mode})")
+    ax.legend()
     fig.tight_layout()
     if out:
         fig.savefig(out("latency.png"), dpi=120)
@@ -278,10 +306,11 @@ def plot_leadership(run, out):
 def print_tables(run):
     totals = run.whole_run()
 
-    print("\n--- Latency per busy cell (whole run; P95/P99 = worst 1 s interval) ---")
+    print("\n--- Latency per busy cell (whole run; P50/P90 = count-weighted "
+          "interval percentiles, P95/P99 = worst 1 s interval) ---")
     busy = totals[totals["Count"] > 0.01 * totals["Count"].sum()]
-    cols = ["NodeId", "ChosenLevel", "ExecutedLevel", "Count",
-            "AvgLatencyMs", "P95Ms", "P99Ms"]
+    cols = (["NodeId", "ChosenLevel", "ExecutedLevel", "Count"]
+            + run.percentile_cols() + ["P95Ms", "P99Ms"])
     print(busy.sort_values("Count", ascending=False)[cols].to_string(index=False))
 
     print("\n--- Satisfied rung per chosen SLA (the Pileus head-to-head metric) ---")
@@ -298,6 +327,8 @@ def print_tables(run):
     print("=" * 64)
     print(f"served:            {served:,.0f}  ({served / max(duration_s, 1):,.0f}/s avg)")
     print(f"rejected:          {totals['Rejected'].sum():,.0f}")
+    if "ShedAtClient" in totals.columns:
+        print(f"shed at client:    {totals['ShedAtClient'].sum():,.0f}")
     print(f"lost:              {totals['Lost'].sum():,.0f}")
     print(f"fallbacks:         {totals['Fallbacks'].sum():,.0f}")
     print(f"redirects:         {totals['Redirects'].sum():,.0f}")
@@ -309,6 +340,76 @@ def print_tables(run):
     for node, df in sorted(run.occupancy.items()):
         print(f"node {node}: meanU={df['U'].mean():.3f}  maxU={df['U'].max():.2f}  "
               f"maxLambda={df['Lambda'].max():.4f}")
+
+
+def print_phase_tables(run):
+    """Per-phase, per-subSLA accounting. For every phase and every subSLA
+    (ChosenLevel, e.g. R:A1S1): the outcome counts, average served/s over the
+    phase, the execution rate (served / its own attempts), its share of the
+    phase's served requests, upgrades and their free fraction, predicted and
+    realized profit, and its share of the phase's realized profit."""
+    if not run.phases:
+        return
+    # Terminal outcomes (the ExecRate denominator); redirects/fallbacks/
+    # violations describe served requests, upgrades split by waiting.
+    outcomes = ["Count", "Rejected", "Lost"]
+    has_shed = "ShedAtClient" in run.ledger.columns
+    if has_shed:
+        outcomes.insert(1, "ShedAtClient")
+    extras = ["Fallbacks", "Redirects", "SessionViolations",
+              "UpgradesFree", "UpgradesWaiting", "PredictedProfitSum"]
+
+    names, edges = [], [0.0]
+    for i, p in enumerate(run.phases):
+        names.append(p.get("name", f"phase{i}"))
+        edges.append(edges[-1] + p["durationSeconds"])
+    # Interval rows are stamped at flush time; the drain tail after the last
+    # phase's configured end counts into the last phase.
+    bins = edges[:-1] + [float("inf")]
+    phase_idx = pd.cut(run.ledger["Time_s"], bins=bins, labels=False, right=False)
+    t_max = run.ledger["Time_s"].max()
+
+    for i, name in enumerate(names):
+        sub = run.ledger[phase_idx == i]
+        if sub.empty:
+            continue
+        g = sub.groupby("ChosenLevel")[outcomes + extras + ["RealizedProfitSum"]].sum()
+        g = g[(g[outcomes].sum(axis=1) > 0) | (g["RealizedProfitSum"] > 0)]
+        if g.empty:
+            continue
+        attempted = g[outcomes].sum(axis=1).clip(lower=1)
+        phase_served = max(g["Count"].sum(), 1)
+        phase_profit = g["RealizedProfitSum"].sum()
+        # Rates use the phase's observed span: a cut-short run ends early, and
+        # the last phase includes its drain tail.
+        duration = max((t_max if i == len(names) - 1 else min(edges[i + 1], t_max)) - edges[i], 1.0)
+        upgrades = g["UpgradesFree"] + g["UpgradesWaiting"]
+
+        columns = {"Served": g["Count"].astype(int)}
+        columns["Served/s"] = (g["Count"] / duration).round(0).astype(int)
+        columns["Rejected"] = g["Rejected"].astype(int)
+        if has_shed:
+            columns["Shed"] = g["ShedAtClient"].astype(int)
+        columns["Lost"] = g["Lost"].astype(int)
+        columns["Fallbacks"] = g["Fallbacks"].astype(int)
+        columns["Redirects"] = g["Redirects"].astype(int)
+        columns["Viol"] = g["SessionViolations"].astype(int)
+        columns["ExecRate%"] = (100.0 * g["Count"] / attempted).round(1)
+        columns["ExecShare%"] = (100.0 * g["Count"] / phase_served).round(1)
+        columns["Upgrades"] = upgrades.astype(int)
+        columns["Free%"] = (100.0 * g["UpgradesFree"] / upgrades.clip(lower=1)).round(1)
+        columns["PredProfit"] = g["PredictedProfitSum"].round(0).astype(int)
+        columns["Profit"] = g["RealizedProfitSum"].round(0).astype(int)
+        columns["ProfitShare%"] = (100.0 * g["RealizedProfitSum"]
+                                   / (phase_profit if phase_profit > 0 else 1)).round(1)
+        table = pd.DataFrame(columns)
+        table.index.name = "SubSLA"
+
+        end = "end" if bins[i + 1] == float("inf") else f"{edges[i + 1]:.0f}s"
+        print(f"\n--- Phase {name} (t={edges[i]:.0f}s-{end}): "
+              f"served={g['Count'].sum():,.0f} ({phase_served / duration:,.0f}/s)  "
+              f"profit={phase_profit:,.0f} ---")
+        print(table.sort_values("Profit", ascending=False).to_string())
 
 
 def main():
@@ -351,6 +452,7 @@ def main():
         print(f"wrote 7 figures to {out_dir}/")
 
     print_tables(run)
+    print_phase_tables(run)
 
     if not save:
         plt.show()

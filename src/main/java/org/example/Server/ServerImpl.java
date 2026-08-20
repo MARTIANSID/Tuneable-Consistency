@@ -17,6 +17,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -96,17 +97,26 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final List<ManagedChannel> ownedChannels = Collections.synchronizedList(new ArrayList<>());
 
     private static final int HEARTBEAT_INTERVAL_MS = 20;
-    private static final int MAX_ENTRIES_PER_RPC = 10000;
+    private static final int MAX_ENTRIES_PER_RPC = 4000;
     private static final int ELECTION_TIMEOUT_BASE_MS = 2000;
     private static final int ELECTION_TIMEOUT_JITTER_MS = 700;
 
     // Cluster wiring (from config; see ExperimentConfig.cluster)
     private static volatile List<String> SERVER_HOSTS = List.of("localhost", "localhost", "localhost");
     private static volatile int SERVER_BASE_PORT = 8000;
+    // First-election cue (-1 = none): the preferred node runs a shorter,
+    // jitter-free election timeout, so it reliably times out and wins the
+    // first election while every other node still sleeps; its heartbeats then
+    // keep their timers suppressed. A cue, not a constraint - Raft safety is
+    // untouched and any node can win once the preferred one is down. The
+    // preference also reapplies on timer resets, so a recovered preferred
+    // node tends to win the leadership back at the next election it sees.
+    private static volatile int PREFERRED_LEADER_ID = -1;
 
     /** Apply cluster configuration. Must run before any ServerImpl is constructed. */
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
         applyClusterSettings(config.cluster.serverHosts, config.cluster.serverBasePort);
+        PREFERRED_LEADER_ID = config.cluster.preferredLeaderId;
     }
 
     /** Point the peer stubs at a cluster without a full config (tests use this directly). */
@@ -140,8 +150,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
         this.waitScheduler = Executors.newScheduledThreadPool(1);
         this.electionTimer = new CustomTimer(this::startElection,
-                ELECTION_TIMEOUT_BASE_MS + new Random().nextInt(ELECTION_TIMEOUT_JITTER_MS), TimeUnit.MILLISECONDS);
+                electionTimeoutMs(serverId), TimeUnit.MILLISECONDS);
         this.electionTimer.start();
+    }
+
+    private static int electionTimeoutMs(int serverId) {
+        if (serverId == PREFERRED_LEADER_ID) {
+            return ELECTION_TIMEOUT_BASE_MS / 2;
+        }
+        return ELECTION_TIMEOUT_BASE_MS + new Random().nextInt(ELECTION_TIMEOUT_JITTER_MS);
     }
 
     public void setUpStubs() {
@@ -622,6 +639,43 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
 
     // ===== Replication =====
 
+    // Batch-fill visibility: the leader prints one line per second summarizing
+    // the AppendEntries batches it sent, so a run shows whether rounds are
+    // full (pipeline-bound at MAX_ENTRIES_PER_RPC) or starved (intake-bound).
+    // Per-RPC printing would be rounds x followers lines per second.
+    private final AtomicLong batchRpcsLastSecond = new AtomicLong();
+    private final AtomicLong batchEntriesLastSecond = new AtomicLong();
+    private final AtomicLong batchBytesLastSecond = new AtomicLong();
+    private final AtomicLong batchMaxLastSecond = new AtomicLong();
+    private final AtomicLong batchMaxBytesLastSecond = new AtomicLong();
+    private final AtomicLong batchLastPrintMs = new AtomicLong(System.currentTimeMillis());
+
+    private void recordAppendEntriesBatch(int entries, int serializedBytes) {
+        batchRpcsLastSecond.incrementAndGet();
+        batchEntriesLastSecond.addAndGet(entries);
+        batchBytesLastSecond.addAndGet(serializedBytes);
+        batchMaxLastSecond.accumulateAndGet(entries, Math::max);
+        batchMaxBytesLastSecond.accumulateAndGet(serializedBytes, Math::max);
+        long now = System.currentTimeMillis();
+        long last = batchLastPrintMs.get();
+        if (now - last >= 1000 && batchLastPrintMs.compareAndSet(last, now)) {
+            long rpcs = batchRpcsLastSecond.getAndSet(0);
+            long sum = batchEntriesLastSecond.getAndSet(0);
+            long bytes = batchBytesLastSecond.getAndSet(0);
+            long max = batchMaxLastSecond.getAndSet(0);
+            long maxBytes = batchMaxBytesLastSecond.getAndSet(0);
+            if (sum > 0) {
+                System.out.printf(
+                        "[replication] appendEntries last %ds: rpcs=%d entries=%d avgBatch=%.0f maxBatch=%d"
+                                + " bytes=%.2fMB avgRpc=%.1fKB maxRpc=%.1fKB cap=%d%n",
+                        Math.round((now - last) / 1000.0), rpcs, sum,
+                        (double) sum / Math.max(1, rpcs), max,
+                        bytes / 1e6, bytes / 1e3 / Math.max(1, rpcs), maxBytes / 1e3,
+                        MAX_ENTRIES_PER_RPC);
+            }
+        }
+    }
+
     private void sendAppendEntries() {
         sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
             if (shouldDropServerNetworkTraffic() || status != ServerCurrentStatus.LEADER) {
@@ -674,6 +728,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                             .setPrevLogTerm(prevLogTerm)
                             .addAllEntries(protoEntries)
                             .build();
+
+                    // getSerializedSize is memoized; the transport computes it
+                    // anyway when the message is framed.
+                    recordAppendEntriesBatch(protoEntries.size(), request.getSerializedSize());
 
                     if (shouldDropServerNetworkTraffic()) {
                         return;

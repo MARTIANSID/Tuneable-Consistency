@@ -10,6 +10,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -21,7 +22,8 @@ import org.example.raft.ReadLevel;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 
 /**
  * One application session against the cluster. Owns a stream per server, the
@@ -70,7 +72,11 @@ public final class KvSessionClient implements AutoCloseable {
     private final Map<Integer, Integer> writeFloors;
 
     private final List<ManagedChannel> channels = new ArrayList<>();
-    private final StreamObserver<KvRequest>[] streams;
+    private final ClientCallStreamObserver<KvRequest>[] streams;
+    // A stream sheds on a full send window only after it has been ready once:
+    // channels connect lazily, and shedding during the initial handshake
+    // would drop traffic a moment of patience delivers.
+    private final AtomicBoolean[] streamEverReady;
     private final Object[] streamLocks;
     private final RttEstimator rttEstimator;
     private final PileusSelector selector; // null unless the mode routes with Pileus
@@ -140,7 +146,8 @@ public final class KvSessionClient implements AutoCloseable {
         this.explorationFraction = explorationFraction;
         this.readAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.readSlas, admitRateGamma) : null;
         this.writeAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.writeSlas, admitRateGamma) : null;
-        this.streams = new StreamObserver[numServers];
+        this.streams = new ClientCallStreamObserver[numServers];
+        this.streamEverReady = new AtomicBoolean[numServers];
         this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
         this.selector = mode.pileusRouting()
@@ -154,7 +161,17 @@ public final class KvSessionClient implements AutoCloseable {
                     .usePlaintext().build();
             channels.add(channel);
             streamLocks[i] = new Object();
-            streams[i] = KvClientGrpc.newStub(channel).session(new StreamObserver<>() {
+            streamEverReady[i] = new AtomicBoolean(false);
+            // ClientResponseObserver exposes the request stream's flow-control
+            // view (isReady): dispatch sheds instead of buffering when the
+            // transport's send window is full.
+            KvClientGrpc.newStub(channel).session(new ClientResponseObserver<KvRequest, KvResponse>() {
+                @Override
+                public void beforeStart(ClientCallStreamObserver<KvRequest> requestStream) {
+                    streams[nodeId] = requestStream;
+                    requestStream.setOnReadyHandler(() -> streamEverReady[nodeId].set(true));
+                }
+
                 @Override
                 public void onNext(KvResponse response) {
                     handleResponse(nodeId, response);
@@ -387,7 +404,20 @@ public final class KvSessionClient implements AutoCloseable {
         }
         try {
             synchronized (streamLocks[targetNode]) {
-                streams[targetNode].onNext(withRtt.build());
+                ClientCallStreamObserver<KvRequest> stream = streams[targetNode];
+                // Transport backpressure: a full send window means the wire to
+                // this node is saturated. Buffering more would add queue delay,
+                // not throughput - every latency and rho measurement would
+                // absorb the client's own backlog. Shed instead and count it,
+                // so overload shows up as ShedAtClient with honest latencies
+                // rather than as multi-second "in flight" phantoms. Guarded by
+                // everReady so the lazy connection handshake never sheds.
+                if (!stream.isReady() && streamEverReady[targetNode].get()) {
+                    pending.remove(request.getRequestId());
+                    ClientMetricsTracker.recordShedAtClient(targetNode, chosenLabel(request));
+                    return;
+                }
+                stream.onNext(withRtt.build());
             }
         } catch (RuntimeException e) {
             // Stream unusable (node down): the sweeper scores it as lost.

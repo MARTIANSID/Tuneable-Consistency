@@ -31,6 +31,12 @@ cluster:
     - localhost
     - localhost
   serverBasePort: 8000
+  # First-election cue: this node runs a shorter, jitter-free election
+  # timeout, so it reliably wins the first election (EXPERIMENT.md puts the
+  # leader in region A = node 0; set to -1 for the default random election).
+  # A cue, not a constraint: if the node fails, the others elect normally,
+  # and Raft safety is untouched.
+  preferredLeaderId: 0
 
 # Mode-independent server mechanics (apply to every arm).
 server:
@@ -43,11 +49,11 @@ server:
   # flight the node is calibrated for (sweep_smax.sh measures it at the
   # latency knee). Utilization u = slot-time / (sMax * interval); the hard
   # admission cap rejects outright above 1.5x sMax in-flight - in every mode.
-  sMax: 10000
+  sMax: 4500
   # Leader-side write admission: entries per second charged one per admitted
   # write, refilled continuously, never returned. Calibrated from the
   # measured max commit rate (sweep_smax.sh, ~80% of it). Universal.
-  replicationBudgetPerSecond: 200000
+  replicationBudgetPerSecond: 160000
   # Followers may serve linearizable reads by fetching a confirmed read index
   # from the leader (batched rounds) and waiting for their own commit index
   # to catch up. Relieves leader concentration at the cost of an extra hop.
@@ -113,88 +119,110 @@ client:
 # (at majority the write is committed and closes the loss window).
 # At most 4 rungs per SLA (the client ledger's satisfied-rung columns are fixed).
 slas:
-  # A1: online shopping. Almost everything is browsing, worth little and
-  # stale-tolerant; checkouts must reflect what the shopper just added and
-  # pay 10-40x a browse. Two read SLAs in one application make value-ordered
-  # shedding observable inside a single app, on the same node, from the same
-  # session pool, over the same key range: under load the price should
-  # reject browses while checkouts are still being upgraded.
+  # A1: online shopping (EXPERIMENT.md). Almost everything is browsing, worth
+  # little and stale-tolerant; checkouts must reflect what the shopper just
+  # added and pay far more. Three read SLAs make value-ordered shedding
+  # observable inside one application (slaId 3 is active only during flash
+  # segments). Thresholds sit above the geo level costs so no rung is dead.
   - applicationId: 1
     read:
+      # slaId 1, browsing: prefers session-consistent catalogue data, accepts
+      # anything committed, accepts anything at all rather than nothing. The
+      # only place eventual-majority appears.
       - slaId: 1
         rungs:
           - level: CAUSAL_LOCAL
-            latencyMs: 30
-            profit: 2
+            latencyMs: 40
+            profit: 5
+          - level: EVENTUAL_MAJORITY
+            latencyMs: 40
+            profit: 4
           - level: EVENTUAL_LOCAL
-            latencyMs: 30
+            latencyMs: 200
             profit: 1.5
-          - level: EVENTUAL_LOCAL
-            latencyMs: 150
-            profit: 0.5
+      # slaId 2, checkout: the cart must reflect what the shopper just added
+      # and must not reflect state that later rolls back.
       - slaId: 2
         rungs:
           - level: CAUSAL_MAJORITY
-            latencyMs: 20
-            profit: 20
+            latencyMs: 60
+            profit: 50
           - level: CAUSAL_LOCAL
-            latencyMs: 20
-            profit: 15
+            latencyMs: 60
+            profit: 38
           - level: EVENTUAL_LOCAL
-            latencyMs: 20
-            profit: 8
+            latencyMs: 60
+            profit: 15
+      # slaId 3, flash checkout: active only during flash segments. The floor
+      # rises to majority-committed (no eventual rung - the application would
+      # rather be refused than oversell), patience rises with it, profit only
+      # modestly above ordinary checkout. The one segment where the price
+      # cannot economise by downgrading; admission is the only lever.
+      - slaId: 3
+        rungs:
+          - level: LINEARIZABLE
+            latencyMs: 300
+            profit: 70
+          - level: CAUSAL_MAJORITY
+            latencyMs: 300
+            profit: 52
+          - level: CAUSAL_MAJORITY
+            latencyMs: 1500
+            profit: 30
+    # Adding to a cart should be acknowledged instantly; the order record
+    # itself must be durable.
     write:
       - slaId: 1
         rungs:
           - concern: 3
-            latencyMs: 50
-            profit: 4
+            latencyMs: 200
+            profit: 12
           - concern: 1
-            latencyMs: 20
-            profit: 3
+            latencyMs: 40
+            profit: 8
           - concern: 1
-            latencyMs: 100
-            profit: 1
-  # A2: advertising-funded search/news feed. Consistency requirement never
-  # changes; revenue falls as latency rises, so the read ladder varies only
-  # in the deadline (Terry's consistency-favouring class). Writes are rare
-  # billing events that always demand full durability: every write rung
-  # requires wc:majority, so A2 never contributes an upgrade decision, only
-  # expensive load - the greedy neighbour the price must contain.
+            latencyMs: 200
+            profit: 2
+  # A2: advertising-funded search/news feed. Results may be stale but the
+  # reader must not see their own feed go backwards: session ordering, not
+  # durability, so causal-local everywhere and the ladder varies only in the
+  # deadline (Terry's consistency-favouring class). Writes are rare billing
+  # events that always demand full durability - the greedy neighbour the
+  # price must contain.
   - applicationId: 2
     read:
       - slaId: 1
         rungs:
-          - level: CAUSAL_MAJORITY
-            latencyMs: 10
-            profit: 10
-          - level: CAUSAL_MAJORITY
-            latencyMs: 25
-            profit: 8
-          - level: CAUSAL_MAJORITY
-            latencyMs: 50
+          - level: CAUSAL_LOCAL
+            latencyMs: 20
             profit: 5
-          - level: CAUSAL_MAJORITY
-            latencyMs: 200
-            profit: 0.5
+          - level: CAUSAL_LOCAL
+            latencyMs: 50
+            profit: 4
+          - level: CAUSAL_LOCAL
+            latencyMs: 120
+            profit: 2.5
+          - level: CAUSAL_LOCAL
+            latencyMs: 400
+            profit: 0.25
     write:
       - slaId: 1
         rungs:
           - concern: 3
-            latencyMs: 30
-            profit: 10
-          - concern: 3
-            latencyMs: 100
-            profit: 7
+            latencyMs: 120
+            profit: 18
           - concern: 3
             latencyMs: 300
-            profit: 3
+            profit: 12
           - concern: 3
-            latencyMs: 1000
-            profit: 0.5
-  # A3: login and credential checking. Try a fast weak read first, fall back
-  # to an authoritative one: linearizable-fast beats eventual-fast beats
-  # linearizable-slow. Two rungs share the 30ms threshold, so a linearizable
+            latencyMs: 800
+            profit: 5
+          - concern: 3
+            latencyMs: 2000
+            profit: 0.6
+  # A3: login and credential checking. Fast weak read first, authoritative
+  # fallback if the check fails: linearizable-fast beats eventual-fast beats
+  # linearizable-slow. Two rungs share the 150ms threshold, so a linearizable
   # result must claim the higher-paying one (the only SLA exercising that
   # deduplication). Writes are password changes / session records with a
   # real graded durability tradeoff, and the only place wc:2 appears.
@@ -203,55 +231,57 @@ slas:
       - slaId: 1
         rungs:
           - level: LINEARIZABLE
-            latencyMs: 30
-            profit: 10
+            latencyMs: 150
+            profit: 9
           - level: EVENTUAL_LOCAL
-            latencyMs: 30
-            profit: 5
+            latencyMs: 150
+            profit: 4.5
           - level: LINEARIZABLE
-            latencyMs: 200
-            profit: 3
+            latencyMs: 600
+            profit: 2
     write:
       - slaId: 1
         rungs:
           - concern: 3
-            latencyMs: 40
-            profit: 10
+            latencyMs: 150
+            profit: 15
           - concern: 2
-            latencyMs: 40
-            profit: 7
+            latencyMs: 120
+            profit: 10
           - concern: 1
             latencyMs: 40
-            profit: 5
+            profit: 6
           - concern: 3
-            latencyMs: 300
-            profit: 3
-  # A4: payments and account balances. Low volume, high stakes: a stale
-  # balance or a lost acknowledged transfer is a real financial loss, so
-  # every rung is worth an order of magnitude more than anything else. A4
-  # should still be served and upgraded at prices that shed everyone else.
+            latencyMs: 600
+            profit: 4
+  # A4: payments and account balances. Low volume, high stakes; the value
+  # lives in the writes and the consistency floor rather than a blanket
+  # multiplier (a balance read gates the same transaction as a checkout
+  # read, but a transfer acknowledged and then lost is in a class of its
+  # own). A4 should still be served and upgraded at prices that have shed
+  # everyone else.
   - applicationId: 4
     read:
       - slaId: 1
         rungs:
           - level: LINEARIZABLE
-            latencyMs: 50
-            profit: 100
-          - level: CAUSAL_MAJORITY
-            latencyMs: 50
-            profit: 20
-          - level: CAUSAL_MAJORITY
             latencyMs: 200
-            profit: 10
+            profit: 50
+          - level: CAUSAL_MAJORITY
+            latencyMs: 100
+            profit: 30
+          - level: CAUSAL_MAJORITY
+            latencyMs: 400
+            profit: 12
     write:
       - slaId: 1
         rungs:
           - concern: 3
-            latencyMs: 100
-            profit: 100
+            latencyMs: 250
+            profit: 150
           - concern: 3
-            latencyMs: 500
-            profit: 40
+            latencyMs: 1000
+            profit: 60
 
 # Failure injection: drop all inter-server RPCs on one node from the start.
 nodeFailure:
@@ -303,7 +333,7 @@ workload:
   # and each request picks a session uniformly within its application.
   # Sessions persist across phases, so history carries forward. Only the
   # metrics ledger is shared.
-  sessionsPerApplication: 50
+  sessionsPerApplication: 100
   # Threads injecting the workload. One thread caps at roughly 200-400k
   # requests/s (per-request cost on a single core); the configured TPS is
   # split evenly across threads each 100ms tick. Sessions are sharded across
@@ -319,9 +349,13 @@ workload:
   # they are normalised over all entries, not per application); every entry
   # must reference an SLA registered above. The consistency-level mix is
   # never configured: the active decision policy chooses the rung per request.
+  # Scenario mixes (EXPERIMENT.md): each is a day in the life of the platform
+  # rather than a synthetic knob setting, which is why composition and rate
+  # move together in the phase schedule below.
   mixes:
-    # The default. Roughly 13% writes.
-    balanced:
+    # An ordinary day: overwhelmingly browsing, a trickle of checkouts,
+    # steady logins, payments the thinnest stream (~13% writes).
+    normal:
       - { applicationId: 1, type: read,  slaId: 1, weight: 32 }   # browse
       - { applicationId: 1, type: read,  slaId: 2, weight: 4 }    # checkout
       - { applicationId: 1, type: write, slaId: 1, weight: 4 }
@@ -331,58 +365,119 @@ workload:
       - { applicationId: 3, type: write, slaId: 1, weight: 6 }
       - { applicationId: 4, type: read,  slaId: 1, weight: 4 }
       - { applicationId: 4, type: write, slaId: 1, weight: 1 }
-    # Write weights tripled, roughly 31% writes: drives replication lag up so
-    # causal upgrades that were free start having to wait, at unchanged load.
-    writeHeavy:
-      - { applicationId: 1, type: read,  slaId: 1, weight: 25 }
-      - { applicationId: 1, type: read,  slaId: 2, weight: 3 }
-      - { applicationId: 1, type: write, slaId: 1, weight: 10 }
-      - { applicationId: 2, type: read,  slaId: 1, weight: 27 }
-      - { applicationId: 2, type: write, slaId: 1, weight: 5 }
-      - { applicationId: 3, type: read,  slaId: 1, weight: 11 }
-      - { applicationId: 3, type: write, slaId: 1, weight: 14 }
-      - { applicationId: 4, type: read,  slaId: 1, weight: 3 }
-      - { applicationId: 4, type: write, slaId: 1, weight: 2 }
-    # A4 and A1-checkout tripled: high-value traffic rises from 9% to 23% at
-    # the same request rate. Tests whether the price responds to what the
-    # work is worth rather than only to how much of it there is.
-    valueHeavy:
-      - { applicationId: 1, type: read,  slaId: 1, weight: 27 }
-      - { applicationId: 1, type: read,  slaId: 2, weight: 10 }
-      - { applicationId: 1, type: write, slaId: 1, weight: 3 }
-      - { applicationId: 2, type: read,  slaId: 1, weight: 28 }
+    # Weeks before Christmas: shopping displaces feed reading, conversion
+    # creeps up, everything else follows. The system simply runs hot.
+    holiday:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 38 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 6 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 5 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 26 }
       - { applicationId: 2, type: write, slaId: 1, weight: 2 }
       - { applicationId: 3, type: read,  slaId: 1, weight: 12 }
       - { applicationId: 3, type: write, slaId: 1, weight: 5 }
-      - { applicationId: 4, type: read,  slaId: 1, weight: 10 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 5 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 1 }
+    # Prime Day / 11.11: far more browsing converts, cart writes multiply,
+    # payments follow, the feed is ignored. Volume and value rise together.
+    saleDay:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 26 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 14 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 12 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 16 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 2 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 12 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 6 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 9 }
       - { applicationId: 4, type: write, slaId: 1, weight: 3 }
-  # The phase run tests adaptation (a static load sweep is a separate
-  # experiment). TPS values are fractions of the measured capacity C = 60000
-  # (the sweep's latency knee): 0.4C = 24000, 0.8C = 48000, 1.5C = 90000.
-  # Light2 repeats Light exactly so recovery is measurable: does the price
-  # fall back and do upgrades resume at the Light level.
+    # Minutes before a flash sale: everyone signs in to position themselves.
+    # A3 is write-heavy, so replication lag climbs right before the burst
+    # (~25% writes).
+    preFlash:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 18 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 3 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 2 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 8 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 1 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 40 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 20 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 6 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 2 }
+    # A one-dollar car at noon: browsing collapses, the feed is abandoned,
+    # almost everything is a checkout attempt under the flash SLA (A1 slaId
+    # 3), logins still heavy under their ordinary ladder, payments a trickle
+    # because only the winners pay (~27% writes).
+    flash:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 5 }
+      - { applicationId: 1, type: read,  slaId: 3, weight: 45 }   # flash checkout
+      - { applicationId: 1, type: write, slaId: 1, weight: 20 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 2 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 1 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 18 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 5 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 3 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 1 }
+    # Immediately after: load falls off a cliff, losers drift back to
+    # browsing, winners pay, so payments are briefly elevated.
+    collapse:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 25 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 6 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 5 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 20 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 1 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 15 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 6 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 15 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 7 }
+    # End of month: balances and transfers surge while browsing stays flat.
+    # The mirror image of the greedy-neighbour test - the surging tenant is
+    # the most valuable one, so the price should admit it and shed cheap
+    # browsing to make room.
+    payday:
+      - { applicationId: 1, type: read,  slaId: 1, weight: 22 }
+      - { applicationId: 1, type: read,  slaId: 2, weight: 3 }
+      - { applicationId: 1, type: write, slaId: 1, weight: 3 }
+      - { applicationId: 2, type: read,  slaId: 1, weight: 22 }
+      - { applicationId: 2, type: write, slaId: 1, weight: 1 }
+      - { applicationId: 3, type: read,  slaId: 1, weight: 10 }
+      - { applicationId: 3, type: write, slaId: 1, weight: 4 }
+      - { applicationId: 4, type: read,  slaId: 1, weight: 25 }
+      - { applicationId: 4, type: write, slaId: 1, weight: 10 }
+  # The day sequence (EXPERIMENT.md): one continuous run, sessions persist
+  # throughout so history and lag carry across segments. Rates are fractions
+  # of measured capacity C = 200000 (recalibrate C per deployment and scale
+  # these together). The cluster is provisioned for ordinary peak plus
+  # headroom, not for the flash sale: normal sits at 0.5C and the sale day
+  # exceeds C.
   phases:
-    - name: Light           # price near its floor, nearly everything upgrades
+    - name: NormalDay       # baseline: price on its floor, upgrades free
       durationSeconds: 60
-      totalTPS: 24000
-      mix: balanced
-    - name: WriteSurge      # composition alone moves the mechanism: lag grows, free upgrades become waiting ones
+      totalTPS: 150000      # 0.5C
+      mix: normal
+    - name: HolidayPlateau  # sustained lift; equilibrium, where oscillation would appear
       durationSeconds: 60
-      totalTPS: 24000
-      mix: writeHeavy
-    - name: Medium          # price begins to bind, cheap applications lose upgrades first
+      totalTPS: 240000      # 0.8C
+      mix: holiday
+    - name: SaleDay         # Prime Day scale: rate and value rise together
       durationSeconds: 60
-      totalTPS: 48000
-      mix: balanced
-    - name: ValueSurge      # price responds to value, not volume: browses shed while checkouts still upgrade
+      totalTPS: 540000      # 1.8C
+      mix: saleDay
+    - name: PreFlash        # login surge; write-heavy A3 drives lag up before the burst
+      durationSeconds: 30
+      totalTPS: 300000      # 1.0C
+      mix: preFlash
+    - name: Flash           # ~60% must be refused; floor forbids downgrading
+      durationSeconds: 15
+      totalTPS: 750000      # 2.5C
+      mix: flash
+    - name: Collapse        # load vanishes: does the price come down promptly
+      durationSeconds: 15
+      totalTPS: 210000      # 0.7C
+      mix: collapse
+    - name: Payday          # composition shifts, volume barely does; the valuable tenant surges
       durationSeconds: 60
-      totalTPS: 48000
-      mix: valueHeavy
-    - name: Heavy           # shedding, and it should be in value order, not arrival order
+      totalTPS: 180000      # 0.6C
+      mix: payday
+    - name: ReturnToNormal  # recovery, compared directly against the opening segment
       durationSeconds: 60
-      totalTPS: 90000
-      mix: balanced
-    - name: Light2          # recovery: repeats Light exactly
-      durationSeconds: 60
-      totalTPS: 24000
-      mix: balanced
+      totalTPS: 150000      # 0.5C
+      mix: normal
