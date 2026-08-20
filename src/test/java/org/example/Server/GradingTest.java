@@ -6,6 +6,8 @@ import static org.example.raft.ReadLevel.EVENTUAL_LOCAL;
 import static org.example.raft.ReadLevel.EVENTUAL_MAJORITY;
 import static org.example.raft.ReadLevel.LINEARIZABLE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 
@@ -117,6 +119,14 @@ class GradingTest {
     void realizeReturnsNoneWhenNothingIsMet() {
         assertEquals(Grading.Realized.NONE, Grading.realize(SLA, EVENTUAL_LOCAL.getNumber(), 50));
         assertEquals(Grading.Realized.NONE, Grading.realize(SLA, LINEARIZABLE.getNumber(), 500));
+    }
+
+    @Test
+    void deadlineMissRequiresApplicableConsistencyAndNoDeadlineHit() {
+        assertFalse(Grading.missedDeadline(SLA, EVENTUAL_LOCAL.getNumber(), 500),
+                "insufficient consistency is not a deadline violation");
+        assertFalse(Grading.missedDeadline(SLA, CAUSAL_MAJORITY.getNumber(), 120));
+        assertTrue(Grading.missedDeadline(SLA, CAUSAL_MAJORITY.getNumber(), 200));
     }
 
     @Test

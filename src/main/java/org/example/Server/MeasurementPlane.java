@@ -67,9 +67,9 @@ public final class MeasurementPlane implements AutoCloseable {
     private final ServiceTimeHistograms histograms;
     private final OccupancyMeter occupancy = new OccupancyMeter();
 
-    // Cross-check (development aid from the plan): the sum of service times of
-    // requests completing in the interval approximates the same utilization,
-    // with boundary bias when service times are comparable to the interval.
+    // Cross-check: completed callback service excludes pre-callback queueing,
+    // while the authoritative occupancy integral includes it. The two agree
+    // when callback queueing is negligible, apart from interval boundaries.
     private final DoubleAdder completedServiceMsInterval = new DoubleAdder();
 
     private final AtomicLong cumulativeSlotNanos = new AtomicLong();
@@ -122,9 +122,21 @@ public final class MeasurementPlane implements AutoCloseable {
 
     // ===== Hot path =====
 
-    /** Step 5's on_event(+1): the request holds a slot from here to reply. */
+    /** A deframed request holds a slot from here through its terminal reply. */
     public void requestAdmitted() {
         occupancy.onEvent(1);
+    }
+
+    /** Close slots for deframed messages whose stream ended before their callback began. */
+    public void requestsAbandonedBeforeCallback(int count) {
+        if (count <= 0) {
+            throw new IllegalArgumentException("abandoned request count must be positive, got " + count);
+        }
+        if (count > occupancy.inFlight()) {
+            throw new IllegalStateException("abandoned callback count " + count
+                    + " exceeds total in-flight occupancy " + occupancy.inFlight());
+        }
+        occupancy.onEvent(-count);
     }
 
     /** Step 8's on_event(-1), plus the completed-service cross-check feed. */

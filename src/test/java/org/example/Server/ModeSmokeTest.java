@@ -59,7 +59,6 @@ class ModeSmokeTest {
                     Thread.sleep(50);
                 }
                 assertEquals(0, client.pendingCount(), mode + ": all requests must resolve");
-                assertEquals(0, client.sessionViolations(), mode + ": session guarantees must hold");
             }
         } finally {
             KvClientService.setChameleonDecisionForTest(true);

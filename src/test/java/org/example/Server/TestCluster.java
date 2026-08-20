@@ -33,6 +33,7 @@ final class TestCluster implements AutoCloseable {
             ServerImpl node = new ServerImpl(i, NUM_NODES);
             MeasurementPlane plane = new MeasurementPlane(i, NUM_NODES);
             rpcServers.add(ServerBuilder.forPort(basePort + i + 1)
+                    .addStreamTracerFactory(ServerIngressOccupancyTracer.factory(plane))
                     .addService(node)
                     .addService(new KvClientService(node, plane))
                     .build().start());

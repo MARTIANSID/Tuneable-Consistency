@@ -75,6 +75,7 @@ public final class ServerNode {
         };
 
         Server server = ServerBuilder.forPort(port)
+                .addStreamTracerFactory(ServerIngressOccupancyTracer.factory(plane))
                 .addService(serverImpl)
                 .addService(new KvClientService(serverImpl, plane))
                 .addService(new AdminService(serverImpl, shutdownAction))

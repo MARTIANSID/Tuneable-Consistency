@@ -14,12 +14,14 @@ import org.example.raft.ReadLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 /**
- * The client-facing per-request path. Every request is timestamped the moment
- * it comes off the stream (t_recv), takes an occupancy slot until its reply,
- * and is decided by the rung scorer: the legal levels for this node and
+ * The client-facing per-request path. A stream tracer opens the occupancy slot
+ * after message deframing, before callback scheduling; this callback starts
+ * service timing and closes the slot at the terminal reply. The rung scorer
+ * considers the legal levels for this node and
  * operation are scored against the registered SLA (steps 2-4), the best
  * scoring level wins, and requests worth less than the capacity they consume
  * are rejected (step 5). There are no modes anywhere: degradation under load
@@ -84,12 +86,16 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
 
     @Override
     public StreamObserver<KvRequest> session(StreamObserver<KvResponse> responseObserver) {
+        ServerIngressOccupancyTracer ingress = ServerIngressOccupancyTracer.current();
+        if (ingress == null) {
+            throw Status.INTERNAL.withDescription("server ingress occupancy tracer is not installed")
+                    .asRuntimeException();
+        }
         return new StreamObserver<>() {
             @Override
             public void onNext(KvRequest request) {
-                // Step 1: t_recv before any queueing; the occupancy slot opens here.
+                ingress.callbackStarted();
                 long tRecvNanos = System.nanoTime();
-                plane.requestAdmitted();
                 try {
                     handle(request, tRecvNanos, responseObserver);
                 } catch (Exception e) {
