@@ -13,9 +13,9 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 
 /**
- * Entry point for a single Raft node running in its own OS process: the Raft
- * service, the client-facing KV service, and the admin service (leader
- * detection, failure injection, teardown) on serverBasePort + serverId + 1.
+ * Entry point for a single Raft node running in its own OS process. Raft and
+ * admin use gRPC on serverBasePort + serverId + 1; client KV traffic uses the
+ * framed ingress listener on clientBasePort + serverId + 1.
  * The workload driver (org.example.Client.WorkloadDriver) runs in a separate
  * process and stops this one over Admin.Shutdown; SIGTERM performs the same
  * orderly teardown via a JVM shutdown hook.
@@ -47,9 +47,12 @@ public final class ServerNode {
         clearOwnCsvFiles(serverId);
 
         int port = config.cluster.serverBasePort + serverId + 1;
+        int clientPort = config.cluster.clientBasePort + serverId + 1;
         ServerImpl serverImpl = new ServerImpl(serverId, numServers);
         MeasurementPlane plane = new MeasurementPlane(serverId, numServers);
         plane.setRoleSupplier(() -> serverImpl.status.name());
+        KvClientService clientService = new KvClientService(serverImpl, plane);
+        KvIngressServer ingressServer = new KvIngressServer(clientPort, clientService, plane);
 
         AtomicReference<Server> serverRef = new AtomicReference<>();
         AtomicBoolean stopping = new AtomicBoolean(false);
@@ -60,6 +63,8 @@ public final class ServerNode {
                 return;
             }
             System.out.println("Server" + serverId + " shutting down...");
+            ingressServer.close();
+            clientService.close();
             Server server = serverRef.get();
             server.shutdown();
             try {
@@ -74,17 +79,24 @@ public final class ServerNode {
             plane.close();
         };
 
-        Server server = ServerBuilder.forPort(port)
-                .addStreamTracerFactory(ServerIngressOccupancyTracer.factory(plane))
-                .addService(serverImpl)
-                .addService(new KvClientService(serverImpl, plane))
-                .addService(new AdminService(serverImpl, shutdownAction))
-                .build()
-                .start();
+        Server server;
+        try {
+            ingressServer.start();
+            server = ServerBuilder.forPort(port)
+                    .addService(serverImpl)
+                    .addService(new AdminService(serverImpl, shutdownAction))
+                    .build()
+                    .start();
+        } catch (IOException | RuntimeException e) {
+            ingressServer.close();
+            clientService.close();
+            throw e;
+        }
         serverRef.set(server);
         serverImpl.setUpStubs();
         Runtime.getRuntime().addShutdownHook(new Thread(shutdownAction, "server-node-shutdown"));
-        System.out.println("Server" + serverId + " started on port " + port
+        System.out.println("Server" + serverId + " started: raft/admin=" + port
+                + " clientIngress=" + clientPort
                 + " (pid " + ProcessHandle.current().pid() + ")");
 
         server.awaitTermination();
@@ -95,6 +107,7 @@ public final class ServerNode {
     private static void clearOwnCsvFiles(int serverId) {
         for (String filename : new String[] {
                 "occupancy_" + serverId + ".csv",
+                "server_drain_" + serverId + ".csv",
                 "histograms_" + serverId + ".csv" }) {
             File file = new File(filename);
             if (file.exists() && !file.delete()) {

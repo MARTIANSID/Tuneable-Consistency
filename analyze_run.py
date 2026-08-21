@@ -12,6 +12,9 @@ Data sources (per run directory):
                              numbers come from here
   occupancy_<n>.csv          per node, per control interval: utilization U,
                              average in-flight, shadow price lambda
+  server_drain_<n>.csv       per node, per ~1 s interval: framed arrivals,
+                             deframe/callback drain, admission outcomes, and
+                             response submission/transport counters
   config.yaml                the exact config of this run (mode, phases)
 
 By default the figures open in interactive windows; pass --save (or --out) to
@@ -76,6 +79,13 @@ class Run:
             df["Time_s"] = (df["Timestamp"] - self.t0) / 1000.0
             self.occupancy[node] = df
 
+        self.drain = {}
+        for path in sorted(glob.glob(os.path.join(run_dir, "server_drain_*.csv"))):
+            node = int(path.split("_")[-1].split(".")[0])
+            df = pd.read_csv(path)
+            df["Time_s"] = (df["Timestamp"] - self.t0) / 1000.0
+            self.drain[node] = df
+
     @staticmethod
     def _load_config(run_dir):
         yaml_path = os.path.join(run_dir, "config.yaml")
@@ -109,7 +119,14 @@ class Run:
         """Whole-run totals per cell: the sum of every interval row."""
         sum_cols = [c for c in self.ledger.columns
                     if c not in CELL_KEY + ["Timestamp", "Time_s", "AvgLatencyMs",
-                                            "P50Ms", "P90Ms", "P95Ms", "P99Ms"]]
+                                            "P50Ms", "P90Ms", "P95Ms", "P99Ms",
+                                            "AvgStreamOnNextMs", "P99StreamOnNextMs",
+                                            "AvgUnaryInvocationMs", "P99UnaryInvocationMs",
+                                            "AvgTransportInvocationMs", "P99TransportInvocationMs",
+                                            "AvgRejectTotalMs", "P50RejectTotalMs",
+                                            "P90RejectTotalMs", "P99RejectTotalMs",
+                                            "AvgRejectFeedbackMs", "P50RejectFeedbackMs",
+                                            "P90RejectFeedbackMs", "P99RejectFeedbackMs"]]
         df = self.ledger.copy()
         df["LatencySum"] = df["AvgLatencyMs"] * df["Count"]
         agg = df.groupby(CELL_KEY)[sum_cols + ["LatencySum"]].sum().reset_index()
@@ -145,6 +162,9 @@ def style(ax, xlabel, ylabel, title):
 
 def plot_throughput(run, out):
     cols = ["Count", "Rejected", "Lost", "Fallbacks"]
+    has_deadline_exceeded = "DeadlineExceeded" in run.ledger.columns
+    if has_deadline_exceeded:
+        cols.append("DeadlineExceeded")
     has_shed = "ShedAtClient" in run.ledger.columns
     if has_shed:
         cols.append("ShedAtClient")
@@ -157,6 +177,9 @@ def plot_throughput(run, out):
     if has_shed:
         ax.plot(rates["Time_s"], rates["ShedAtClient"] / rates["dt_s"], label="shed at client/s",
                 color=PALETTE[2], **LINE)
+    if has_deadline_exceeded:
+        ax.plot(rates["Time_s"], rates["DeadlineExceeded"] / rates["dt_s"],
+                label="deadline exceeded/s", color=PALETTE[4], **LINE)
     ax.plot(rates["Time_s"], rates["Fallbacks"] / rates["dt_s"], label="fallbacks/s",
             color=PALETTE[3], **LINE)
     run.phase_lines(ax)
@@ -205,6 +228,183 @@ def plot_occupancy(run, out):
     if out:
         fig.savefig(out("occupancy.png"), dpi=120)
         plt.close(fig)
+
+
+def plot_server_drain(run, out):
+    if not run.drain:
+        return False
+
+    frames = []
+    drain_columns = next(iter(run.drain.values())).columns
+    inbound_column = ("FramesSeen" if "FramesSeen" in drain_columns else
+                      "HeadersSeen" if "HeadersSeen" in drain_columns else
+                      "RpcsOpened" if "RpcsOpened" in drain_columns else "InboundCreditsIssued")
+    callback_returned_column = ("IngressDispatchReturned"
+                                if "IngressDispatchReturned" in next(iter(run.drain.values())).columns
+                                else "CallbackReturned"
+                                if "CallbackReturned" in next(iter(run.drain.values())).columns
+                                else "OnNextReturned")
+    decoded_column = "FramesDecoded" if "FramesDecoded" in drain_columns else "Deframed"
+    rejected_response_column = ("RejectedResponseEnqueueSucceeded"
+                                if "RejectedResponseEnqueueSucceeded" in drain_columns
+                                else "RejectedReplyOnNextSucceeded")
+    outbound_sent_column = ("ResponseWritesCompleted"
+                            if "ResponseWritesCompleted" in drain_columns
+                            else "OutboundMessagesSent")
+    count_columns = [
+        inbound_column, decoded_column, callback_returned_column, "ExecutionAdmitted",
+        "HardCapRejected", "ScorerRejected", "ReplicationBudgetRejected",
+        rejected_response_column, outbound_sent_column,
+    ]
+    optional_count_columns = [
+        "AdmissionQueueAccepted", "AdmissionQueueRejected",
+        "AdmissionWorkStarted", "AdmissionWorkCompleted",
+    ]
+    if "FramesSeen" in drain_columns:
+        optional_count_columns = ["FramesAdmitted", "RequestsOpened"] + optional_count_columns
+    elif "HeadersSeen" in drain_columns:
+        optional_count_columns = ["HeadersAccepted", "RpcsOpened"] + optional_count_columns
+    for df in run.drain.values():
+        part = df.copy()
+        interval_s = part["IntervalMs"].clip(lower=1) / 1000.0
+        present_count_columns = count_columns + [
+            column for column in optional_count_columns if column in part.columns
+        ]
+        for column in present_count_columns:
+            part[column + "Rate"] = part[column] / interval_s
+        part["TimeBin_s"] = part["Time_s"].round()
+        frames.append(part)
+    drain = pd.concat(frames, ignore_index=True)
+
+    rate_columns = [column + "Rate" for column in count_columns]
+    rate_columns += [column + "Rate" for column in optional_count_columns
+                     if column + "Rate" in drain.columns]
+    rates = drain.groupby("TimeBin_s")[rate_columns].sum().reset_index()
+    decoded_waiting_gauge = ("DecodedAwaitingDispatchAtClose"
+                             if "DecodedAwaitingDispatchAtClose" in drain.columns
+                             else "DeframedAwaitingCallbackAtClose")
+    dispatch_executing_gauge = ("IngressDispatchesExecutingAtClose"
+                                if "IngressDispatchesExecutingAtClose" in drain.columns
+                                else "CallbacksExecutingAtClose")
+    response_pending_gauge = ("ResponsesPendingWriteAtClose"
+                              if "ResponsesPendingWriteAtClose" in drain.columns
+                              else "OutboundMessagesPendingAtClose")
+    gauge_columns = [decoded_waiting_gauge, dispatch_executing_gauge, response_pending_gauge]
+    gauge_columns += [column for column in [
+        "TransportPermitsInFlightAtClose", "HeaderPermitsInFlightAtClose", "AdmissionQueueDepthAtClose",
+        "AdmissionWorkersExecutingAtClose",
+    ] if column in drain.columns]
+    gauges = drain.groupby("TimeBin_s")[gauge_columns].sum().reset_index()
+    callback_latency_column = ("P99IngressDispatchMs"
+                               if "P99IngressDispatchMs" in drain.columns
+                               else "P99CallbackMs" if "P99CallbackMs" in drain.columns else "P99OnNextMs")
+    response_latency_column = ("P99ResponseEnqueueMs"
+                               if "P99ResponseEnqueueMs" in drain.columns else "P99ReplyOnNextMs")
+    latency_columns = [callback_latency_column, response_latency_column]
+    latency_columns += [column for column in [
+        "P99AdmissionQueueWaitMs", "P99AdmissionWorkMs",
+    ] if column in drain.columns]
+    latencies = drain.groupby("TimeBin_s")[latency_columns].max().reset_index()
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+    ax_in, ax_reject, ax_queue, ax_latency = axes
+
+    if "TransportCalls" in run.ledger.columns:
+        client = run.interval_rates(["TransportCalls"])
+        ax_in.plot(client["Time_s"], client["TransportCalls"] / client["dt_s"],
+                   label="client framed sends/s", color="#52514e", **LINE)
+    elif "UnaryCalls" in run.ledger.columns:
+        client = run.interval_rates(["UnaryCalls"])
+        ax_in.plot(client["Time_s"], client["UnaryCalls"] / client["dt_s"],
+                   label="client unary calls/s", color="#52514e", **LINE)
+    elif "StreamSends" in run.ledger.columns:
+        client = run.interval_rates(["StreamSends"])
+        ax_in.plot(client["Time_s"], client["StreamSends"] / client["dt_s"],
+                   label="client stream sends/s", color="#52514e", **LINE)
+    ax_in.plot(rates["TimeBin_s"], rates[inbound_column + "Rate"],
+               label=("frames seen/s" if inbound_column == "FramesSeen" else
+                      "headers seen/s" if inbound_column == "HeadersSeen" else
+                      "RPCs opened/s" if inbound_column == "RpcsOpened" else "inbound credits/s"),
+               color=PALETTE[0], **LINE)
+    if "FramesAdmittedRate" in rates.columns:
+        ax_in.plot(rates["TimeBin_s"], rates["FramesAdmittedRate"],
+                   label="frames admitted/s", color="#8f8b85", **LINE)
+    elif "HeadersAcceptedRate" in rates.columns:
+        ax_in.plot(rates["TimeBin_s"], rates["HeadersAcceptedRate"],
+                   label="headers accepted/s", color="#8f8b85", **LINE)
+    if "FramesSeen" in drain_columns:
+        ax_in.plot(rates["TimeBin_s"], rates["RequestsOpenedRate"],
+                   label="requests opened/s", color="#bcbd22", **LINE)
+    elif "HeadersSeen" in drain_columns:
+        ax_in.plot(rates["TimeBin_s"], rates["RpcsOpenedRate"],
+                   label="gRPC streams opened/s", color="#bcbd22", **LINE)
+    ax_in.plot(rates["TimeBin_s"], rates[decoded_column + "Rate"],
+               label="frames decoded/s", color=PALETTE[1], **LINE)
+    ax_in.plot(rates["TimeBin_s"], rates[callback_returned_column + "Rate"],
+               label="service callback returned/s", color=PALETTE[2], **LINE)
+    ax_in.plot(rates["TimeBin_s"], rates["ExecutionAdmittedRate"],
+               label="execution admitted/s", color=PALETTE[3], **LINE)
+    style(ax_in, "", "messages/s", "Server inbound and callback drain")
+    ax_in.legend(ncol=3)
+
+    rejection_rate = (rates["HardCapRejectedRate"] + rates["ScorerRejectedRate"]
+                      + rates["ReplicationBudgetRejectedRate"])
+    if "AdmissionQueueRejectedRate" in rates.columns:
+        rejection_rate += rates["AdmissionQueueRejectedRate"]
+    ax_reject.plot(rates["TimeBin_s"], rejection_rate,
+                   label="server rejection decisions/s", color=PALETTE[1], **LINE)
+    ax_reject.plot(rates["TimeBin_s"], rates[rejected_response_column + "Rate"],
+                   label="rejection response submissions/s", color=PALETTE[3], **LINE)
+    client_rejections = run.interval_rates(["Rejected"])
+    ax_reject.plot(client_rejections["Time_s"],
+                   client_rejections["Rejected"] / client_rejections["dt_s"],
+                   label="client rejection receipts/s", color=PALETTE[0], **LINE)
+    ax_reject.plot(rates["TimeBin_s"], rates[outbound_sent_column + "Rate"],
+                   label="all outbound tracer messages/s", color=PALETTE[2], linestyle=":", linewidth=1.5)
+    style(ax_reject, "", "messages/s", "Rejection feedback drain")
+    ax_reject.legend(ncol=2)
+
+    ax_queue.plot(gauges["TimeBin_s"], gauges[decoded_waiting_gauge],
+                  label="decoded awaiting dispatch", color=PALETTE[0], **LINE)
+    ax_queue.plot(gauges["TimeBin_s"], gauges[dispatch_executing_gauge],
+                  label="ingress dispatch executing", color=PALETTE[1], **LINE)
+    ax_queue.plot(gauges["TimeBin_s"], gauges[response_pending_gauge],
+                  label="responses pending write", color=PALETTE[2], **LINE)
+    if "TransportPermitsInFlightAtClose" in gauges.columns:
+        ax_queue.plot(gauges["TimeBin_s"], gauges["TransportPermitsInFlightAtClose"],
+                      label="transport permits in flight", color="#8f8b85", **LINE)
+    elif "HeaderPermitsInFlightAtClose" in gauges.columns:
+        ax_queue.plot(gauges["TimeBin_s"], gauges["HeaderPermitsInFlightAtClose"],
+                      label="header permits in flight", color="#8f8b85", **LINE)
+    if "AdmissionQueueDepthAtClose" in gauges.columns:
+        ax_queue.plot(gauges["TimeBin_s"], gauges["AdmissionQueueDepthAtClose"],
+                      label="admission queue", color=PALETTE[3], **LINE)
+    if "AdmissionWorkersExecutingAtClose" in gauges.columns:
+        ax_queue.plot(gauges["TimeBin_s"], gauges["AdmissionWorkersExecutingAtClose"],
+                      label="admission workers", color=PALETTE[4], **LINE)
+    style(ax_queue, "", "messages", "Measured server-side queues")
+    ax_queue.legend(ncol=3)
+
+    ax_latency.plot(latencies["TimeBin_s"], latencies[callback_latency_column],
+                    label="worst-node p99 service callback", color=PALETTE[1], **LINE)
+    ax_latency.plot(latencies["TimeBin_s"], latencies[response_latency_column],
+                    label="worst-node p99 response enqueue", color=PALETTE[2], **LINE)
+    if "P99AdmissionQueueWaitMs" in latencies.columns:
+        ax_latency.plot(latencies["TimeBin_s"], latencies["P99AdmissionQueueWaitMs"],
+                        label="worst-node p99 admission queue wait", color=PALETTE[3], **LINE)
+    if "P99AdmissionWorkMs" in latencies.columns:
+        ax_latency.plot(latencies["TimeBin_s"], latencies["P99AdmissionWorkMs"],
+                        label="worst-node p99 admission work", color=PALETTE[4], **LINE)
+    style(ax_latency, "time [s]", "milliseconds", "Callback durations")
+    ax_latency.legend()
+
+    for axis in axes:
+        run.phase_lines(axis)
+    fig.tight_layout()
+    if out:
+        fig.savefig(out("server_drain.png"), dpi=120)
+        plt.close(fig)
+    return True
 
 
 def plot_level_mix(run, out):
@@ -331,6 +531,8 @@ def print_tables(run):
     print(f"rejected:          {totals['Rejected'].sum():,.0f}")
     if "ShedAtClient" in totals.columns:
         print(f"shed at client:    {totals['ShedAtClient'].sum():,.0f}")
+    if "DeadlineExceeded" in totals.columns:
+        print(f"deadline exceeded: {totals['DeadlineExceeded'].sum():,.0f}")
     print(f"lost:              {totals['Lost'].sum():,.0f}")
     print(f"fallbacks:         {totals['Fallbacks'].sum():,.0f}")
     print(f"redirects:         {totals['Redirects'].sum():,.0f}")
@@ -353,8 +555,12 @@ def print_phase_tables(run):
     if not run.phases:
         return
     # Terminal outcomes (the ExecRate denominator); redirects/fallbacks/
-    # violations describe served requests, upgrades split by waiting.
+    # Violations include both late served responses and transport deadline expiry;
+    # upgrades split served responses by waiting.
     outcomes = ["Count", "Rejected", "Lost"]
+    has_deadline_exceeded = "DeadlineExceeded" in run.ledger.columns
+    if has_deadline_exceeded:
+        outcomes.insert(1, "DeadlineExceeded")
     has_shed = "ShedAtClient" in run.ledger.columns
     if has_shed:
         outcomes.insert(1, "ShedAtClient")
@@ -393,6 +599,8 @@ def print_phase_tables(run):
         if has_shed:
             columns["Shed"] = g["ShedAtClient"].astype(int)
         columns["Lost"] = g["Lost"].astype(int)
+        if has_deadline_exceeded:
+            columns["Deadline"] = g["DeadlineExceeded"].astype(int)
         columns["Fallbacks"] = g["Fallbacks"].astype(int)
         columns["Redirects"] = g["Redirects"].astype(int)
         columns["Viol"] = g["Violations"].astype(int)
@@ -446,12 +654,13 @@ def main():
     plot_throughput(run, out)
     plot_profit(run, out)
     plot_occupancy(run, out)
+    has_drain_plot = plot_server_drain(run, out)
     plot_level_mix(run, out)
     plot_latency(run, out)
     plot_upgrades(run, out)
     plot_leadership(run, out)
     if save:
-        print(f"wrote 7 figures to {out_dir}/")
+        print(f"wrote {8 if has_drain_plot else 7} figures to {out_dir}/")
 
     print_tables(run)
     print_phase_tables(run)

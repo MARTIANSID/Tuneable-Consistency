@@ -25,7 +25,7 @@ class GradingTest {
         // Executed eventual-local, but the returned value's write is already
         // majority-committed. Anchors block the causal levels, so the upgrade
         // is exactly local -> majority.
-        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 6, 8, 9);
+        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 6, 8);
         assertEquals(EVENTUAL_MAJORITY.getNumber(), graded);
     }
 
@@ -35,13 +35,13 @@ class GradingTest {
         // session's uncommitted anchor: causal-local is satisfied even though
         // eventual was executed. The value itself is uncommitted, so the
         // majority levels are not.
-        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 9, 7, 10, 8, 9);
+        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 9, 7, 10, 8);
         assertEquals(CAUSAL_LOCAL.getNumber(), graded);
     }
 
     @Test
     void committedValueOnACaughtUpReplicaGradesCausalMajority() {
-        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 9, 6, 7);
+        int graded = Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 9, 6);
         assertEquals(CAUSAL_MAJORITY.getNumber(), graded);
     }
 
@@ -49,43 +49,48 @@ class GradingTest {
     void noSessionHistoryMakesCausalVacuouslySatisfied() {
         // -1 anchors: the session never wrote, so causal holds trivially; a
         // committed value grades causal-majority.
-        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_MAJORITY, 5, 7, 7, -1, -1));
+        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_MAJORITY, 5, 7, 7, -1));
         // An uncommitted value from the local view still grades causal-local.
-        assertEquals(CAUSAL_LOCAL.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 9, 7, 9, -1, -1));
+        assertEquals(CAUSAL_LOCAL.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 9, 7, 9, -1));
     }
 
     @Test
     void linearizableIsNeverGrantedAfterTheFact() {
-        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(CAUSAL_MAJORITY, 5, 7, 7, -1, -1));
+        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(CAUSAL_MAJORITY, 5, 7, 7, -1));
     }
 
     @Test
     void executedLinearizableKeepsItsStrength() {
-        assertEquals(LINEARIZABLE.getNumber(), Grading.gradeRead(LINEARIZABLE, 5, 7, 7, -1, -1));
+        assertEquals(LINEARIZABLE.getNumber(), Grading.gradeRead(LINEARIZABLE, 5, 7, 7, -1));
     }
 
     @Test
-    void gradingNeverDemotesTheExecutedLevel() {
-        // Anchors ahead of everything: no upgrade condition holds, but the
-        // executed level's mechanics already delivered it.
-        int graded = Grading.gradeRead(CAUSAL_MAJORITY, 9, 7, 7, 20, 20);
-        assertEquals(CAUSAL_MAJORITY.getNumber(), graded);
+    void inconsistentCausalLabelCannotBypassTheClientFrontier() {
+        // The label claims causal-majority, but neither the returned value nor
+        // the commit frontier supports that claim against the client anchor.
+        int graded = Grading.gradeRead(CAUSAL_MAJORITY, 9, 7, 7, 20);
+        assertEquals(EVENTUAL_LOCAL.getNumber(), graded);
     }
 
     @Test
     void causalMajorityIsNotGrantedPastAFailedCausalLocalCondition() {
-        // A session with wc:1-acked writes (uncommitted anchor 8) but no
-        // majority-acked writes (committed anchor -1), reading a replica
-        // whose frontier has not reached the acked writes: the vacuous
-        // causal-majority condition must not smuggle in causal-local, so the
-        // grade stops at eventual-majority.
-        assertEquals(EVENTUAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 6, 8, -1));
+        // A session with an acknowledged write at index 8 reads a committed
+        // view whose frontier is only 6. Causal-majority must not be granted
+        // until that latest acknowledged write becomes committed.
+        assertEquals(EVENTUAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 6, 8));
+    }
+
+    @Test
+    void localLogFrontierDoesNotSubstituteForTheCommitFrontier() {
+        // The local log has the acknowledged write at index 8, but the commit
+        // index has not reached it. This is causal-local, not causal-majority.
+        assertEquals(CAUSAL_LOCAL.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, 5, 7, 9, 8));
     }
 
     @Test
     void absentKeyIsTriviallyCommitted() {
         // valueIndex -1 (key absent): both views agree, so majority holds.
-        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, -1, 7, 9, -1, -1));
+        assertEquals(CAUSAL_MAJORITY.getNumber(), Grading.gradeRead(EVENTUAL_LOCAL, -1, 7, 9, -1));
     }
 
     // ===== realize =====

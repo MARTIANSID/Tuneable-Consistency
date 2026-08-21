@@ -12,8 +12,7 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 
 /**
- * A real 3-node cluster on localhost gRPC for integration tests, with both
- * the Raft service and the client-facing KV service registered per node.
+ * A real 3-node cluster with gRPC Raft and framed client ingress per node.
  * Each test uses its own port range so tests never collide with each other
  * or with a concurrently running experiment.
  */
@@ -23,31 +22,38 @@ final class TestCluster implements AutoCloseable {
 
     final List<ServerImpl> nodes = new ArrayList<>();
     final List<MeasurementPlane> planes = new ArrayList<>();
+    final List<KvClientService> clientServices = new ArrayList<>();
     final List<Server> rpcServers = new ArrayList<>();
+    final List<KvIngressServer> ingressServers = new ArrayList<>();
     final int basePort;
+    final int clientBasePort;
 
     TestCluster(int basePort) throws IOException {
         this.basePort = basePort;
+        this.clientBasePort = basePort + 10_000;
         ServerImpl.applyClusterSettings(Collections.nCopies(NUM_NODES, "localhost"), basePort);
         for (int i = 0; i < NUM_NODES; i++) {
             ServerImpl node = new ServerImpl(i, NUM_NODES);
             MeasurementPlane plane = new MeasurementPlane(i, NUM_NODES);
+            KvClientService clientService = new KvClientService(node, plane);
+            KvIngressServer ingress = new KvIngressServer(clientBasePort + i + 1, clientService, plane);
+            ingress.start();
+            ingressServers.add(ingress);
             rpcServers.add(ServerBuilder.forPort(basePort + i + 1)
-                    .addStreamTracerFactory(ServerIngressOccupancyTracer.factory(plane))
                     .addService(node)
-                    .addService(new KvClientService(node, plane))
                     .build().start());
             nodes.add(node);
             planes.add(plane);
+            clientServices.add(clientService);
         }
         for (ServerImpl node : nodes) {
             node.setUpStubs();
         }
     }
 
-    /** gRPC port node i listens on. */
+    /** Framed client ingress port node i listens on. */
     int portOf(int nodeId) {
-        return basePort + nodeId + 1;
+        return clientBasePort + nodeId + 1;
     }
 
     ServerImpl awaitLeader(long timeoutMs) throws InterruptedException {
@@ -122,11 +128,8 @@ final class TestCluster implements AutoCloseable {
 
     @Override
     public void close() {
-        for (MeasurementPlane plane : planes) {
-            plane.close();
-        }
-        for (ServerImpl node : nodes) {
-            node.shutdown();
+        for (KvIngressServer ingress : ingressServers) {
+            ingress.close();
         }
         for (Server server : rpcServers) {
             server.shutdownNow();
@@ -137,6 +140,15 @@ final class TestCluster implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        for (KvClientService clientService : clientServices) {
+            clientService.close();
+        }
+        for (ServerImpl node : nodes) {
+            node.shutdown();
+        }
+        for (MeasurementPlane plane : planes) {
+            plane.close();
         }
     }
 }

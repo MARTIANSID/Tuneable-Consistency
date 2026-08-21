@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.DoubleAdder;
 
 /**
  * Client-side ledger: every cross-arm comparison metric lives here, measured
- * at the client from the request/response stream. Every CSV row is one
+ * at the client from framed request/response exchanges. Every CSV row is one
  * interval: each cell's counters are snapshotted and reset at every flush
  * (~1 s), so rows are per-interval activity, not running totals, and the
  * P50/P90/P95/P99 columns are that interval's percentiles. Cells with no
@@ -55,12 +55,20 @@ public final class ClientMetricsTracker {
 
     private static final class Cell {
         final AtomicLong count = new AtomicLong();
+        final AtomicLong transportCalls = new AtomicLong();
+        final DoubleAdder transportInvocationLatencySumMs = new DoubleAdder();
+        final AtomicLongArray transportInvocationLatencyBuckets = new AtomicLongArray(LATENCY_BUCKETS + 1);
         final AtomicLong fallbacks = new AtomicLong();
         final AtomicLong redirects = new AtomicLong();
         final AtomicLong failures = new AtomicLong();
         final AtomicLong rejected = new AtomicLong();
-        final AtomicLong shedAtClient = new AtomicLong();
+        final DoubleAdder rejectionTotalLatencySumMs = new DoubleAdder();
+        final DoubleAdder rejectionFeedbackLatencySumMs = new DoubleAdder();
+        final AtomicLong invalidRejectionFeedbackTimestamps = new AtomicLong();
+        final AtomicLongArray rejectionTotalLatencyBuckets = new AtomicLongArray(LATENCY_BUCKETS + 1);
+        final AtomicLongArray rejectionFeedbackLatencyBuckets = new AtomicLongArray(LATENCY_BUCKETS + 1);
         final AtomicLong lost = new AtomicLong();
+        final AtomicLong deadlineExceeded = new AtomicLong();
         final AtomicLong violations = new AtomicLong();
         final DoubleAdder latencySumMs = new DoubleAdder();
         final DoubleAdder predictedProfitSum = new DoubleAdder();
@@ -79,7 +87,6 @@ public final class ClientMetricsTracker {
     // these never reset, unlike the per-interval cells above.
     private static final AtomicLong runResponses = new AtomicLong();
     private static final AtomicLong runRejected = new AtomicLong();
-    private static final AtomicLong runShedAtClient = new AtomicLong();
     private static final AtomicLong runLost = new AtomicLong();
     private static final AtomicLong runViolations = new AtomicLong();
     private static final DoubleAdder runPredictedProfit = new DoubleAdder();
@@ -146,22 +153,39 @@ public final class ClientMetricsTracker {
         maybeFlush();
     }
 
-    /** Admission control shed the request; not retried by design. */
-    public static void recordRejected(int nodeId, String chosen) {
-        cell(nodeId, chosen, "-").rejected.incrementAndGet();
-        runRejected.incrementAndGet();
+    /** A request or retry was submitted to the asynchronous framed transport. */
+    public static void recordTransportCall(int nodeId, String chosen, double invocationMs) {
+        Cell c = cell(nodeId, chosen, "-");
+        c.transportCalls.incrementAndGet();
+        c.transportInvocationLatencySumMs.add(invocationMs);
+        c.transportInvocationLatencyBuckets.incrementAndGet(latencyBucketOf(invocationMs));
         maybeFlush();
     }
 
-    /**
-     * The client shed the request at the transport boundary: the target
-     * stream's send window was full, so buffering it would only have built
-     * queue delay, not throughput. Distinct from Rejected (server admission)
-     * so overload runs show who dropped the excess.
-     */
-    public static void recordShedAtClient(int nodeId, String chosen) {
-        cell(nodeId, chosen, "-").shedAtClient.incrementAndGet();
-        runShedAtClient.incrementAndGet();
+    /** The per-RPC SLA deadline expired. It is a violation, not a lost request. */
+    public static void recordDeadlineExceeded(int nodeId, String chosen) {
+        Cell c = cell(nodeId, chosen, "-");
+        c.deadlineExceeded.incrementAndGet();
+        c.violations.incrementAndGet();
+        runViolations.incrementAndGet();
+        maybeFlush();
+    }
+
+    /** Admission control shed the request; not retried by design. */
+    public static void recordRejected(int nodeId, String chosen, double totalLatencyMs,
+            long serverReplyEpochMs, long clientReceiveEpochMs) {
+        Cell c = cell(nodeId, chosen, "-");
+        c.rejected.incrementAndGet();
+        c.rejectionTotalLatencySumMs.add(totalLatencyMs);
+        c.rejectionTotalLatencyBuckets.incrementAndGet(latencyBucketOf(totalLatencyMs));
+        if (serverReplyEpochMs <= 0 || clientReceiveEpochMs < serverReplyEpochMs) {
+            c.invalidRejectionFeedbackTimestamps.incrementAndGet();
+        } else {
+            double feedbackLatencyMs = clientReceiveEpochMs - serverReplyEpochMs;
+            c.rejectionFeedbackLatencySumMs.add(feedbackLatencyMs);
+            c.rejectionFeedbackLatencyBuckets.incrementAndGet(latencyBucketOf(feedbackLatencyMs));
+        }
+        runRejected.incrementAndGet();
         maybeFlush();
     }
 
@@ -173,10 +197,6 @@ public final class ClientMetricsTracker {
 
     public static long totalRejected() {
         return runRejected.get();
-    }
-
-    public static long totalShedAtClient() {
-        return runShedAtClient.get();
     }
 
     public static long totalViolations() {
@@ -243,18 +263,27 @@ public final class ClientMetricsTracker {
                         + "P50Ms,P90Ms,P95Ms,P99Ms,PredictedProfitSum,RealizedProfitSum,"
                         + "UpgradesFree,UpgradesWaiting,"
                         + "SatisfiedRung0,SatisfiedRung1,SatisfiedRung2,SatisfiedRung3,SatisfiedNone,"
-                        + "Fallbacks,Redirects,Failures,Rejected,ShedAtClient,Lost,Violations");
+                        + "Fallbacks,Redirects,Failures,TransportCalls,AvgTransportInvocationMs,P99TransportInvocationMs,"
+                        + "Rejected,AvgRejectTotalMs,P50RejectTotalMs,"
+                        + "P90RejectTotalMs,P99RejectTotalMs,AvgRejectFeedbackMs,P50RejectFeedbackMs,"
+                        + "P90RejectFeedbackMs,P99RejectFeedbackMs,InvalidRejectFeedbackTimestamps,"
+                        + "Lost,DeadlineExceeded,Violations");
             }
             for (Map.Entry<Key, Cell> e : cells.entrySet()) {
                 Key k = e.getKey();
                 Cell c = e.getValue();
                 long count = c.count.getAndSet(0);
+                long transportCalls = c.transportCalls.getAndSet(0);
+                double transportInvocationLatencySum = c.transportInvocationLatencySumMs.sumThenReset();
                 long fallbacks = c.fallbacks.getAndSet(0);
                 long redirects = c.redirects.getAndSet(0);
                 long failures = c.failures.getAndSet(0);
                 long rejected = c.rejected.getAndSet(0);
-                long shed = c.shedAtClient.getAndSet(0);
+                double rejectionTotalLatencySum = c.rejectionTotalLatencySumMs.sumThenReset();
+                double rejectionFeedbackLatencySum = c.rejectionFeedbackLatencySumMs.sumThenReset();
+                long invalidRejectionFeedbackTimestamps = c.invalidRejectionFeedbackTimestamps.getAndSet(0);
                 long lost = c.lost.getAndSet(0);
+                long deadlineExceeded = c.deadlineExceeded.getAndSet(0);
                 long violations = c.violations.getAndSet(0);
                 double latencySum = c.latencySumMs.sumThenReset();
                 double predicted = c.predictedProfitSum.sumThenReset();
@@ -271,12 +300,28 @@ public final class ClientMetricsTracker {
                     buckets[i] = c.latencyBuckets.getAndSet(i, 0);
                     bucketTotal += buckets[i];
                 }
-                if (count == 0 && fallbacks == 0 && redirects == 0 && failures == 0
-                        && rejected == 0 && shed == 0 && lost == 0 && violations == 0) {
+                long[] rejectionTotalBuckets = new long[LATENCY_BUCKETS + 1];
+                long rejectionTotalBucketCount = 0;
+                long[] rejectionFeedbackBuckets = new long[LATENCY_BUCKETS + 1];
+                long rejectionFeedbackBucketCount = 0;
+                long[] transportInvocationBuckets = new long[LATENCY_BUCKETS + 1];
+                long transportInvocationBucketCount = 0;
+                for (int i = 0; i <= LATENCY_BUCKETS; i++) {
+                    transportInvocationBuckets[i] = c.transportInvocationLatencyBuckets.getAndSet(i, 0);
+                    transportInvocationBucketCount += transportInvocationBuckets[i];
+                    rejectionTotalBuckets[i] = c.rejectionTotalLatencyBuckets.getAndSet(i, 0);
+                    rejectionTotalBucketCount += rejectionTotalBuckets[i];
+                    rejectionFeedbackBuckets[i] = c.rejectionFeedbackLatencyBuckets.getAndSet(i, 0);
+                    rejectionFeedbackBucketCount += rejectionFeedbackBuckets[i];
+                }
+                if (count == 0 && transportCalls == 0 && fallbacks == 0 && redirects == 0 && failures == 0
+                        && rejected == 0 && lost == 0 && violations == 0) {
                     continue; // no activity this interval
                 }
                 double avg = count == 0 ? 0.0 : latencySum / count;
-                out.printf("%d,%d,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                out.printf("%d,%d,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                                + "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%d,"
+                                + "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n",
                         now, k.nodeId(), k.chosen(), k.executed(), count, avg,
                         quantileMs(buckets, bucketTotal, 0.50), quantileMs(buckets, bucketTotal, 0.90),
                         quantileMs(buckets, bucketTotal, 0.95),
@@ -284,7 +329,20 @@ public final class ClientMetricsTracker {
                         predicted, realized,
                         upFree, upWaiting,
                         rungs[0], rungs[1], rungs[2], rungs[3], rungs[MAX_RUNGS],
-                        fallbacks, redirects, failures, rejected, shed, lost, violations);
+                        fallbacks, redirects, failures, transportCalls,
+                        transportCalls == 0 ? 0.0 : transportInvocationLatencySum / transportCalls,
+                        quantileMs(transportInvocationBuckets, transportInvocationBucketCount, 0.99),
+                        rejected,
+                        rejected == 0 ? 0.0 : rejectionTotalLatencySum / rejected,
+                        quantileMs(rejectionTotalBuckets, rejectionTotalBucketCount, 0.50),
+                        quantileMs(rejectionTotalBuckets, rejectionTotalBucketCount, 0.90),
+                        quantileMs(rejectionTotalBuckets, rejectionTotalBucketCount, 0.99),
+                        rejectionFeedbackBucketCount == 0
+                                ? 0.0 : rejectionFeedbackLatencySum / rejectionFeedbackBucketCount,
+                        quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.50),
+                        quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.90),
+                        quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.99),
+                        invalidRejectionFeedbackTimestamps, lost, deadlineExceeded, violations);
             }
         } catch (IOException e) {
             System.err.println("Failed to write " + CSV_PATH + ": " + e.getMessage());

@@ -49,12 +49,12 @@ class ProfitReconciliationTest {
 
     /** Regrade one read record from nothing but the response and the request's anchors. */
     private static Grading.Realized regradeRead(List<RungScorer.Rung> sla, KvResponse response,
-            int uncommittedAnchor, int committedAnchor) {
+            int uncommittedAnchor) {
         ReadLevel delivered = response.getDeliveredReadLevel();
         boolean localView = delivered == ReadLevel.EVENTUAL_LOCAL || delivered == ReadLevel.CAUSAL_LOCAL;
         int graded = Grading.gradeRead(delivered, response.getValueIndex(), response.getCommitIndex(),
                 localView ? response.getLogIndex() : response.getCommitIndex(),
-                uncommittedAnchor, committedAnchor);
+                uncommittedAnchor);
         assertEquals(graded, response.getGradedReadStrength(), "server and record grading must agree");
         return Grading.realize(sla, graded, response.getServiceTimeMs());
     }
@@ -141,7 +141,7 @@ class ProfitReconciliationTest {
                     assertTrue(readResponse.getOk());
                     reportedRealized += readResponse.getRealizedProfit();
                     reportedPredicted += readResponse.getPredictedProfit();
-                    regradedRealized += regradeRead(sla, readResponse, uncommitted, committed).profit();
+                    regradedRealized += regradeRead(sla, readResponse, uncommitted).profit();
                     served.add(readResponse);
                 }
 

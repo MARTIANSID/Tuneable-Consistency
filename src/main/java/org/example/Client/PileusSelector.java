@@ -15,7 +15,7 @@ import org.example.raft.ReadLevel;
  *
  * - Consistency is binary from tracked per-server high-water indices (every
  *   response reports the server's log and commit index) against the session's
- *   anchors; eventual rungs are always feasible, linearizable is structural
+ *   latest acknowledged write; eventual rungs are always feasible, linearizable is structural
  *   (leader, or any server when follower LIN reads are enabled) because the
  *   mechanism guarantees the outcome - all its uncertainty is latency.
  * - Latency comes from 2n + wc response-time sliding windows: per-server
@@ -109,16 +109,15 @@ final class PileusSelector {
      * attractiveness in profit space instead of through latency-window
      * penalty samples.
      */
-    Choice chooseRead(List<RungScorer.Rung> sla, int uncommittedAnchor, int committedAnchor, int leaderHint,
+    Choice chooseRead(List<RungScorer.Rung> sla, int uncommittedAnchor, int leaderHint,
             AdmitRates admitRates) {
         if (explorationFraction > 0 && random.nextDouble() < explorationFraction) {
             int node = random.nextInt(numServers);
-            return bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint, admitRates);
+            return bestRungForNode(sla, node, uncommittedAnchor, leaderHint, admitRates);
         }
         Choice best = null;
         for (int node = 0; node < numServers; node++) {
-            Choice candidate = bestRungForNode(sla, node, uncommittedAnchor, committedAnchor, leaderHint,
-                    admitRates);
+            Choice candidate = bestRungForNode(sla, node, uncommittedAnchor, leaderHint, admitRates);
             if (candidate == null) {
                 continue;
             }
@@ -131,7 +130,7 @@ final class PileusSelector {
 
     /** The best rung to target at one specific server (used for exploration too). */
     private Choice bestRungForNode(List<RungScorer.Rung> sla, int node, int uncommittedAnchor,
-            int committedAnchor, int leaderHint, AdmitRates admitRates) {
+            int leaderHint, AdmitRates admitRates) {
         double admitFactor = admitRates == null ? 1.0 : admitRates.pAdmit(node);
         Choice best = null;
         int bestStrength = Integer.MAX_VALUE;
@@ -141,7 +140,7 @@ final class PileusSelector {
             if (lin && !followerLinReads && leaderHint >= 0 && node != leaderHint) {
                 continue; // LIN is structurally impossible off-leader
             }
-            double feasible = readFeasible(rung.strength(), node, uncommittedAnchor, committedAnchor) ? 1.0 : 0.0;
+            double feasible = readFeasible(rung.strength(), node, uncommittedAnchor) ? 1.0 : 0.0;
             SlidingWindow window = lin ? linWindows[node] : plainWindows[node];
             double expected = rung.profit() * feasible * window.fractionAtMost(rung.thresholdMs()) * admitFactor;
             // Strictly-greater keeps the weakest requirement on ties.
@@ -154,12 +153,12 @@ final class PileusSelector {
         return best;
     }
 
-    private boolean readFeasible(int strength, int node, int uncommittedAnchor, int committedAnchor) {
+    private boolean readFeasible(int strength, int node, int uncommittedAnchor) {
         if (strength == ReadLevel.CAUSAL_LOCAL.getNumber()) {
             return uncommittedAnchor < 0 || highLogIndex.get(node) >= uncommittedAnchor;
         }
         if (strength == ReadLevel.CAUSAL_MAJORITY.getNumber()) {
-            return committedAnchor < 0 || highCommitIndex.get(node) >= committedAnchor;
+            return uncommittedAnchor < 0 || highCommitIndex.get(node) >= uncommittedAnchor;
         }
         // Eventual levels always; linearizable by mechanism where it may run.
         return true;

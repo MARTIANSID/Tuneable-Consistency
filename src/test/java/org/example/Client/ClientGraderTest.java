@@ -28,13 +28,13 @@ class ClientGraderTest {
 
     @Test
     void committedViewWinsWhenItPaysTheTopRung() {
-        // Commit index covers the committed anchor, both values committed:
-        // the CM rung (profit 6) pays via the committed view.
+        // Commit index covers the session's latest acknowledged write, and
+        // both values are committed: the CM rung pays via the committed view.
         KvResponse r = response(ReadLevel.EVENTUAL_MAJORITY)
                 .setLogIndex(10).setCommitIndex(10)
                 .setLocalValueIndex(9).setCommittedValueIndex(9)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 8, 8, 50);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 8, 50);
         assertEquals(0, verdict.satisfiedRung());
         assertEquals(6.0, verdict.realizedProfit(), 1e-9);
         assertFalse(verdict.viaLocalView());
@@ -50,11 +50,56 @@ class ClientGraderTest {
                 .setLogIndex(12).setCommitIndex(5)
                 .setLocalValueIndex(11).setCommittedValueIndex(4)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 10, 10, 50);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 10, 50);
         assertEquals(1, verdict.satisfiedRung());
         assertEquals(3.0, verdict.realizedProfit(), 1e-9);
         assertTrue(verdict.viaLocalView());
         assertFalse(verdict.deadlineViolation());
+    }
+
+    @Test
+    void serverCausalLabelDoesNotBypassClientFrontierVerification() {
+        KvResponse r = response(ReadLevel.CAUSAL_MAJORITY)
+                .setLogIndex(7).setCommitIndex(7)
+                .setLocalValueIndex(6).setCommittedValueIndex(6)
+                .build();
+
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 20, 50);
+
+        assertEquals(2, verdict.satisfiedRung(), "the server cannot award itself causal-majority credit");
+        assertEquals(1.0, verdict.realizedProfit(), 1e-9);
+    }
+
+    @Test
+    void causalServerLabelProducesTheSameGradeAsPileusBaseline() {
+        KvResponse pileus = response(ReadLevel.EVENTUAL_MAJORITY)
+                .setLogIndex(7).setCommitIndex(10)
+                .setLocalValueIndex(6).setCommittedValueIndex(6)
+                .build();
+        KvResponse chameleon = pileus.toBuilder()
+                .setDeliveredReadLevel(ReadLevel.CAUSAL_MAJORITY)
+                .build();
+
+        ClientGrader.Verdict pileusVerdict = ClientGrader.gradeRead(SLA, pileus, 20, 50);
+        ClientGrader.Verdict chameleonVerdict = ClientGrader.gradeRead(SLA, chameleon, 20, 50);
+
+        assertEquals(pileusVerdict, chameleonVerdict,
+                "a causal label must not change the client-authoritative grade");
+        assertEquals(2, chameleonVerdict.satisfiedRung());
+    }
+
+    @Test
+    void linearizableLabelCannotBypassTheClientCausalFrontier() {
+        KvResponse r = response(ReadLevel.LINEARIZABLE)
+                .setLogIndex(20).setCommitIndex(7)
+                .setLocalValueIndex(6).setCommittedValueIndex(6)
+                .build();
+
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, 20, 50);
+
+        assertEquals(1, verdict.satisfiedRung());
+        assertEquals(3.0, verdict.realizedProfit(), 1e-9);
+        assertTrue(verdict.viaLocalView());
     }
 
     @Test
@@ -63,7 +108,7 @@ class ClientGraderTest {
                 .setLogIndex(10).setCommitIndex(10)
                 .setLocalValueIndex(9).setCommittedValueIndex(9)
                 .build();
-        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, -1, -1, 500);
+        ClientGrader.Verdict verdict = ClientGrader.gradeRead(SLA, r, -1, 500);
         assertEquals(-1, verdict.satisfiedRung());
         assertEquals(0.0, verdict.realizedProfit(), 1e-9);
         assertTrue(verdict.deadlineViolation());

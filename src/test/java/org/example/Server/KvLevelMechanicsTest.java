@@ -100,7 +100,7 @@ class KvLevelMechanicsTest {
                 KvResponse write = leaderSession.write("causal-key", "cv", 12, 1);
                 int anchor = write.getValueIndex();
 
-                KvResponse read = followerSession.read("causal-key", 12, 1, anchor, -1);
+                KvResponse read = followerSession.read("causal-key", 12, 1, -1, anchor);
                 assertTrue(read.getOk());
                 assertEquals(CM, read.getDeliveredReadLevel(), "only causal-majority satisfies the rung on a follower");
                 assertFalse(read.getTimedOutAndFellBack());
@@ -215,7 +215,7 @@ class KvLevelMechanicsTest {
             cluster.awaitLeader(15_000);
 
             try (KvSessionClient client = new KvSessionClient(15,
-                    List.of("localhost", "localhost", "localhost"), 18800,
+                    List.of("localhost", "localhost", "localhost"), cluster.clientBasePort,
                     org.example.Client.ClientMode.CHAMELEON, 64, 3, 8_000,
                     Map.of(1, List.of(read(CM, 1000, 4), read(CL, 500, 2))),
                     Map.of(1, List.of(write(2, 1000, 4), write(1, 500, 2))),

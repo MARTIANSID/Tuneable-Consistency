@@ -42,7 +42,8 @@ public final class ExperimentConfig {
     public static final class Cluster {
         public Integer numServers;
         public List<String> serverHosts; // one entry per server
-        public Integer serverBasePort;   // server i listens on basePort + i + 1
+        public Integer serverBasePort;   // Raft/admin server i listens on basePort + i + 1
+        public Integer clientBasePort;   // framed client ingress i listens on basePort + i + 1
         public Integer preferredLeaderId; // first-election cue (-1 = none): this node gets a shorter election timeout
     }
 
@@ -68,6 +69,7 @@ public final class ExperimentConfig {
         public Integer rttWindowSize;      // per-node sliding window of RTT samples (no-wait replies only)
         public Integer retryLimit;         // redirect/failure resends before giving up on a request
         public Integer lostTimeoutMs;      // no response within this -> the client scores the request as lost
+        public Integer ingressConnectionsPerServer; // shared long-lived framed TCP connections to each server
         public Double explorationFraction; // fraction of reads routed randomly to keep per-node windows fresh (all routing options)
         public Boolean admissionAwareRouting; // route by decayed per-node admit/reject ratio (Pileus and lowest-RTT alike)
         public Double admitRateGamma;      // per-second decay of the admit/reject counters, in (0, 1)
@@ -415,6 +417,15 @@ public final class ExperimentConfig {
                     + cluster.numServers + ") entries, got " + cluster.serverHosts.size());
         }
         requirePositive(cluster.serverBasePort, "cluster.serverBasePort");
+        requirePositive(cluster.clientBasePort, "cluster.clientBasePort");
+        int raftLastPort = cluster.serverBasePort + cluster.numServers;
+        int clientLastPort = cluster.clientBasePort + cluster.numServers;
+        if (raftLastPort > 65_535 || clientLastPort > 65_535) {
+            throw new IllegalArgumentException("cluster port ranges must end at or below 65535");
+        }
+        if (cluster.serverBasePort <= clientLastPort && cluster.clientBasePort <= raftLastPort) {
+            throw new IllegalArgumentException("cluster.serverBasePort and cluster.clientBasePort ranges overlap");
+        }
         require(cluster.preferredLeaderId, "cluster.preferredLeaderId");
         if (cluster.preferredLeaderId < -1 || cluster.preferredLeaderId >= cluster.numServers) {
             throw new IllegalArgumentException("cluster.preferredLeaderId must be -1 (no preference) or a server id"
@@ -450,6 +461,7 @@ public final class ExperimentConfig {
         }
         requirePositive(client.retryLimit, "client.retryLimit");
         requirePositive(client.lostTimeoutMs, "client.lostTimeoutMs");
+        requirePositive(client.ingressConnectionsPerServer, "client.ingressConnectionsPerServer");
         require(client.explorationFraction, "client.explorationFraction");
         if (client.explorationFraction < 0 || client.explorationFraction >= 1) {
             throw new IllegalArgumentException("client.explorationFraction must be in [0, 1), got "

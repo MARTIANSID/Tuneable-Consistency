@@ -1,18 +1,13 @@
 package org.example.Server;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
-import org.example.raft.KvClientGrpc;
+import org.example.Client.KvFramedTransport;
 import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
-
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
 
 /**
  * Minimal test session over the real client protocol: blocking single calls
@@ -21,36 +16,22 @@ import io.grpc.stub.StreamObserver;
  */
 final class TestSession implements AutoCloseable {
 
-    private final ManagedChannel channel;
-    private final StreamObserver<KvRequest> stream;
-    private final ConcurrentHashMap<Long, CompletableFuture<KvResponse>> waiting = new ConcurrentHashMap<>();
+    private final KvFramedTransport transport;
     private final AtomicLong ids = new AtomicLong();
     private volatile Consumer<KvResponse> asyncListener;
 
     TestSession(int port) {
-        channel = ManagedChannelBuilder.forAddress("localhost", port).usePlaintext().build();
-        stream = KvClientGrpc.newStub(channel).session(new StreamObserver<>() {
-            @Override
-            public void onNext(KvResponse response) {
+        transport = new KvFramedTransport(java.util.List.of("localhost"), port - 1, 1);
+    }
+
+    private void onResponse(KvResponse response, CompletableFuture<KvResponse> future) {
                 Consumer<KvResponse> listener = asyncListener;
                 if (listener != null) {
                     listener.accept(response);
                 }
-                CompletableFuture<KvResponse> future = waiting.remove(response.getRequestId());
                 if (future != null) {
                     future.complete(response);
                 }
-            }
-
-            @Override
-            public void onError(Throwable t) {
-                waiting.values().forEach(f -> f.completeExceptionally(t));
-            }
-
-            @Override
-            public void onCompleted() {
-            }
-        });
     }
 
     void setAsyncListener(Consumer<KvResponse> listener) {
@@ -60,20 +41,17 @@ final class TestSession implements AutoCloseable {
     KvResponse call(KvRequest.Builder request) throws Exception {
         long id = ids.incrementAndGet();
         CompletableFuture<KvResponse> future = new CompletableFuture<>();
-        waiting.put(id, future);
-        sendRaw(request.setRequestId(id).build());
+        transport.execute(0, request.setRequestId(id).build(), TimeUnit.SECONDS.toNanos(10),
+                response -> onResponse(response, future),
+                failure -> future.completeExceptionally(failure.status().asRuntimeException()));
         return future.get(10, TimeUnit.SECONDS);
     }
 
     /** Fire and forget; responses reach the async listener only. */
     void send(KvRequest.Builder request) {
-        sendRaw(request.setRequestId(ids.incrementAndGet()).build());
-    }
-
-    private void sendRaw(KvRequest request) {
-        synchronized (stream) {
-            stream.onNext(request);
-        }
+        transport.execute(0, request.setRequestId(ids.incrementAndGet()).build(), TimeUnit.SECONDS.toNanos(10),
+                response -> onResponse(response, null),
+                failure -> { });
     }
 
     KvResponse write(String key, String value, int applicationId, int slaId) throws Exception {
@@ -100,6 +78,6 @@ final class TestSession implements AutoCloseable {
 
     @Override
     public void close() {
-        channel.shutdownNow();
+        transport.close();
     }
 }

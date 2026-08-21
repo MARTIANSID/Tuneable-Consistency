@@ -1,6 +1,5 @@
 package org.example.Client;
 
-import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -13,20 +12,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.example.Utility.RungScorer;
-import org.example.raft.KvClientGrpc;
 import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
 import org.example.raft.ReadLevel;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.ClientCallStreamObserver;
-import io.grpc.stub.ClientResponseObserver;
+import io.grpc.Status;
 
 /**
- * One application session against the cluster. Owns a stream per server, the
+ * One logical application session against the cluster. It shares an
+ * asynchronous framed transport with the other sessions and owns the
  * session anchors (uncommitted = highest log index among this session's
  * acknowledged writes; committed = highest among its majority-acknowledged
  * writes), a per-node RTT estimator fed by no-wait replies, and the client
@@ -71,13 +68,8 @@ public final class KvSessionClient implements AutoCloseable {
     private final Map<Integer, Integer> readFloors;
     private final Map<Integer, Integer> writeFloors;
 
-    private final List<ManagedChannel> channels = new ArrayList<>();
-    private final ClientCallStreamObserver<KvRequest>[] streams;
-    // A stream sheds on a full send window only after it has been ready once:
-    // channels connect lazily, and shedding during the initial handshake
-    // would drop traffic a moment of patience delivers.
-    private final AtomicBoolean[] streamEverReady;
-    private final Object[] streamLocks;
+    private final KvFramedTransport transport;
+    private final boolean ownsTransport;
     private final RttEstimator rttEstimator;
     private final PileusSelector selector; // null unless the mode routes with Pileus
 
@@ -85,11 +77,19 @@ public final class KvSessionClient implements AutoCloseable {
     private final AtomicInteger roundRobin = new AtomicInteger();
     private volatile int leaderHint = -1;
 
-    // Session anchors carried by subsequent requests.
-    private final AtomicInteger uncommittedAnchor = new AtomicInteger(-1);
-    private final AtomicInteger committedAnchor = new AtomicInteger(-1);
+    // Session histories carried by subsequent requests. One atomic snapshot
+    // preserves uncommitted >= committed while write callbacks and workload
+    // threads run concurrently. The uncommitted value is the causal frontier
+    // for both causal-local and causal-majority; committed remains useful as
+    // explicit majority-acknowledgement history.
+    private record SessionAnchors(int uncommitted, int committed) {
+    }
+
+    private final AtomicReference<SessionAnchors> sessionAnchors =
+            new AtomicReference<>(new SessionAnchors(-1, -1));
 
     private final ConcurrentHashMap<Long, Pending> pending = new ConcurrentHashMap<>();
+    private final AtomicBoolean closed = new AtomicBoolean();
     private final ScheduledExecutorService lostSweeper;
 
     private static final class Pending {
@@ -98,31 +98,56 @@ public final class KvSessionClient implements AutoCloseable {
         final long firstSendMs;
         final int targetNode;
         final int attempt;
+        final long deadlineNanos;
         // Client-side profit prediction and the target rung's threshold for
         // recomputing the wait bound on retries.
         final double predictedProfit;
         final double targetThresholdMs;
+        volatile KvFramedTransport.RequestHandle transportHandle;
 
         Pending(KvRequest request, long firstSendNanos, long firstSendMs, int targetNode, int attempt,
+                long deadlineNanos,
                 double predictedProfit, double targetThresholdMs) {
             this.request = request;
             this.firstSendNanos = firstSendNanos;
             this.firstSendMs = firstSendMs;
             this.targetNode = targetNode;
             this.attempt = attempt;
+            this.deadlineNanos = deadlineNanos;
             this.predictedProfit = predictedProfit;
             this.targetThresholdMs = targetThresholdMs;
         }
     }
 
-    @SuppressWarnings("unchecked")
     public KvSessionClient(int applicationId, List<String> hosts, int basePort, ClientMode mode,
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
             boolean admissionAwareRouting, double admitRateGamma) {
+        this(applicationId, new KvFramedTransport(hosts, basePort, 1), true, mode,
+                rttWindowSize, retryLimit, lostTimeoutMs, readSlas, writeSlas,
+                explorationFraction, followerLinReads, admissionAwareRouting, admitRateGamma);
+    }
+
+    public KvSessionClient(int applicationId, KvFramedTransport transport, ClientMode mode,
+            int rttWindowSize, int retryLimit, long lostTimeoutMs,
+            Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
+            double explorationFraction, boolean followerLinReads,
+            boolean admissionAwareRouting, double admitRateGamma) {
+        this(applicationId, transport, false, mode, rttWindowSize, retryLimit, lostTimeoutMs,
+                readSlas, writeSlas, explorationFraction, followerLinReads,
+                admissionAwareRouting, admitRateGamma);
+    }
+
+    private KvSessionClient(int applicationId, KvFramedTransport transport, boolean ownsTransport, ClientMode mode,
+            int rttWindowSize, int retryLimit, long lostTimeoutMs,
+            Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
+            double explorationFraction, boolean followerLinReads,
+            boolean admissionAwareRouting, double admitRateGamma) {
         this.applicationId = applicationId;
-        this.numServers = hosts.size();
+        this.transport = transport;
+        this.ownsTransport = ownsTransport;
+        this.numServers = transport.numServers();
         this.majority = (numServers / 2) + 1;
         this.mode = mode;
         this.retryLimit = retryLimit;
@@ -135,48 +160,11 @@ public final class KvSessionClient implements AutoCloseable {
         this.explorationFraction = explorationFraction;
         this.readAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.readSlas, admitRateGamma) : null;
         this.writeAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.writeSlas, admitRateGamma) : null;
-        this.streams = new ClientCallStreamObserver[numServers];
-        this.streamEverReady = new AtomicBoolean[numServers];
-        this.streamLocks = new Object[numServers];
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
         this.selector = mode.pileusRouting()
                 ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
                         explorationFraction, new Random())
                 : null;
-
-        for (int i = 0; i < numServers; i++) {
-            final int nodeId = i;
-            ManagedChannel channel = ManagedChannelBuilder.forAddress(hosts.get(i), basePort + i + 1)
-                    .usePlaintext().build();
-            channels.add(channel);
-            streamLocks[i] = new Object();
-            streamEverReady[i] = new AtomicBoolean(false);
-            // ClientResponseObserver exposes the request stream's flow-control
-            // view (isReady): dispatch sheds instead of buffering when the
-            // transport's send window is full.
-            KvClientGrpc.newStub(channel).session(new ClientResponseObserver<KvRequest, KvResponse>() {
-                @Override
-                public void beforeStart(ClientCallStreamObserver<KvRequest> requestStream) {
-                    streams[nodeId] = requestStream;
-                    requestStream.setOnReadyHandler(() -> streamEverReady[nodeId].set(true));
-                }
-
-                @Override
-                public void onNext(KvResponse response) {
-                    handleResponse(nodeId, response);
-                }
-
-                @Override
-                public void onError(Throwable t) {
-                    // Stream died (node crashed or shut down). Outstanding
-                    // requests on it will be scored as lost by the sweeper.
-                }
-
-                @Override
-                public void onCompleted() {
-                }
-            });
-        }
 
         this.lostSweeper = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "kv-client-lost-sweeper-app" + applicationId);
@@ -219,8 +207,9 @@ public final class KvSessionClient implements AutoCloseable {
     // ===== Sending =====
 
     public void sendRead(String key, int slaId) {
-        int uncommitted = uncommittedAnchor.get();
-        int committed = committedAnchor.get();
+        SessionAnchors anchors = sessionAnchors.get();
+        int uncommitted = anchors.uncommitted();
+        int committed = anchors.committed();
 
         List<RungScorer.Rung> sla = slaOf(readSlas, slaId);
         AdmitRates admitRates = admitRatesFor(true, slaId);
@@ -230,12 +219,12 @@ public final class KvSessionClient implements AutoCloseable {
         switch (mode) {
             case CHAMELEON -> targetNode = lowestRttNode(admitRates);
             case CHAMELEON_PILEUS -> {
-                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint,
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, leaderHint,
                         admitRates);
                 targetNode = choice == null ? lowestRttNode(admitRates) : choice.node();
             }
             case PILEUS -> {
-                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, committed, leaderHint,
+                PileusSelector.Choice choice = selector.chooseRead(sla, uncommitted, leaderHint,
                         admitRates);
                 if (choice == null) {
                     targetNode = lowestRttNode(admitRates);
@@ -288,6 +277,7 @@ public final class KvSessionClient implements AutoCloseable {
             }
         }
 
+        SessionAnchors anchors = sessionAnchors.get();
         KvRequest.Builder request = KvRequest.newBuilder()
                 .setRequestId(requestIdGen.incrementAndGet())
                 .setApplicationId(applicationId)
@@ -295,8 +285,8 @@ public final class KvSessionClient implements AutoCloseable {
                 .setIsRead(false)
                 .setKey(key)
                 .setValue(value)
-                .setCommittedSessionIndex(committedAnchor.get())
-                .setUncommittedSessionIndex(uncommittedAnchor.get());
+                .setCommittedSessionIndex(anchors.committed())
+                .setUncommittedSessionIndex(anchors.uncommitted());
         if (targetRung != null) {
             request.setRequestedWriteConcern(Math.min(Math.max(1, targetRung.strength()), majority));
         }
@@ -364,12 +354,18 @@ public final class KvSessionClient implements AutoCloseable {
         long nowNanos = System.nanoTime();
         long nowMs = System.currentTimeMillis();
         Pending previous = pending.get(request.getRequestId());
+        long deadlineNanos = previous != null
+                ? previous.deadlineNanos
+                : saturatedAdd(nowNanos, TimeUnit.MILLISECONDS.toNanos(
+                        (long) Math.ceil(longestDeadlineMs(request))));
         Pending entry = (previous != null)
                 // Retry: keep the original send instants so latency stays end
                 // to end and the prediction stays the first.
                 ? new Pending(request, previous.firstSendNanos, previous.firstSendMs, targetNode, attempt,
+                        deadlineNanos,
                         previous.predictedProfit, previous.targetThresholdMs)
                 : new Pending(request, nowNanos, nowMs, targetNode, attempt,
+                        deadlineNanos,
                         predictedProfit, targetThresholdMs);
         pending.put(request.getRequestId(), entry);
 
@@ -381,37 +377,49 @@ public final class KvSessionClient implements AutoCloseable {
         if (entry.targetThresholdMs > 0) {
             withRtt.setWaitBoundMs(Math.max(1.0, entry.targetThresholdMs - rtt));
         }
-        try {
-            synchronized (streamLocks[targetNode]) {
-                ClientCallStreamObserver<KvRequest> stream = streams[targetNode];
-                // Transport backpressure: a full send window means the wire to
-                // this node is saturated. Buffering more would add queue delay,
-                // not throughput - every latency and rho measurement would
-                // absorb the client's own backlog. Shed instead and count it,
-                // so overload shows up as ShedAtClient with honest latencies
-                // rather than as multi-second "in flight" phantoms. Guarded by
-                // everReady so the lazy connection handshake never sheds.
-                if (!stream.isReady() && streamEverReady[targetNode].get()) {
-                    pending.remove(request.getRequestId());
-                    ClientMetricsTracker.recordShedAtClient(targetNode, chosenLabel(request));
-                    return;
-                }
-                stream.onNext(withRtt.build());
+        long remainingDeadlineNanos = deadlineNanos - System.nanoTime();
+        if (remainingDeadlineNanos <= 0) {
+            if (pending.remove(request.getRequestId(), entry)) {
+                ClientMetricsTracker.recordDeadlineExceeded(targetNode, chosenLabel(request));
             }
-        } catch (RuntimeException e) {
-            // Stream unusable (node down): the sweeper scores it as lost.
+            return;
         }
+        long invocationStartedNanos = System.nanoTime();
+        entry.transportHandle = transport.execute(targetNode, withRtt.build(), remainingDeadlineNanos,
+                response -> handleResponse(targetNode, response, entry),
+                failure -> handleRpcError(targetNode, entry, failure));
+        double invocationMs = (System.nanoTime() - invocationStartedNanos) / 1_000_000.0;
+        ClientMetricsTracker.recordTransportCall(targetNode, chosenLabel(request), invocationMs);
+    }
+
+    private double longestDeadlineMs(KvRequest request) {
+        List<RungScorer.Rung> sla = slaOf(request.getIsRead() ? readSlas : writeSlas, request.getSlaId());
+        return sla.stream().mapToDouble(RungScorer.Rung::thresholdMs).max()
+                .orElseThrow(() -> new IllegalStateException("SLA has no rungs"));
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        return right > 0 && left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
     }
 
     // ===== Responses =====
 
-    private void handleResponse(int nodeId, KvResponse response) {
+    private void handleResponse(int nodeId, KvResponse response, Pending expected) {
+        long responseReceiveNanos = System.nanoTime();
+        long responseReceiveEpochMs = System.currentTimeMillis();
         Pending entry = pending.get(response.getRequestId());
-        if (entry == null) {
+        if (entry != expected) {
             return; // late duplicate after a retry resolved, or post-loss reply
         }
         KvRequest request = entry.request;
         String chosen = chosenLabel(request);
+
+        if (response.getDeadlineExceeded()) {
+            if (pending.remove(response.getRequestId(), entry)) {
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosen);
+            }
+            return;
+        }
 
         if (response.getNotLeader()) {
             int hinted = response.getLeaderId();
@@ -425,7 +433,7 @@ public final class KvSessionClient implements AutoCloseable {
                         : Math.floorMod(roundRobin.getAndIncrement(), numServers);
                 dispatch(request, target, entry.attempt + 1, 0, 0);
             } else {
-                pending.remove(response.getRequestId());
+                pending.remove(response.getRequestId(), entry);
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
             }
             return;
@@ -437,14 +445,14 @@ public final class KvSessionClient implements AutoCloseable {
             // the rejecting node on cold-start optimism. With admission-aware
             // routing the decayed admit/reject ratio carries that signal;
             // otherwise the selector's latency-penalty samples do.
-            pending.remove(response.getRequestId());
+            pending.remove(response.getRequestId(), entry);
             // A rejection is also a clean RTT sample: the server scores and
             // replies immediately, with no server-side waiting. Feeding it
             // keeps the estimator live under total rejection - otherwise
             // windows poisoned by an overload burst freeze (nothing is served,
             // so nothing updates rho) and the scorer keeps rejecting on the
             // stale estimate long after the queues have drained.
-            double rejectLatencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
+            double rejectLatencyMs = (responseReceiveNanos - entry.firstSendNanos) / 1_000_000.0;
             rttEstimator.observe(nodeId, rejectLatencyMs, response.getServiceTimeMs(), response.getWaited());
             AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
             if (admitRates != null) {
@@ -456,7 +464,8 @@ public final class KvSessionClient implements AutoCloseable {
                     selector.observeWriteRejected(request.getRequestedWriteConcern());
                 }
             }
-            ClientMetricsTracker.recordRejected(nodeId, chosen);
+            ClientMetricsTracker.recordRejected(nodeId, chosen, rejectLatencyMs,
+                    response.getServerReplyEpochMs(), responseReceiveEpochMs);
             return;
         }
 
@@ -465,13 +474,15 @@ public final class KvSessionClient implements AutoCloseable {
                 dispatch(request, Math.floorMod(roundRobin.getAndIncrement(), numServers), entry.attempt + 1,
                         0, 0);
             } else {
-                pending.remove(response.getRequestId());
+                pending.remove(response.getRequestId(), entry);
                 ClientMetricsTracker.recordFailure(nodeId, chosen);
             }
             return;
         }
 
-        pending.remove(response.getRequestId());
+        if (!pending.remove(response.getRequestId(), entry)) {
+            return;
+        }
         double latencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
         rttEstimator.observe(nodeId, latencyMs, response.getServiceTimeMs(), response.getWaited());
         AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
@@ -494,7 +505,7 @@ public final class KvSessionClient implements AutoCloseable {
                         latencyMs);
             }
             verdict = ClientGrader.gradeRead(slaOf(readSlas, request.getSlaId()), response,
-                    request.getUncommittedSessionIndex(), request.getCommittedSessionIndex(), latencyMs);
+                    request.getUncommittedSessionIndex(), latencyMs);
             upgraded = verdict.gradedStrength() > readFloors.get(request.getSlaId());
         } else {
             int index = response.getValueIndex();
@@ -506,16 +517,64 @@ public final class KvSessionClient implements AutoCloseable {
             }
             verdict = ClientGrader.gradeWrite(slaOf(writeSlas, request.getSlaId()), response, latencyMs);
             upgraded = response.getDeliveredWriteConcern() > writeFloors.get(request.getSlaId());
-            uncommittedAnchor.accumulateAndGet(index, Math::max);
-            if (response.getDeliveredWriteConcern() >= majority && !response.getTimedOutAndFellBack()) {
-                committedAnchor.accumulateAndGet(index, Math::max);
-            }
+            boolean majorityAcknowledged = response.getDeliveredWriteConcern() >= majority
+                    && !response.getTimedOutAndFellBack();
+            sessionAnchors.updateAndGet(current -> new SessionAnchors(
+                    Math.max(current.uncommitted(), index),
+                    majorityAcknowledged ? Math.max(current.committed(), index) : current.committed()));
         }
 
         double predicted = mode.chameleonDecision() ? response.getPredictedProfit() : entry.predictedProfit;
         ClientMetricsTracker.recordResponse(nodeId, chosen, executed, latencyMs,
                 response.getTimedOutAndFellBack(), verdict.deadlineViolation(),
                 predicted, verdict.realizedProfit(), verdict.satisfiedRung(), upgraded, response.getWaited());
+    }
+
+    private void handleRpcError(int nodeId, Pending entry, KvFramedTransport.RpcFailure failure) {
+        Status status = failure.status();
+        long requestId = entry.request.getRequestId();
+        if (pending.get(requestId) != entry) {
+            return;
+        }
+        if (status.getCode() == Status.Code.DEADLINE_EXCEEDED) {
+            if (pending.remove(requestId, entry)) {
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosenLabel(entry.request));
+            }
+            return;
+        }
+        if (status.getCode() == Status.Code.RESOURCE_EXHAUSTED) {
+            if (!pending.remove(requestId, entry)) {
+                return;
+            }
+            KvRequest request = entry.request;
+            double rejectLatencyMs = (System.nanoTime() - entry.firstSendNanos) / 1_000_000.0;
+            rttEstimator.observe(nodeId, rejectLatencyMs, 0, false);
+            AdmitRates admitRates = admitRatesFor(request.getIsRead(), request.getSlaId());
+            if (admitRates != null) {
+                admitRates.onReject(nodeId);
+            } else if (selector != null) {
+                if (request.getIsRead()) {
+                    selector.observeReadRejected(nodeId, request.getWantLinearizable());
+                } else {
+                    selector.observeWriteRejected(request.getRequestedWriteConcern());
+                }
+            }
+            ClientMetricsTracker.recordRejected(nodeId, chosenLabel(request), rejectLatencyMs,
+                    failure.serverReplyEpochMs(), System.currentTimeMillis());
+            return;
+        }
+        if (entry.attempt < retryLimit && System.nanoTime() < entry.deadlineNanos) {
+            dispatch(entry.request, Math.floorMod(roundRobin.getAndIncrement(), numServers),
+                    entry.attempt + 1, 0, 0);
+            return;
+        }
+        if (pending.remove(requestId, entry)) {
+            if (System.nanoTime() >= entry.deadlineNanos) {
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosenLabel(entry.request));
+            } else {
+                ClientMetricsTracker.recordFailure(nodeId, chosenLabel(entry.request));
+            }
+        }
     }
 
     private static String chosenLabel(KvRequest request) {
@@ -535,6 +594,10 @@ public final class KvSessionClient implements AutoCloseable {
             Map.Entry<Long, Pending> e = it.next();
             if (now - e.getValue().firstSendMs >= lostTimeoutMs) {
                 it.remove();
+                KvFramedTransport.RequestHandle handle = e.getValue().transportHandle;
+                if (handle != null) {
+                    handle.cancel();
+                }
                 ClientMetricsTracker.recordLost(e.getValue().targetNode, chosenLabel(e.getValue().request));
             }
         }
@@ -546,18 +609,19 @@ public final class KvSessionClient implements AutoCloseable {
 
     @Override
     public void close() {
-        lostSweeper.shutdownNow();
-        for (int i = 0; i < numServers; i++) {
-            try {
-                synchronized (streamLocks[i]) {
-                    streams[i].onCompleted();
-                }
-            } catch (RuntimeException ignored) {
-                // Stream already dead.
-            }
+        if (!closed.compareAndSet(false, true)) {
+            return;
         }
-        for (ManagedChannel channel : channels) {
-            channel.shutdownNow();
+        lostSweeper.shutdownNow();
+        pending.values().forEach(entry -> {
+            KvFramedTransport.RequestHandle handle = entry.transportHandle;
+            if (handle != null) {
+                handle.cancel();
+            }
+        });
+        pending.clear();
+        if (ownsTransport) {
+            transport.close();
         }
     }
 }

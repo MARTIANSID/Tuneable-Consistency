@@ -66,6 +66,7 @@ public final class MeasurementPlane implements AutoCloseable {
     private final int majority;
     private final ServiceTimeHistograms histograms;
     private final OccupancyMeter occupancy = new OccupancyMeter();
+    private final ServerDrainMetrics drainMetrics;
 
     // Cross-check: completed callback service excludes pre-callback queueing,
     // while the authoritative occupancy integral includes it. The two agree
@@ -87,6 +88,7 @@ public final class MeasurementPlane implements AutoCloseable {
         this.nodeId = nodeId;
         this.majority = (numServers / 2) + 1;
         this.histograms = new ServiceTimeHistograms(5 + majority, HISTOGRAM_DECAY);
+        this.drainMetrics = new ServerDrainMetrics(nodeId);
         this.uncalibratedRiders = new java.util.concurrent.atomic.AtomicInteger[5 + majority][ServiceTimeHistograms.GAP_BUCKETS];
         for (int l = 0; l < 5 + majority; l++) {
             for (int g = 0; g < ServiceTimeHistograms.GAP_BUCKETS; g++) {
@@ -104,6 +106,7 @@ public final class MeasurementPlane implements AutoCloseable {
                 CONTROL_INTERVAL_MS, CONTROL_INTERVAL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::dumpHistograms,
                 HISTOGRAM_DUMP_INTERVAL_MS, HISTOGRAM_DUMP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(drainMetrics::flush, 1000, 1000, TimeUnit.MILLISECONDS);
     }
 
     // ===== Level indexing =====
@@ -122,12 +125,16 @@ public final class MeasurementPlane implements AutoCloseable {
 
     // ===== Hot path =====
 
-    /** A deframed request holds a slot from here through its terminal reply. */
+    /** An ingress-admitted frame holds a slot from here through its terminal reply. */
     public void requestAdmitted() {
         occupancy.onEvent(1);
     }
 
-    /** Close slots for deframed messages whose stream ended before their callback began. */
+    ServerDrainMetrics drainMetrics() {
+        return drainMetrics;
+    }
+
+    /** Close slots cancelled after transport admission and before completion. */
     public void requestsAbandonedBeforeCallback(int count) {
         if (count <= 0) {
             throw new IllegalArgumentException("abandoned request count must be positive, got " + count);
@@ -274,5 +281,6 @@ public final class MeasurementPlane implements AutoCloseable {
     @Override
     public void close() {
         scheduler.shutdownNow();
+        drainMetrics.flush();
     }
 }

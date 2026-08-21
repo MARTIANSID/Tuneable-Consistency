@@ -14,7 +14,7 @@ Reads: eventual-local, eventual-majority, causal-local, causal-majority, lineari
 
 Local means the replica's log, which may contain uncommitted entries that a leader change can roll back. Majority means committed state. That distinction is real and must be stated in any writeup, because a reader assuming stock Raft will assume followers only apply committed entries.
 
-Causal-local waits until the local log index reaches the client's uncommitted session index. Causal-majority waits until the commit index reaches the client's committed session index. Linearizable is leader-only.
+Causal-local waits until the local log index reaches the client's uncommitted session index. Causal-majority waits until the commit index reaches that same uncommitted session index. Linearizable is leader-only and must also cover that causal frontier.
 
 Implement linearizable with ReadIndex, not with a no-op append and not as an entry. The leader records its commit index, confirms leadership via a heartbeat round with a majority, waits for its applied index to reach the recorded value, then serves locally. No log entry is created, and reads batch onto whatever AppendEntries round is already in flight. Consider follower linearizable reads (follower obtains the read index from the leader, waits for its own apply to catch up) as a way to relieve leader concentration.
 
@@ -30,7 +30,7 @@ Request carries: application id, SLA id, operation (read or write, key, value), 
 
 Send the RTT rather than a pre-subtracted budget, because the SLA has several thresholds and the server subtracts from each.
 
-Send both committed and uncommitted session indices, not one. Causal-local checks against the uncommitted index; causal-majority checks against the committed index. Folding them together means a wc:1 acknowledgment at an uncommitted index makes every later causal-majority read wait for an index that may never commit.
+Send both committed and uncommitted session indices. The committed index records the highest majority-acknowledged write for session history and diagnostics. The uncommitted index records the highest write acknowledged at any concern and is the causal frontier for both causal-local and causal-majority. If a wc:1 write never commits, a later causal-majority or linearizable read cannot honestly satisfy read-your-writes and must time out or fall back instead of claiming that consistency level.
 
 Response carries: the value or acknowledgment, the level actually delivered, which rung was satisfied, the node's current log index, the node's current commit index, and the server-side service time.
 
@@ -70,8 +70,9 @@ For each legal level `c`, compute the gap it must close before it can be served:
 
 - eventual-local, eventual-majority: gap is zero, both values are already local
 - causal-local: `gap = client_uncommitted_index - local_log_index`
-- causal-majority: `gap = client_committed_index - commit_index`
-- linearizable and write concerns: no gap dimension, they wait on rounds rather than indices
+- causal-majority: `gap = client_uncommitted_index - commit_index`
+- linearizable: `gap = client_uncommitted_index - commit_index`, in addition to the ReadIndex round
+- write concerns: no gap dimension, they wait on rounds rather than indices
 
 Bucket the gap coarsely based on the maximum batch size, for example into buckets for `gap <= 0`, `1..2000`, `2001..20000`, `> 20000`. Everything at or below zero lands in the same bucket, whose observed waits are near zero, so the case where an upgrade is free emerges from measured data rather than from a special rule.
 

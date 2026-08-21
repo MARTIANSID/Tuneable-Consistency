@@ -28,7 +28,7 @@ import io.grpc.StatusRuntimeException;
 
 /**
  * Experiment entry point for the workload side: drives the phased workload
- * through per-application KvSessionClients over real gRPC streams against a
+ * through per-application KvSessionClients over persistent framed connections against a
  * cluster of server processes (org.example.Server.ServerNode, one per node).
  * Cluster orchestration that used to happen on in-process ServerImpl
  * references - leader detection, failure injection, teardown - goes over the
@@ -40,6 +40,7 @@ public class WorkloadDriver {
     // ===== Configuration (loaded from YAML/JSON at startup, see ExperimentConfig) =====
     public static int NUM_OF_SERVERS;
     private static int SERVER_BASE_PORT;
+    private static int CLIENT_BASE_PORT;
     private static List<String> SERVER_HOSTS;
 
     private static boolean ENABLE_NODE_NETWORK_FAILURE;
@@ -57,6 +58,7 @@ public class WorkloadDriver {
     private static int RTT_WINDOW_SIZE;
     private static int CLIENT_RETRY_LIMIT;
     private static int CLIENT_LOST_TIMEOUT_MS;
+    private static int INGRESS_CONNECTIONS_PER_SERVER;
 
     // Number of applications, derived from the registered SLAs (the config
     // loader guarantees applicationIds are exactly 1..N).
@@ -146,9 +148,10 @@ public class WorkloadDriver {
     private static final List<ManagedChannel> adminChannels = new ArrayList<>();
     // appSessions[app][session]: independent session clients per application,
     // drawn uniformly per request. Every session carries its own full client
-    // state (session anchors, per-key floors, RTT windows, Pileus windows,
-    // gRPC streams); only the metrics ledger is shared.
+    // state (session anchors, per-key floors, RTT windows, Pileus windows);
+    // only the framed transport and metrics ledger are shared.
     private static KvSessionClient[][] appSessions;
+    private static KvFramedTransport framedTransport;
     private static int SESSIONS_PER_APPLICATION;
     // Injection threads; sessions are sharded across them so every session
     // stays driven by exactly one thread (a session is one logical actor).
@@ -164,6 +167,7 @@ public class WorkloadDriver {
     static void applyConfig(ExperimentConfig config) {
         NUM_OF_SERVERS = config.cluster.numServers;
         SERVER_BASE_PORT = config.cluster.serverBasePort;
+        CLIENT_BASE_PORT = config.cluster.clientBasePort;
         SERVER_HOSTS = List.copyOf(config.cluster.serverHosts);
 
         ENABLE_NODE_NETWORK_FAILURE = config.nodeFailure.enabled;
@@ -176,6 +180,7 @@ public class WorkloadDriver {
         RTT_WINDOW_SIZE = config.client.rttWindowSize;
         CLIENT_RETRY_LIMIT = config.client.retryLimit;
         CLIENT_LOST_TIMEOUT_MS = config.client.lostTimeoutMs;
+        INGRESS_CONNECTIONS_PER_SERVER = config.client.ingressConnectionsPerServer;
         CLIENT_MODE = ClientMode.fromConfig(config.mode);
         EXPLORATION_FRACTION = config.client.explorationFraction;
         ADMISSION_AWARE_ROUTING = config.client.admissionAwareRouting;
@@ -239,10 +244,12 @@ public class WorkloadDriver {
         waitForClusterReachable();
         applyNodeFailureConfig();
 
+        framedTransport = new KvFramedTransport(SERVER_HOSTS, CLIENT_BASE_PORT,
+                INGRESS_CONNECTIONS_PER_SERVER);
         appSessions = new KvSessionClient[NUM_APPLICATIONS][SESSIONS_PER_APPLICATION];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
             for (int session = 0; session < SESSIONS_PER_APPLICATION; session++) {
-                appSessions[app][session] = new KvSessionClient(app + 1, SERVER_HOSTS, SERVER_BASE_PORT, CLIENT_MODE,
+                appSessions[app][session] = new KvSessionClient(app + 1, framedTransport, CLIENT_MODE,
                         RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
                         readSlasByApp.get(app + 1), writeSlasByApp.get(app + 1),
                         EXPLORATION_FRACTION, FOLLOWER_LIN_READS,
@@ -500,7 +507,6 @@ public class WorkloadDriver {
             long lastSent = 0;
             long lastServed = 0;
             long lastRejected = 0;
-            long lastShed = 0;
             long lastLost = 0;
             long lastViolations = 0;
             double lastPredicted = 0;
@@ -520,22 +526,20 @@ public class WorkloadDriver {
                     long sent = totalInjected.sum();
                     long served = ClientMetricsTracker.totalResponses();
                     long rejectedNow = ClientMetricsTracker.totalRejected();
-                    long shedNow = ClientMetricsTracker.totalShedAtClient();
                     long lostNow = ClientMetricsTracker.totalLost();
                     long violationsNow = ClientMetricsTracker.totalViolations();
                     double predictedNow = ClientMetricsTracker.totalPredictedProfit();
                     double realizedNow = ClientMetricsTracker.totalRealizedProfit();
                     System.out.printf(
-                            "[%02ds] Sent=%d | Served=%d | Rejected=%d | Shed=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
+                            "[%02ds] Sent=%d | Served=%d | Rejected=%d | Lost=%d | Violations=%d | PredictedProfit=%.0f | RealizedProfit=%.0f | Phase=%s | TotalTPS=%d%n",
                             elapsedSeconds, sent - lastSent, served - lastServed,
-                            rejectedNow - lastRejected, shedNow - lastShed, lostNow - lastLost,
+                            rejectedNow - lastRejected, lostNow - lastLost,
                             violationsNow - lastViolations,
                             predictedNow - lastPredicted, realizedNow - lastRealized,
                             phase.name, phase.totalTPS);
                     lastSent = sent;
                     lastServed = served;
                     lastRejected = rejectedNow;
-                    lastShed = shedNow;
                     lastLost = lostNow;
                     lastViolations = violationsNow;
                     lastPredicted = predictedNow;
@@ -561,14 +565,15 @@ public class WorkloadDriver {
             ClientMetricsTracker.flushNow();
             long violations = ClientMetricsTracker.totalViolations();
             System.out.printf(
-                    "%nExperiment completed. Sent=%d Responses=%d Rejected=%d ShedAtClient=%d Lost=%d Violations=%d%n",
+                    "%nExperiment completed. Sent=%d Responses=%d Rejected=%d Lost=%d Violations=%d%n",
                     totalInjected.sum(), ClientMetricsTracker.totalResponses(), ClientMetricsTracker.totalRejected(),
-                    ClientMetricsTracker.totalShedAtClient(), ClientMetricsTracker.totalLost(), violations);
+                    ClientMetricsTracker.totalLost(), violations);
             for (KvSessionClient[] sessions : appSessions) {
                 for (KvSessionClient client : sessions) {
                     client.close();
                 }
             }
+            framedTransport.close();
             System.out.println("Shutting down server processes...");
             shutdownCluster();
             // Deadline violations are an expected experiment outcome under

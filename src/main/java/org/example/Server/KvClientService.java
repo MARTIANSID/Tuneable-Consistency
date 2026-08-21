@@ -3,33 +3,32 @@ package org.example.Server;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import org.example.Utility.Grading;
 import org.example.Utility.RungScorer;
-import org.example.raft.KvClientGrpc;
 import org.example.raft.KvRequest;
 import org.example.raft.KvResponse;
 import org.example.raft.ReadLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
-
 /**
- * The client-facing per-request path. A stream tracer opens the occupancy slot
- * after message deframing, before callback scheduling; this callback starts
- * service timing and closes the slot at the terminal reply. The rung scorer
+ * The client-facing execution path behind the framed transport admission
+ * gate. The ingress event loop opens occupancy before protobuf parsing and
+ * closes it at the terminal reply. The rung scorer
  * considers the legal levels for this node and
  * operation are scored against the registered SLA (steps 2-4), the best
  * scoring level wins, and requests worth less than the capacity they consume
  * are rejected (step 5). There are no modes anywhere: degradation under load
  * comes from the shadow price lambda rising, not from anything flipping.
  *
- * Admission backstops (step 5): the hard occupancy cap at 1.5x S_max and the
- * leader's replication rate bucket for writes cover model error within a
- * single request rather than a control interval.
+ * The framed transport applies the hard occupancy cap before protobuf
+ * parsing, then places accepted work into a bounded service-wide queue. SLA
+ * scoring and operation setup
+ * run on that queue's workers, allowing inbound callbacks to keep draining.
+ * The leader's replication rate bucket remains the final write backstop.
  *
  * Execution (step 6) is unchanged mechanics: eventual levels read a view,
  * causal levels wait for an index, linearizable runs ReadIndex, write
@@ -39,7 +38,7 @@ import io.grpc.stub.StreamObserver;
  * its sample under the chosen level at the bound, and files nothing under the
  * fallback (step 8).
  */
-public final class KvClientService extends KvClientGrpc.KvClientImplBase {
+public final class KvClientService implements KvRequestHandler, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(KvClientService.class);
 
@@ -77,63 +76,78 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     private final ServerImpl node;
     private final MeasurementPlane plane;
     private final ReplicationRateBucket replicationBucket;
+    private final ServerAdmissionQueue admissionQueue;
+    private final int admissionCapacity;
 
     public KvClientService(ServerImpl node, MeasurementPlane plane) {
         this.node = node;
         this.plane = plane;
         this.replicationBucket = new ReplicationRateBucket(REPLICATION_BUDGET_PER_SECOND);
+        this.admissionCapacity = configuredAdmissionCapacity();
+        this.admissionQueue = new ServerAdmissionQueue(admissionCapacity,
+                Runtime.getRuntime().availableProcessors(), node.nodeId(), plane.drainMetrics());
+    }
+
+    private static int configuredAdmissionCapacity() {
+        double capacity = Math.ceil(1.5 * MeasurementPlane.sMax());
+        if (!Double.isFinite(capacity) || capacity < 1 || capacity > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("1.5 * sMax must be in [1, " + Integer.MAX_VALUE
+                    + "], got " + capacity);
+        }
+        return (int) capacity;
+    }
+
+    int admissionCapacity() {
+        return admissionCapacity;
     }
 
     @Override
-    public StreamObserver<KvRequest> session(StreamObserver<KvResponse> responseObserver) {
-        ServerIngressOccupancyTracer ingress = ServerIngressOccupancyTracer.current();
-        if (ingress == null) {
-            throw Status.INTERNAL.withDescription("server ingress occupancy tracer is not installed")
-                    .asRuntimeException();
+    public void execute(KvRequest request, long tRecvNanos, KvResponseSink out) {
+        if (out.isFinished()) {
+            return;
         }
-        return new StreamObserver<>() {
-            @Override
-            public void onNext(KvRequest request) {
-                ingress.callbackStarted();
-                long tRecvNanos = System.nanoTime();
-                try {
-                    handle(request, tRecvNanos, responseObserver);
-                } catch (Exception e) {
-                    LOG.error("Request {} failed on server {}", request.getRequestId(), node.nodeId(), e);
-                    send(responseObserver, failure(request), tRecvNanos);
-                }
-            }
-
-            @Override
-            public void onError(Throwable t) {
-                // Client went away; pending waits reply into a cancelled
-                // stream and are dropped by send().
-            }
-
-            @Override
-            public void onCompleted() {
-                synchronized (responseObserver) {
-                    responseObserver.onCompleted();
-                }
-            }
-        };
-    }
-
-    private void handle(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
         if (node.isDropAllServerNetworkTraffic()) {
             send(out, failure(request), tRecvNanos);
             return;
         }
-        // Hard occupancy cap: an immediate backstop that reacts within one
-        // request; the price covers the control-interval timescale.
-        if (plane.inFlight() > 1.5 * MeasurementPlane.sMax()) {
-            send(out, rejected(request), tRecvNanos);
+        if (out.remainingDeadlineMs() <= 0) {
+            send(out, deadlineExceeded(request), tRecvNanos);
             return;
         }
+        try {
+            if (!admissionQueue.trySubmit(() -> processQueued(request, tRecvNanos, out))) {
+                plane.drainMetrics().rejected(ServerDrainMetrics.RejectionReason.ADMISSION_QUEUE_FULL);
+                send(out, rejected(request), tRecvNanos);
+            }
+        } catch (RejectedExecutionException e) {
+            LOG.error("Admission executor rejected request {} on server {}",
+                    request.getRequestId(), node.nodeId(), e);
+            send(out, failure(request), tRecvNanos);
+        }
+    }
+
+    private void processQueued(KvRequest request, long tRecvNanos, KvResponseSink responseObserver) {
+        if (responseObserver.isFinished()) {
+            return;
+        }
+        if (responseObserver.remainingDeadlineMs() <= 0) {
+            send(responseObserver, deadlineExceeded(request), tRecvNanos);
+            return;
+        }
+        try {
+            handle(request, tRecvNanos, responseObserver);
+        } catch (Exception e) {
+            LOG.error("Request {} failed on server {}", request.getRequestId(), node.nodeId(), e);
+            send(responseObserver, failure(request), tRecvNanos);
+        }
+    }
+
+    private void handle(KvRequest request, long tRecvNanos, KvResponseSink out) {
         if (request.getIsRead()) {
             if (CHAMELEON_DECISION) {
                 handleRead(request, tRecvNanos, out);
             } else {
+                plane.drainMetrics().executionAdmitted();
                 dumbRead(request, tRecvNanos, out);
             }
         } else {
@@ -156,12 +170,26 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
     // replication bucket.
 
     /** The client's d_max analog: its wait bound, clamped to maxWaitMs. */
-    private long requestBound(KvRequest request) {
+    private long requestBound(KvRequest request, KvResponseSink out) {
         double bound = request.getWaitBoundMs();
-        return bound > 0 ? Math.min((long) Math.ceil(bound), MAX_WAIT_MS) : MAX_WAIT_MS;
+        long configured = bound > 0 ? Math.min((long) Math.ceil(bound), MAX_WAIT_MS) : MAX_WAIT_MS;
+        return boundByRpcDeadline(out, configured);
     }
 
-    private void dumbRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+    /** Confirm linearizability and make the committed view cover this session's causal frontier. */
+    private CompletableFuture<Void> linearizableReady(KvRequest request) {
+        CompletableFuture<Integer> confirmed = node.isLeader()
+                ? node.confirmLeadership()
+                : node.readIndexFromLeader();
+        return confirmed.thenCompose(readIndex -> {
+            int requiredIndex = Math.max(readIndex, request.getUncommittedSessionIndex());
+            return node.currentCommitIndex() >= requiredIndex
+                    ? CompletableFuture.completedFuture(null)
+                    : node.awaitCommitIndex(requiredIndex);
+        });
+    }
+
+    private void dumbRead(KvRequest request, long tRecvNanos, KvResponseSink out) {
         if (!request.getWantLinearizable()) {
             send(out, dumbReadReply(request, ReadLevel.EVENTUAL_MAJORITY, false, false), tRecvNanos);
             return;
@@ -170,13 +198,8 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             send(out, notLeader(request), tRecvNanos);
             return;
         }
-        CompletableFuture<Void> ready = node.isLeader()
-                ? node.confirmLeadership().thenApply(readIndex -> null)
-                : node.readIndexFromLeader().thenCompose(readIndex ->
-                        node.currentCommitIndex() >= readIndex
-                                ? CompletableFuture.completedFuture(null)
-                                : node.awaitCommitIndex(readIndex));
-        ready.orTimeout(requestBound(request), TimeUnit.MILLISECONDS)
+        CompletableFuture<Void> ready = linearizableReady(request);
+        ready.orTimeout(requestBound(request, out), TimeUnit.MILLISECONDS)
                 .whenCompleteAsync((v, error) -> {
                     if (error == null) {
                         send(out, dumbReadReply(request, ReadLevel.LINEARIZABLE, true, false), tRecvNanos);
@@ -202,16 +225,18 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 .setSatisfiedRung(-1), request.getKey());
     }
 
-    private void dumbWrite(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+    private void dumbWrite(KvRequest request, long tRecvNanos, KvResponseSink out) {
         if (!node.isLeader()) {
             send(out, notLeader(request), tRecvNanos);
             return;
         }
         int writeConcern = Math.min(Math.max(1, request.getRequestedWriteConcern()), node.majority());
         if (!replicationBucket.tryCharge()) {
+            plane.drainMetrics().rejected(ServerDrainMetrics.RejectionReason.REPLICATION_BUDGET);
             send(out, rejected(request), tRecvNanos);
             return;
         }
+        plane.drainMetrics().executionAdmitted();
         int index;
         try {
             index = node.appendWrite(request.getKey(), request.getValue(),
@@ -227,7 +252,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         CompletableFuture<Void> wait = (writeConcern >= node.majority())
                 ? node.awaitCommitIndex(index)
                 : node.awaitReplication(index, writeConcern);
-        awaitBounded(wait, requestBound(request),
+        awaitBounded(wait, requestBound(request, out),
                 () -> send(out, dumbWriteReply(request, index, writeConcern, true, false), tRecvNanos),
                 () -> send(out, dumbWriteReply(request, index, node.replicaCount(index), true, true), tRecvNanos));
     }
@@ -325,7 +350,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
 
     // ===== Reads =====
 
-    private void handleRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+    private void handleRead(KvRequest request, long tRecvNanos, KvResponseSink out) {
         List<RungScorer.Rung> sla = SlaRegistry.readSla(request.getApplicationId(), request.getSlaId());
         if (sla == null) {
             LOG.error("No read SLA registered for applicationId={} slaId={}", request.getApplicationId(),
@@ -336,10 +361,9 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         boolean leader = node.isLeader();
         // Linearizable is leader-only unless follower reads are enabled.
         int maxLevel = (leader || FOLLOWER_LINEARIZABLE_READS) ? READ_LEVELS - 1 : READ_LEVELS - 2;
-        double rho = request.getRttEstimateMs();
+        double rho = effectiveRttMs(request, out);
         double lambda = plane.lambda();
         int uncommittedAnchor = request.getUncommittedSessionIndex();
-        int committedAnchor = request.getCommittedSessionIndex();
 
         List<Candidate> candidates = new ArrayList<>(READ_LEVELS);
         int satisfiableAnywhere = 0;
@@ -347,7 +371,8 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             // Step 3: the gap each level must close, bucketed coarsely.
             long gap = switch (ReadLevel.forNumber(level)) {
                 case CAUSAL_LOCAL -> (long) uncommittedAnchor - node.lastLogIndex();
-                case CAUSAL_MAJORITY -> (long) committedAnchor - node.currentCommitIndex();
+                case CAUSAL_MAJORITY, LINEARIZABLE ->
+                    (long) uncommittedAnchor - node.currentCommitIndex();
                 default -> 0L;
             };
             Candidate candidate = scoreLevel(sla, level, level, ServiceTimeHistograms.gapBucketOf(gap), rho, lambda);
@@ -365,17 +390,20 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
 
         Candidate chosen = choose(candidates, level -> level);
         if (chosen == null) {
+            plane.drainMetrics().rejected(ServerDrainMetrics.RejectionReason.SCORER);
             send(out, rejected(request), tRecvNanos);
             return;
         }
 
+        plane.drainMetrics().executionAdmitted();
         executeRead(request, tRecvNanos, out, chosen);
     }
 
-    private void executeRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out, Candidate chosen) {
+    private void executeRead(KvRequest request, long tRecvNanos, KvResponseSink out, Candidate chosen) {
         String key = request.getKey();
         ReadLevel level = ReadLevel.forNumber(chosen.levelIndex);
-        long boundMs = Math.min((long) Math.ceil(chosen.scored.dMaxMs()), MAX_WAIT_MS);
+        long boundMs = boundByRpcDeadline(out,
+                Math.min((long) Math.ceil(chosen.scored.dMaxMs()), MAX_WAIT_MS));
 
         switch (level) {
             case EVENTUAL_LOCAL -> completeRead(request, tRecvNanos, out, chosen, ReadLevel.EVENTUAL_LOCAL,
@@ -396,7 +424,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 }
             }
             case CAUSAL_MAJORITY -> {
-                int anchor = request.getCommittedSessionIndex();
+                int anchor = request.getUncommittedSessionIndex();
                 if (anchor < 0 || node.currentCommitIndex() >= anchor) {
                     completeRead(request, tRecvNanos, out, chosen, ReadLevel.CAUSAL_MAJORITY,
                             node.kv.readCommitted(key), false, false, 0);
@@ -413,12 +441,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 // covers the returned index (state-before-index). Follower
                 // (flag-gated): fetch the confirmed index from the leader,
                 // then wait for the own commit index to reach it.
-                CompletableFuture<Void> ready = node.isLeader()
-                        ? node.confirmLeadership().thenApply(readIndex -> null)
-                        : node.readIndexFromLeader().thenCompose(readIndex ->
-                                node.currentCommitIndex() >= readIndex
-                                        ? CompletableFuture.completedFuture(null)
-                                        : node.awaitCommitIndex(readIndex));
+                CompletableFuture<Void> ready = linearizableReady(request);
                 ready.orTimeout(boundMs, TimeUnit.MILLISECONDS)
                         .whenCompleteAsync((v, error) -> {
                             if (error == null) {
@@ -442,7 +465,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
      * the bound when the wait was abandoned), release any cold-start rider,
      * grade what was actually delivered (step 7), and reply.
      */
-    private void completeRead(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out, Candidate chosen,
+    private void completeRead(KvRequest request, long tRecvNanos, KvResponseSink out, Candidate chosen,
             ReadLevel delivered, KvStore.Versioned versioned, boolean waited, boolean fellBack, long abandonedAtMs) {
         double serviceMs = (System.nanoTime() - tRecvNanos) / 1_000_000.0;
         plane.fileServiceTime(chosen.levelIndex, chosen.gapBucket, fellBack ? abandonedAtMs : serviceMs);
@@ -455,7 +478,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         boolean localView = delivered == ReadLevel.EVENTUAL_LOCAL || delivered == ReadLevel.CAUSAL_LOCAL;
         int graded = Grading.gradeRead(delivered, valueIndex, commitIndex,
                 localView ? node.lastLogIndex() : commitIndex,
-                request.getUncommittedSessionIndex(), request.getCommittedSessionIndex());
+                request.getUncommittedSessionIndex());
         Grading.Realized realized = Grading.realize(
                 SlaRegistry.readSla(request.getApplicationId(), request.getSlaId()),
                 graded, serviceMs + request.getRttEstimateMs());
@@ -476,7 +499,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
 
     // ===== Writes =====
 
-    private void handleWrite(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out) {
+    private void handleWrite(KvRequest request, long tRecvNanos, KvResponseSink out) {
         if (!node.isLeader()) {
             // Writes are illegal on followers: redirect rather than reject (step 2).
             send(out, notLeader(request), tRecvNanos);
@@ -489,7 +512,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             send(out, failure(request), tRecvNanos);
             return;
         }
-        double rho = request.getRttEstimateMs();
+        double rho = effectiveRttMs(request, out);
         double lambda = plane.lambda();
 
         List<Candidate> candidates = new ArrayList<>(node.majority());
@@ -498,6 +521,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         }
         Candidate chosen = choose(candidates, plane::writeLevelIndex);
         if (chosen == null) {
+            plane.drainMetrics().rejected(ServerDrainMetrics.RejectionReason.SCORER);
             send(out, rejected(request), tRecvNanos);
             return;
         }
@@ -505,10 +529,12 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         // admission, never returned. Empty bucket is the hard backstop.
         if (!replicationBucket.tryCharge()) {
             releaseRider(chosen);
+            plane.drainMetrics().rejected(ServerDrainMetrics.RejectionReason.REPLICATION_BUDGET);
             send(out, rejected(request), tRecvNanos);
             return;
         }
 
+        plane.drainMetrics().executionAdmitted();
         int writeConcern = chosen.levelIndex;
         int index;
         try {
@@ -525,7 +551,8 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
             return;
         }
 
-        long boundMs = Math.min((long) Math.ceil(chosen.scored.dMaxMs()), MAX_WAIT_MS);
+        long boundMs = boundByRpcDeadline(out,
+                Math.min((long) Math.ceil(chosen.scored.dMaxMs()), MAX_WAIT_MS));
         CompletableFuture<Void> wait = (writeConcern >= node.majority())
                 ? node.awaitCommitIndex(index)
                 : node.awaitReplication(index, writeConcern);
@@ -535,7 +562,7 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                         boundMs));
     }
 
-    private void completeWrite(KvRequest request, long tRecvNanos, StreamObserver<KvResponse> out, Candidate chosen,
+    private void completeWrite(KvRequest request, long tRecvNanos, KvResponseSink out, Candidate chosen,
             int entryIndex, int deliveredWriteConcern, boolean waited, boolean fellBack, long abandonedAtMs) {
         double serviceMs = (System.nanoTime() - tRecvNanos) / 1_000_000.0;
         plane.fileServiceTime(plane.writeLevelIndex(chosen.levelIndex), chosen.gapBucket,
@@ -568,6 +595,14 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
         if (chosen.uncalibrated) {
             plane.releaseUncalibratedRider(chosen.levelIndex, chosen.gapBucket);
         }
+    }
+
+    private double effectiveRttMs(KvRequest request, KvResponseSink out) {
+        return Math.max(request.getRttEstimateMs(), out.ingressElapsedMs());
+    }
+
+    private long boundByRpcDeadline(KvResponseSink out, long requestedMs) {
+        return Math.max(1, Math.min(requestedMs, (long) Math.floor(out.remainingDeadlineMs())));
     }
 
     private void awaitBounded(CompletableFuture<Void> wait, long boundMs, Runnable onSatisfied, Runnable onExpired) {
@@ -610,18 +645,19 @@ public final class KvClientService extends KvClientGrpc.KvClientImplBase {
                 .setLeaderId(-1);
     }
 
-    private void send(StreamObserver<KvResponse> out, KvResponse.Builder reply, long tRecvNanos) {
-        double serviceTimeMs = (System.nanoTime() - tRecvNanos) / 1_000_000.0;
-        reply.setServiceTimeMs(serviceTimeMs);
-        // The slot closes exactly once per request: every handle path ends in
-        // exactly one send.
-        plane.requestCompleted(serviceTimeMs);
-        try {
-            synchronized (out) {
-                out.onNext(reply.build());
-            }
-        } catch (RuntimeException e) {
-            LOG.debug("Dropping reply for request {}: {}", reply.getRequestId(), e.toString());
-        }
+    private KvResponse.Builder deadlineExceeded(KvRequest request) {
+        return stamp(KvResponse.newBuilder()).setRequestId(request.getRequestId()).setOk(false)
+                .setDeadlineExceeded(true)
+                .setSatisfiedRung(-1)
+                .setLeaderId(-1);
+    }
+
+    private void send(KvResponseSink out, KvResponse.Builder reply, long tRecvNanos) {
+        out.respond(reply);
+    }
+
+    @Override
+    public void close() {
+        admissionQueue.close();
     }
 }

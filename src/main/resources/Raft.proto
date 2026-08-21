@@ -64,14 +64,13 @@ message ReadIndexResult {
 }
 
 // ============================================================
-// Client protocol (Chameleon)
+// Client message payloads
 // ============================================================
-
-service KvClient {
-  // Bidirectional session stream. Requests and responses are correlated by
-  // requestId; responses may arrive out of order (waits overlap).
-  rpc Session(stream KvRequest) returns (stream KvResponse);
-}
+//
+// Client traffic uses the persistent framed Netty transport. Protobuf remains
+// the payload format for admitted requests and normal responses, but there is
+// deliberately no per-request gRPC service. The transport reads its fixed
+// admission header and can reject before parsing KvRequest.
 
 // MongoDB-style read levels on Raft. LOCAL serves from the replica's log
 // (may contain uncommitted entries a leader change can roll back), MAJORITY
@@ -96,8 +95,8 @@ message KvRequest {
   bool isRead = 4;
   string key = 5;
   string value = 6;                  // writes only
-  int32 committedSessionIndex = 7;   // causal-majority anchor, -1 = none
-  int32 uncommittedSessionIndex = 8; // causal-local anchor, -1 = none
+  int32 committedSessionIndex = 7;   // highest majority-acknowledged session write; -1 = none
+  int32 uncommittedSessionIndex = 8; // highest acknowledged write; causal anchor for CL and CM; -1 = none
   double rttEstimateMs = 9;          // client's RTT estimate to this server
 
   // 10, 11 were the stage 2 forced-level fields, removed with the scorer.
@@ -141,6 +140,8 @@ message KvResponse {
   int32 localValueIndex = 20;        // log index of the local value's write; -1 = absent
   string committedValue = 21;        // this node's majority-committed view; "" = absent
   int32 committedValueIndex = 22;    // log index of the committed value's write; -1 = absent
+  int64 serverReplyEpochMs = 23;      // wall-clock timestamp immediately before the framed response write
+  bool deadlineExceeded = 24;         // expired in transport or the bounded admission queue
 }
 
 // ============================================================

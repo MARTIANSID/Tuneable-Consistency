@@ -23,7 +23,8 @@ cluster:
   # Number of Raft nodes. Majority = numServers/2 + 1 (write concerns and the
   # SLA validation are checked against it).
   numServers: 5
-  # One host per node; node i listens on serverBasePort + i + 1.
+  # One host per node. Raft/admin use serverBasePort; client traffic uses the
+  # dedicated framed ingress range at clientBasePort.
   serverHosts:
     - localhost
     - localhost
@@ -31,6 +32,7 @@ cluster:
     - localhost
     - localhost
   serverBasePort: 8000
+  clientBasePort: 9000
   # First-election cue: this node runs a shorter, jitter-free election
   # timeout, so it reliably wins the first election (EXPERIMENT.md puts the
   # leader in region A = node 0; set to -1 for the default random election).
@@ -47,8 +49,9 @@ server:
   maxWaitMs: 400
   # Occupancy slot budget: the time-weighted average number of requests in
   # flight the node is calibrated for (sweep_smax.sh measures it at the
-  # latency knee). Utilization u = slot-time / (sMax * interval); the hard
-  # admission cap rejects outright above 1.5x sMax in-flight - in every mode.
+  # latency knee). Utilization u = framed-admission-to-terminal slot-time /
+  # (sMax * interval). The ingress event loop accepts at most 1.5x sMax
+  # requests from fixed frame headers before protobuf parsing - in every mode.
   sMax: 4500
   # Leader-side write admission: entries per second charged one per admitted
   # write, refilled continuously, never returned. Calibrated from the
@@ -75,7 +78,7 @@ chameleon:
   # Utilization target the shadow price regulates toward.
   uTarget: 0.85
   # Multiplicative controller gain: lambda <- max(lambdaMin, lambda * exp(eta * (u - uTarget))).
-  eta: 1.0
+  eta: 0.1
   # Price floor. It lets lambda start from zero and stops it decaying so far
   # during idle periods that recovery takes many intervals; only its order of
   # magnitude matters relative to the rung profits.
@@ -92,6 +95,9 @@ client:
   retryLimit: 3
   # No response within this -> the client scores the request as lost.
   lostTimeoutMs: 10000
+  # Shared persistent framed TCP connections per server. Logical sessions
+  # multiplex over them without creating a transport stream per request.
+  ingressConnectionsPerServer: 16
   # Fraction of reads routed to a uniformly random server instead of the
   # routing policy's pick - applies to the Pileus selector and to lowest-RTT
   # routing alike. Keeps per-node latency windows and staleness estimates
@@ -329,11 +335,12 @@ workload:
   zipfianExponent: 1.0
   # Independent session clients per application. Each session keeps its own
   # full client state - session anchors and per-key floors (so causal
-  # guarantees are per session), RTT windows, Pileus windows, gRPC streams -
-  # and each request picks a session uniformly within its application.
+  # guarantees are per session), RTT windows, and Pileus windows. All sessions
+  # share the framed transport, and each request picks a session
+  # uniformly within its application.
   # Sessions persist across phases, so history carries forward. Only the
   # metrics ledger is shared.
-  sessionsPerApplication: 100
+  sessionsPerApplication: 50
   # Threads injecting the workload. One thread caps at roughly 200-400k
   # requests/s (per-request cost on a single core); the configured TPS is
   # split evenly across threads each 100ms tick. Sessions are sharded across
@@ -444,40 +451,44 @@ workload:
       - { applicationId: 4, type: write, slaId: 1, weight: 10 }
   # The day sequence (EXPERIMENT.md): one continuous run, sessions persist
   # throughout so history and lag carry across segments. Rates are fractions
-  # of measured capacity C = 200000 (recalibrate C per deployment and scale
+  # of measured capacity C = 400000 (recalibrate C per deployment and scale
   # these together). The cluster is provisioned for ordinary peak plus
   # headroom, not for the flash sale: normal sits at 0.5C and the sale day
   # exceeds C.
   phases:
+    - name: WarmUp          # baseline: price on its floor, upgrades free
+      durationSeconds: 300
+      totalTPS: 200000      # 0.5C
+      mix: normal
     - name: NormalDay       # baseline: price on its floor, upgrades free
-      durationSeconds: 60
-      totalTPS: 150000      # 0.5C
+      durationSeconds: 300
+      totalTPS: 200000      # 0.5C
       mix: normal
     - name: HolidayPlateau  # sustained lift; equilibrium, where oscillation would appear
-      durationSeconds: 60
-      totalTPS: 240000      # 0.8C
+      durationSeconds: 300
+      totalTPS: 320000      # 0.8C
       mix: holiday
     - name: SaleDay         # Prime Day scale: rate and value rise together
-      durationSeconds: 60
-      totalTPS: 540000      # 1.8C
+      durationSeconds: 300
+      totalTPS: 720000      # 1.8C
       mix: saleDay
     - name: PreFlash        # login surge; write-heavy A3 drives lag up before the burst
-      durationSeconds: 30
-      totalTPS: 300000      # 1.0C
+      durationSeconds: 120
+      totalTPS: 400000      # 1.0C
       mix: preFlash
     - name: Flash           # ~60% must be refused; floor forbids downgrading
-      durationSeconds: 15
-      totalTPS: 750000      # 2.5C
+      durationSeconds: 60
+      totalTPS: 1000000      # 2.5C
       mix: flash
     - name: Collapse        # load vanishes: does the price come down promptly
-      durationSeconds: 15
-      totalTPS: 210000      # 0.7C
+      durationSeconds: 120
+      totalTPS: 280000      # 0.7C
       mix: collapse
     - name: Payday          # composition shifts, volume barely does; the valuable tenant surges
-      durationSeconds: 60
-      totalTPS: 180000      # 0.6C
+      durationSeconds: 300
+      totalTPS: 240000      # 0.6C
       mix: payday
     - name: ReturnToNormal  # recovery, compared directly against the opening segment
-      durationSeconds: 60
-      totalTPS: 150000      # 0.5C
+      durationSeconds: 300
+      totalTPS: 200000      # 0.5C
       mix: normal
