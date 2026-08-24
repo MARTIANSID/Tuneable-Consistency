@@ -11,7 +11,7 @@ import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 
 /**
- * The strict loader over YAML: the repo's own config.yaml must load and
+ * The strict loader over YAML: the repo's local config must load and
  * validate, and the unknown-key typo protection must work through the YAML
  * path exactly as it does for JSON.
  */
@@ -19,14 +19,16 @@ class ExperimentConfigTest {
 
     // Surefire's working directory is the build directory, a direct child of
     // the repo root, so the repo config is one level up.
-    private static final Path REPO_CONFIG = Path.of("..", "config.yaml");
+    private static final Path REPO_CONFIG = Path.of("..", "config_local.yaml");
 
     @Test
     void repoConfigLoadsAndValidates() {
-        assertTrue(Files.exists(REPO_CONFIG), "repo config.yaml must exist at " + REPO_CONFIG.toAbsolutePath());
+        assertTrue(Files.exists(REPO_CONFIG), "repo config_local.yaml must exist at " + REPO_CONFIG.toAbsolutePath());
         ExperimentConfig config = ExperimentConfig.load(REPO_CONFIG);
         assertEquals(config.cluster.serverHosts.size(), (int) config.cluster.numServers);
         assertTrue(config.slas.size() >= 1);
+        assertTrue(config.server.maxEntriesPerReplicationBatch > 0);
+        assertTrue(config.server.maxInflightReplicationBatchesPerFollower > 0);
         // The mode helpers agree with the mode string.
         assertEquals(config.mode.startsWith("chameleon"), config.chameleonDecision());
     }

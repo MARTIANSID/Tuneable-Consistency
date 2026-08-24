@@ -1,7 +1,9 @@
 package org.example.Server;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
@@ -11,6 +13,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -18,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -40,6 +44,9 @@ import org.slf4j.LoggerFactory;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 /**
@@ -63,13 +70,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     final AtomicInteger commitIndex;
     private final AtomicIntegerArray nextIndex;
     private final AtomicIntegerArray matchIndex;
+    private final ReplicationPipeline[] replicationPipelines;
+    private final AtomicIntegerArray maxObservedReplicationInflight;
+    private final AtomicInteger maxObservedReplicationBatchEntries = new AtomicInteger();
 
     private final CustomTimer electionTimer;
     public RaftStub[] stubs;
     private final AtomicInteger votes;
     public volatile ServerCurrentStatus status;
     private final AtomicBoolean isElectionOver;
-    private final AtomicBoolean doesLeaderHasHighestTerm;
     volatile int currentLeader = -1;
 
     final ReadWriteLock lock;
@@ -86,7 +95,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final IndexWaitRegistry commitWaiters = new IndexWaitRegistry();
     private final ReplicationWaitRegistry replicationWaiters = new ReplicationWaitRegistry();
 
-    private ScheduledExecutorService sendAppendEntriesScheduler;
+    // A single event loop owns every leader-side replication pipeline. RPC
+    // callbacks enqueue onto it, so speculative cursors and in-flight deques
+    // never need cross-thread mutation.
+    private final ScheduledExecutorService replicationExecutor;
     private final ScheduledExecutorService waitScheduler;
     final ExecutorService executorService;
 
@@ -97,7 +109,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private final List<ManagedChannel> ownedChannels = Collections.synchronizedList(new ArrayList<>());
 
     private static final int HEARTBEAT_INTERVAL_MS = 20;
-    private static final int MAX_ENTRIES_PER_RPC = 4000;
+    private static volatile int MAX_ENTRIES_PER_REPLICATION_BATCH = 4000;
+    private static volatile int MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER = 4;
     private static final int ELECTION_TIMEOUT_BASE_MS = 2000;
     private static final int ELECTION_TIMEOUT_JITTER_MS = 700;
 
@@ -113,10 +126,52 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // node tends to win the leadership back at the next election it sees.
     private static volatile int PREFERRED_LEADER_ID = -1;
 
+    private record InflightBatch(long sequence, int startIndex, int endExclusive,
+            int term, long sendStartNanos) {
+        int acknowledgedIndex() {
+            return endExclusive - 1;
+        }
+    }
+
+    /** Mutable only on {@link #replicationExecutor}. */
+    private static final class ReplicationPipeline {
+        final int followerId;
+        final Deque<InflightBatch> inFlight = new ArrayDeque<>();
+        long generation;
+        long nextSequence;
+        int term = -1;
+        int nextSendIndex;
+        long lastSendNanos;
+        boolean connecting;
+        ClientCallStreamObserver<AppendEntriesArgument> outbound;
+
+        ReplicationPipeline(int followerId) {
+            this.followerId = followerId;
+        }
+
+        void resetSpeculativeState(int confirmedNextIndex, int leaderTerm) {
+            inFlight.clear();
+            nextSendIndex = confirmedNextIndex;
+            term = leaderTerm;
+            lastSendNanos = 0;
+        }
+    }
+
     /** Apply cluster configuration. Must run before any ServerImpl is constructed. */
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
         applyClusterSettings(config.cluster.serverHosts, config.cluster.serverBasePort);
         PREFERRED_LEADER_ID = config.cluster.preferredLeaderId;
+        MAX_ENTRIES_PER_REPLICATION_BATCH = config.server.maxEntriesPerReplicationBatch;
+        MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER =
+                config.server.maxInflightReplicationBatchesPerFollower;
+    }
+
+    static void applyReplicationSettingsForTest(int maxEntriesPerBatch, int maxInflightBatches) {
+        if (maxEntriesPerBatch <= 0 || maxInflightBatches <= 0) {
+            throw new IllegalArgumentException("replication batch and in-flight limits must be positive");
+        }
+        MAX_ENTRIES_PER_REPLICATION_BATCH = maxEntriesPerBatch;
+        MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER = maxInflightBatches;
     }
 
     /** Point the peer stubs at a cluster without a full config (tests use this directly). */
@@ -135,19 +190,29 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         this.status = ServerCurrentStatus.FOLLOWER;
         this.votes = new AtomicInteger(0);
         this.isElectionOver = new AtomicBoolean(false);
-        this.doesLeaderHasHighestTerm = new AtomicBoolean(false);
         this.lock = new ReentrantReadWriteLock();
         this.kv = new KvStore();
         this.log = new RaftLog();
         this.stubs = new RaftStub[NUM_OF_SERVERS];
         this.nextIndex = new AtomicIntegerArray(NUM_OF_SERVERS);
         this.matchIndex = new AtomicIntegerArray(NUM_OF_SERVERS);
+        this.replicationPipelines = new ReplicationPipeline[NUM_OF_SERVERS];
+        this.maxObservedReplicationInflight = new AtomicIntegerArray(NUM_OF_SERVERS);
         for (int i = 0; i < NUM_OF_SERVERS; i++) {
             nextIndex.set(i, 0);
             matchIndex.set(i, -1);
+            if (i != serverId) {
+                replicationPipelines[i] = new ReplicationPipeline(i);
+            }
         }
         this.executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
-        this.sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
+        this.replicationExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "raft-replication-" + serverId);
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.replicationExecutor.scheduleAtFixedRate(this::pumpAllFollowersSafely,
+                0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
         this.waitScheduler = Executors.newScheduledThreadPool(1);
         this.electionTimer = new CustomTimer(this::startElection,
                 electionTimeoutMs(serverId), TimeUnit.MILLISECONDS);
@@ -191,10 +256,12 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 stubs[i] = RaftGrpc.newStub(channel);
             }
         }
+        submitReplicationTask(this::ensureLeaderStreams);
     }
 
     public void setDropAllServerNetworkTraffic(boolean enabled) {
         this.dropAllServerNetworkTraffic = enabled;
+        submitReplicationTask(enabled ? this::closeReplicationStreams : this::ensureLeaderStreams);
     }
 
     public boolean isDropAllServerNetworkTraffic() {
@@ -214,12 +281,13 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
      * awaitReplication (intermediate counts).
      */
     public int appendWrite(String key, String value, String opId) throws NotLeaderException {
+        int index;
         lock.writeLock().lock();
         try {
             if (status != ServerCurrentStatus.LEADER) {
                 throw new NotLeaderException(currentLeader, "server " + serverId + " is not the leader");
             }
-            int index = log.size();
+            index = log.size();
             LogEntry entry = new LogEntry(index, currentTerm.get(), key, value, opId);
             // State before index: the lock-free fast path in KvClientService
             // serves as soon as lastLogIndex covers its anchor, so the KV view
@@ -227,10 +295,11 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             kv.applyLocal(entry);
             log.append(entry);
             localLogWaiters.signal(index);
-            return index;
         } finally {
             lock.writeLock().unlock();
         }
+        submitReplicationTask(this::pumpAllFollowersSafely);
+        return index;
     }
 
     /** Completes once this node's local log covers the given index. */
@@ -287,13 +356,64 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // ===== Raft RPC handlers =====
 
     @Override
-    public void appendEntries(AppendEntriesArgument args, StreamObserver<AppendEntriesResult> responseObserver) {
-        if (shouldDropServerNetworkTraffic()) {
-            responseObserver.onError(Status.UNAVAILABLE
-                    .withDescription("Node is configured as failed: appendEntries dropped")
-                    .asRuntimeException());
-            return;
+    public StreamObserver<AppendEntriesArgument> replicate(
+            StreamObserver<AppendEntriesResult> responseObserver) {
+        if (!(responseObserver instanceof ServerCallStreamObserver<?>)) {
+            throw new IllegalStateException("replication requires a ServerCallStreamObserver");
         }
+        @SuppressWarnings("unchecked")
+        ServerCallStreamObserver<AppendEntriesResult> outbound =
+                (ServerCallStreamObserver<AppendEntriesResult>) responseObserver;
+        AtomicBoolean terminal = new AtomicBoolean();
+        outbound.disableAutoRequest();
+        outbound.setOnCancelHandler(() -> terminal.set(true));
+
+        StreamObserver<AppendEntriesArgument> inbound = new StreamObserver<>() {
+            @Override
+            public void onNext(AppendEntriesArgument args) {
+                if (terminal.get()) {
+                    return;
+                }
+                if (shouldDropServerNetworkTraffic()) {
+                    if (terminal.compareAndSet(false, true)) {
+                        outbound.onError(Status.UNAVAILABLE
+                                .withDescription("Node is configured as failed: replication stream dropped")
+                                .asRuntimeException());
+                    }
+                    return;
+                }
+                try {
+                    outbound.onNext(applyAppendEntries(args));
+                } catch (RuntimeException e) {
+                    LOG.error("Exception in replication stream on server {}", serverId, e);
+                    if (terminal.compareAndSet(false, true)) {
+                        outbound.onError(Status.INTERNAL.withDescription(e.toString()).withCause(e)
+                                .asRuntimeException());
+                    }
+                    return;
+                }
+                if (!terminal.get() && !outbound.isCancelled()) {
+                    outbound.request(1);
+                }
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                terminal.set(true);
+            }
+
+            @Override
+            public void onCompleted() {
+                if (terminal.compareAndSet(false, true)) {
+                    outbound.onCompleted();
+                }
+            }
+        };
+        outbound.request(1);
+        return inbound;
+    }
+
+    private AppendEntriesResult applyAppendEntries(AppendEntriesArgument args) {
         int leadersTerm = args.getLeadersTerm(),
                 prevLogIndex = args.getPrevLogIndex(),
                 prevLogTerm = args.getPrevLogTerm(),
@@ -316,24 +436,17 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 }
             }
             if (leadersTerm < currentTerm.get()) {
-                responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get())
-                        .setIsSuccessFull(false).setFollowerId(serverId).build());
-                responseObserver.onCompleted();
-                return;
+                return appendEntriesResult(args, false, -1);
             }
             startTheElectionTimer();
 
             if (!log.checkIfPrevLogIndexHasPrevLogTerm(prevLogIndex, prevLogTerm)) {
-                responseObserver.onNext(AppendEntriesResult.newBuilder().setCurrentTerm(currentTerm.get())
-                        .setIsSuccessFull(false).setFollowerId(serverId).build());
-                responseObserver.onCompleted();
-                return;
+                return appendEntriesResult(args, false, conflictNextIndex(prevLogIndex));
             }
 
             // Raft 5.3: truncate only at the first entry whose (index, term)
             // conflicts with ours, never on a matching prefix. The leader
-            // sends rounds every 30 ms without waiting for responses, so
-            // duplicate and reordered rounds are routine; an unconditional
+            // may replay an acknowledged prefix after a stream reset, so an unconditional
             // truncation at prevLogIndex+1 would wipe and re-append the log on
             // every stale round, and a stale empty probe would wipe it
             // outright - after which the monotonic wait registries would let
@@ -374,15 +487,41 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
                 commitWaiters.signal(newCommitIndex);
             }
 
-            responseObserver.onNext(AppendEntriesResult.newBuilder()
-                    .setIsSuccessFull(true).setFollowerId(serverId).setCurrentTerm(currentTerm.get()).build());
-            responseObserver.onCompleted();
-        } catch (Exception e) {
-            LOG.error("Exception in appendEntries on server {}", serverId, e);
-            responseObserver.onError(Status.INTERNAL.withDescription(e.toString()).asRuntimeException());
+            return appendEntriesResult(args, true, -1);
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    private AppendEntriesResult appendEntriesResult(AppendEntriesArgument args, boolean success, int nextIndexHint) {
+        return AppendEntriesResult.newBuilder()
+                .setCurrentTerm(currentTerm.get())
+                .setIsSuccessFull(success)
+                .setFollowerId(serverId)
+                .setSequence(args.getSequence())
+                .setNextIndexHint(nextIndexHint)
+                .build();
+    }
+
+    /** Fast Raft conflict hint: first index of the conflicting follower term, or the log end. */
+    private int conflictNextIndex(int prevLogIndex) {
+        int size = log.size();
+        if (prevLogIndex >= size) {
+            return size;
+        }
+        if (prevLogIndex < 0) {
+            return 0;
+        }
+        int conflictTerm = log.get(prevLogIndex).term;
+        int first = prevLogIndex;
+        while (first > 0 && log.get(first - 1).term == conflictTerm) {
+            first--;
+        }
+        return first;
+    }
+
+    AppendEntriesResult applyAppendEntriesForTest(AppendEntriesArgument args) {
+        return applyAppendEntries(args);
     }
 
     // inside write lock; logIndex is the first log position being truncated
@@ -598,18 +737,18 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (status != ServerCurrentStatus.CANDIDATE) {
                 return;
             }
-            doesLeaderHasHighestTerm.set(true);
             electionTimer.stop();
             reinitialiseIndexes();
             this.status = ServerCurrentStatus.LEADER;
             this.currentLeader = this.serverId;
-            if (sendAppendEntriesScheduler == null || sendAppendEntriesScheduler.isShutdown()) {
-                sendAppendEntriesScheduler = Executors.newScheduledThreadPool(1);
-            }
         } finally {
             lock.writeLock().unlock();
         }
-        sendAppendEntries();
+        submitReplicationTask(() -> {
+            closeReplicationStreams();
+            ensureLeaderStreams();
+            pumpAllFollowersSafely();
+        });
     }
 
     // should be inside write lock
@@ -623,10 +762,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         // satisfy leader-side replication waits.
         failPendingLeadershipConfirmations();
         replicationWaiters.failAll(new NotLeaderException(currentLeader, "stepped down from leadership"));
-        if (sendAppendEntriesScheduler != null && !sendAppendEntriesScheduler.isShutdown()) {
-            sendAppendEntriesScheduler.shutdownNow();
-            sendAppendEntriesScheduler = null;
-        }
+        submitReplicationTask(this::closeReplicationStreams);
     }
 
     // already in writeLock
@@ -640,9 +776,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // ===== Replication =====
 
     // Batch-fill visibility: the leader prints one line per second summarizing
-    // the AppendEntries batches it sent, so a run shows whether rounds are
-    // full (pipeline-bound at MAX_ENTRIES_PER_RPC) or starved (intake-bound).
-    // Per-RPC printing would be rounds x followers lines per second.
+    // the ordered replication messages it sent, so a run shows whether batches
+    // are full (pipeline-bound) or starved (intake-bound).
     private final AtomicLong batchRpcsLastSecond = new AtomicLong();
     private final AtomicLong batchEntriesLastSecond = new AtomicLong();
     private final AtomicLong batchBytesLastSecond = new AtomicLong();
@@ -666,148 +801,322 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             long maxBytes = batchMaxBytesLastSecond.getAndSet(0);
             if (sum > 0) {
                 System.out.printf(
-                        "[replication] appendEntries last %ds: rpcs=%d entries=%d avgBatch=%.0f maxBatch=%d"
-                                + " bytes=%.2fMB avgRpc=%.1fKB maxRpc=%.1fKB cap=%d%n",
+                        "[replication] stream last %ds: messages=%d entries=%d avgBatch=%.0f maxBatch=%d"
+                                + " bytes=%.2fMB avgMessage=%.1fKB maxMessage=%.1fKB cap=%d%n",
                         Math.round((now - last) / 1000.0), rpcs, sum,
                         (double) sum / Math.max(1, rpcs), max,
                         bytes / 1e6, bytes / 1e3 / Math.max(1, rpcs), maxBytes / 1e3,
-                        MAX_ENTRIES_PER_RPC);
+                        MAX_ENTRIES_PER_REPLICATION_BATCH);
             }
         }
     }
 
-    private void sendAppendEntries() {
-        sendAppendEntriesScheduler.scheduleAtFixedRate(() -> {
+    private void submitReplicationTask(Runnable task) {
+        if (replicationExecutor.isShutdown()) {
+            return;
+        }
+        try {
+            replicationExecutor.execute(task);
+        } catch (RejectedExecutionException e) {
+            if (!replicationExecutor.isShutdown()) {
+                throw e;
+            }
+        }
+    }
+
+    private void pumpAllFollowersSafely() {
+        try {
             if (shouldDropServerNetworkTraffic() || status != ServerCurrentStatus.LEADER) {
                 return;
             }
-            for (int i = 0; i < NUM_OF_SERVERS; i++) {
-                if (i == serverId) {
-                    continue;
+            ensureLeaderStreams();
+            for (ReplicationPipeline pipeline : replicationPipelines) {
+                if (pipeline != null) {
+                    pumpFollower(pipeline);
                 }
-                final int followerId = i;
-
-                executorService.submit(() -> {
-                    int indexToSendFrom;
-                    int endIndex;
-                    int matchIndexForFollower;
-                    int prevLogIndex;
-                    int prevLogTerm;
-                    // Taken before the RPC is sent: any response to this round
-                    // proves leadership only for confirmations registered
-                    // before this instant (ReadIndex).
-                    final long sendStartNanos = System.nanoTime();
-
-                    lock.readLock().lock();
-                    try {
-                        if (status != ServerCurrentStatus.LEADER) {
-                            return;
-                        }
-                        indexToSendFrom = nextIndex.get(followerId);
-                        prevLogIndex = indexToSendFrom - 1;
-                        prevLogTerm = prevLogIndex >= 0 ? log.get(prevLogIndex).term : -1;
-                        endIndex = Math.min(log.size(), indexToSendFrom + MAX_ENTRIES_PER_RPC);
-                        matchIndexForFollower = endIndex - 1;
-                    } finally {
-                        lock.readLock().unlock();
-                    }
-
-                    List<LogEntryProto> protoEntries = new ArrayList<>();
-                    for (LogEntry entry : log.entriesInRange(indexToSendFrom, endIndex)) {
-                        protoEntries.add(LogEntryProto.newBuilder()
-                                .setLogIndex(entry.index).setTerm(entry.term)
-                                .setKey(entry.key).setValue(entry.value).setOpId(entry.opId)
-                                .build());
-                    }
-
-                    AppendEntriesArgument request = AppendEntriesArgument.newBuilder()
-                            .setLeadersTerm(currentTerm.get())
-                            .setLeadersId(serverId)
-                            .setLeadersCommit(commitIndex.get())
-                            .setPrevLogIndex(prevLogIndex)
-                            .setPrevLogTerm(prevLogTerm)
-                            .addAllEntries(protoEntries)
-                            .build();
-
-                    // getSerializedSize is memoized; the transport computes it
-                    // anyway when the message is framed.
-                    recordAppendEntriesBatch(protoEntries.size(), request.getSerializedSize());
-
-                    if (shouldDropServerNetworkTraffic()) {
-                        return;
-                    }
-
-                    stubs[followerId].appendEntries(request, new StreamObserver<AppendEntriesResult>() {
-                        @Override
-                        public void onNext(AppendEntriesResult result) {
-                            doesLeaderHasHighestTerm.compareAndSet(true,
-                                    handleAppendEntriesResult(result, matchIndexForFollower, indexToSendFrom));
-                            // ReadIndex: a response whose term does not exceed
-                            // ours means this follower accepted our authority
-                            // for this round.
-                            if (result.getCurrentTerm() <= request.getLeadersTerm()) {
-                                recordLeadershipAck(followerId, sendStartNanos, request.getLeadersTerm());
-                            }
-                        }
-
-                        @Override
-                        public void onError(Throwable throwable) {
-                            LOG.debug("AppendEntries RPC failed for follower {}", followerId, throwable);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                        }
-                    });
-                });
             }
-        }, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException e) {
+            LOG.error("Replication pipeline failed on leader {}", serverId, e);
+        }
     }
 
-    private boolean handleAppendEntriesResult(AppendEntriesResult result, int matchIndexOfFollower,
-            int prevNextIndex) {
-        boolean success = result.getIsSuccessFull();
-        int termOfFollower = result.getCurrentTerm(), idOfFollower = result.getFollowerId();
+    private void ensureLeaderStreams() {
+        if (shouldDropServerNetworkTraffic() || status != ServerCurrentStatus.LEADER) {
+            return;
+        }
+        for (ReplicationPipeline pipeline : replicationPipelines) {
+            if (pipeline != null && pipeline.outbound == null && !pipeline.connecting
+                    && stubs[pipeline.followerId] != null) {
+                openReplicationStream(pipeline);
+            }
+        }
+    }
 
+    private void openReplicationStream(ReplicationPipeline pipeline) {
+        if (shouldDropServerNetworkTraffic() || status != ServerCurrentStatus.LEADER
+                || stubs[pipeline.followerId] == null || pipeline.outbound != null || pipeline.connecting) {
+            return;
+        }
+        pipeline.connecting = true;
+        pipeline.generation++;
+        long generation = pipeline.generation;
+        int leaderTerm = currentTerm.get();
+        pipeline.resetSpeculativeState(nextIndex.get(pipeline.followerId), leaderTerm);
+        AtomicReference<ClientCallStreamObserver<AppendEntriesArgument>> requestStreamRef = new AtomicReference<>();
+
+        ClientResponseObserver<AppendEntriesArgument, AppendEntriesResult> responses = new ClientResponseObserver<>() {
+            @Override
+            public void beforeStart(ClientCallStreamObserver<AppendEntriesArgument> requestStream) {
+                requestStreamRef.set(requestStream);
+                requestStream.setOnReadyHandler(() -> submitReplicationTask(
+                        () -> handleReplicationStreamReady(pipeline.followerId, generation)));
+            }
+
+            @Override
+            public void onNext(AppendEntriesResult result) {
+                submitReplicationTask(() -> handleReplicationResponse(pipeline.followerId, generation, result));
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                submitReplicationTask(() -> handleReplicationStreamClosed(
+                        pipeline.followerId, generation, throwable));
+            }
+
+            @Override
+            public void onCompleted() {
+                submitReplicationTask(() -> handleReplicationStreamClosed(
+                        pipeline.followerId, generation, null));
+            }
+        };
+
+        stubs[pipeline.followerId].replicate(responses);
+        ClientCallStreamObserver<AppendEntriesArgument> requestStream = requestStreamRef.get();
+        if (requestStream == null) {
+            pipeline.connecting = false;
+            throw new IllegalStateException("gRPC did not expose the replication request stream for follower "
+                    + pipeline.followerId);
+        }
+        if (pipeline.generation != generation || status != ServerCurrentStatus.LEADER) {
+            requestStream.onCompleted();
+            pipeline.connecting = false;
+            return;
+        }
+        pipeline.outbound = requestStream;
+        pipeline.connecting = false;
+        pumpFollower(pipeline);
+    }
+
+    private void handleReplicationStreamReady(int followerId, long generation) {
+        ReplicationPipeline pipeline = replicationPipelines[followerId];
+        if (pipeline != null && pipeline.generation == generation) {
+            pumpFollower(pipeline);
+        }
+    }
+
+    private void pumpFollower(ReplicationPipeline pipeline) {
+        ClientCallStreamObserver<AppendEntriesArgument> outbound = pipeline.outbound;
+        if (outbound == null || shouldDropServerNetworkTraffic()
+                || status != ServerCurrentStatus.LEADER || pipeline.term != currentTerm.get()) {
+            return;
+        }
+        while (pipeline.inFlight.size() < MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER
+                && outbound.isReady()) {
+            AppendEntriesArgument request = buildNextReplicationMessage(pipeline);
+            if (request == null) {
+                return;
+            }
+            int entries = request.getEntriesCount();
+            InflightBatch batch = new InflightBatch(request.getSequence(),
+                    request.getPrevLogIndex() + 1,
+                    request.getPrevLogIndex() + 1 + entries,
+                    request.getLeadersTerm(), System.nanoTime());
+            pipeline.inFlight.addLast(batch);
+            maxObservedReplicationInflight.accumulateAndGet(
+                    pipeline.followerId, pipeline.inFlight.size(), Math::max);
+            maxObservedReplicationBatchEntries.accumulateAndGet(entries, Math::max);
+            recordAppendEntriesBatch(entries, request.getSerializedSize());
+            try {
+                outbound.onNext(request);
+            } catch (RuntimeException e) {
+                restartReplicationStream(pipeline, nextIndex.get(pipeline.followerId), e);
+                return;
+            }
+        }
+    }
+
+    private AppendEntriesArgument buildNextReplicationMessage(ReplicationPipeline pipeline) {
+        lock.readLock().lock();
+        try {
+            if (status != ServerCurrentStatus.LEADER || pipeline.term != currentTerm.get()) {
+                return null;
+            }
+            int logSize = log.size();
+            if (pipeline.nextSendIndex > logSize) {
+                throw new IllegalStateException("replication cursor " + pipeline.nextSendIndex
+                        + " exceeds leader log size " + logSize);
+            }
+            boolean hasData = pipeline.nextSendIndex < logSize;
+            long now = System.nanoTime();
+            if (!hasData && (!pipeline.inFlight.isEmpty()
+                    || now - pipeline.lastSendNanos < TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_INTERVAL_MS))) {
+                return null;
+            }
+
+            int start = pipeline.nextSendIndex;
+            int end = hasData
+                    ? Math.min(logSize, start + MAX_ENTRIES_PER_REPLICATION_BATCH)
+                    : start;
+            int prevLogIndex = start - 1;
+            int prevLogTerm = prevLogIndex >= 0 ? log.get(prevLogIndex).term : -1;
+            List<LogEntryProto> protoEntries = new ArrayList<>(Math.max(0, end - start));
+            for (LogEntry entry : log.entriesInRange(start, end)) {
+                protoEntries.add(LogEntryProto.newBuilder()
+                        .setLogIndex(entry.index).setTerm(entry.term)
+                        .setKey(entry.key).setValue(entry.value).setOpId(entry.opId)
+                        .build());
+            }
+            long sequence = ++pipeline.nextSequence;
+            pipeline.nextSendIndex = end;
+            pipeline.lastSendNanos = now;
+            return AppendEntriesArgument.newBuilder()
+                    .setLeadersTerm(currentTerm.get())
+                    .setLeadersId(serverId)
+                    .setLeadersCommit(commitIndex.get())
+                    .setPrevLogIndex(prevLogIndex)
+                    .setPrevLogTerm(prevLogTerm)
+                    .addAllEntries(protoEntries)
+                    .setSequence(sequence)
+                    .build();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private void handleReplicationResponse(int followerId, long generation, AppendEntriesResult result) {
+        ReplicationPipeline pipeline = replicationPipelines[followerId];
+        if (pipeline == null || pipeline.generation != generation) {
+            return;
+        }
+        InflightBatch batch = pipeline.inFlight.peekFirst();
+        if (batch == null || result.getFollowerId() != followerId
+                || result.getSequence() != batch.sequence()) {
+            restartReplicationStream(pipeline, nextIndex.get(followerId),
+                    new IllegalStateException("out-of-order replication acknowledgement from follower " + followerId));
+            return;
+        }
+        pipeline.inFlight.removeFirst();
+
+        int retryFrom = -1;
         lock.writeLock().lock();
         try {
-            // idempotence: stale responses after stepping down are ignored
-            if (status != ServerCurrentStatus.LEADER) {
-                return false;
+            if (status != ServerCurrentStatus.LEADER || batch.term() != currentTerm.get()) {
+                return;
             }
-            if (termOfFollower > currentTerm.get()) {
-                currentTerm.updateAndGet(term -> Math.max(term, termOfFollower));
+            if (result.getCurrentTerm() > currentTerm.get()) {
+                currentTerm.set(result.getCurrentTerm());
                 becomeFollower();
-                return false;
+                return;
             }
-            if (!success) {
-                // Back off; guard against double decrements from overlapping rounds.
-                if (nextIndex.get(idOfFollower) >= prevNextIndex) {
-                    nextIndex.decrementAndGet(idOfFollower);
+            if (!result.getIsSuccessFull()) {
+                int minimum = matchIndex.get(followerId) + 1;
+                retryFrom = Math.max(minimum, Math.min(result.getNextIndexHint(), log.size()));
+                nextIndex.set(followerId, retryFrom);
+            } else {
+                int acknowledged = batch.acknowledgedIndex();
+                if (acknowledged > matchIndex.get(followerId)) {
+                    matchIndex.set(followerId, acknowledged);
+                    nextIndex.set(followerId, acknowledged + 1);
+                    advanceCommitIndexIfPossible();
+                    replicationWaiters.evaluate(this::replicaCount);
                 }
-            } else if (matchIndex.get(idOfFollower) < matchIndexOfFollower) {
-                matchIndex.set(idOfFollower, matchIndexOfFollower);
-                nextIndex.set(idOfFollower, matchIndexOfFollower + 1);
-
-                int prevCommitIndex = commitIndex.get();
-                int candidateCommitIndex = getCommitIndexIfPossibleEarlyExitMethod();
-                if (candidateCommitIndex > prevCommitIndex) {
-                    // Committed view before commit index (see appendWrite).
-                    for (int i = prevCommitIndex + 1; i <= candidateCommitIndex; i++) {
-                        kv.applyCommitted(log.get(i));
-                    }
-                    commitIndex.set(candidateCommitIndex);
-                    commitWaiters.signal(candidateCommitIndex);
-                }
-                replicationWaiters.evaluate(this::replicaCount);
             }
-        } catch (Exception e) {
-            LOG.error("Exception while handling AppendEntriesResult on server {}", serverId, e);
-            return false;
         } finally {
             lock.writeLock().unlock();
         }
-        return true;
+
+        if (retryFrom >= 0) {
+            restartReplicationStream(pipeline, retryFrom, null);
+            return;
+        }
+        if (result.getCurrentTerm() <= batch.term()) {
+            recordLeadershipAck(followerId, batch.sendStartNanos(), batch.term());
+        }
+        pumpFollower(pipeline);
+    }
+
+    // Called with the Raft write lock held.
+    private void advanceCommitIndexIfPossible() {
+        int previous = commitIndex.get();
+        int candidate = getCommitIndexIfPossibleEarlyExitMethod();
+        if (candidate <= previous) {
+            return;
+        }
+        for (int i = previous + 1; i <= candidate; i++) {
+            kv.applyCommitted(log.get(i));
+        }
+        commitIndex.set(candidate);
+        commitWaiters.signal(candidate);
+    }
+
+    private void handleReplicationStreamClosed(int followerId, long generation, Throwable error) {
+        ReplicationPipeline pipeline = replicationPipelines[followerId];
+        if (pipeline == null || pipeline.generation != generation) {
+            return;
+        }
+        if (error != null && status == ServerCurrentStatus.LEADER && !shouldDropServerNetworkTraffic()) {
+            LOG.debug("Replication stream to follower {} closed: {}", followerId, error.toString());
+        }
+        invalidateReplicationStream(pipeline, nextIndex.get(followerId), false);
+        if (status == ServerCurrentStatus.LEADER && !shouldDropServerNetworkTraffic()
+                && !replicationExecutor.isShutdown()) {
+            replicationExecutor.schedule(() -> openReplicationStream(pipeline),
+                    HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void restartReplicationStream(ReplicationPipeline pipeline, int confirmedNextIndex, Throwable cause) {
+        if (cause != null) {
+            LOG.debug("Restarting replication stream to follower {}: {}",
+                    pipeline.followerId, cause.toString());
+        }
+        invalidateReplicationStream(pipeline, confirmedNextIndex, true);
+        if (status == ServerCurrentStatus.LEADER && !shouldDropServerNetworkTraffic()) {
+            submitReplicationTask(() -> openReplicationStream(pipeline));
+        }
+    }
+
+    private void invalidateReplicationStream(ReplicationPipeline pipeline,
+            int confirmedNextIndex, boolean completeOutbound) {
+        ClientCallStreamObserver<AppendEntriesArgument> old = pipeline.outbound;
+        pipeline.generation++;
+        pipeline.outbound = null;
+        pipeline.connecting = false;
+        pipeline.resetSpeculativeState(confirmedNextIndex, currentTerm.get());
+        if (completeOutbound && old != null) {
+            try {
+                old.onCompleted();
+            } catch (RuntimeException e) {
+                LOG.debug("Closing replication stream to follower {} failed: {}",
+                        pipeline.followerId, e.toString());
+            }
+        }
+    }
+
+    private void closeReplicationStreams() {
+        for (ReplicationPipeline pipeline : replicationPipelines) {
+            if (pipeline != null) {
+                invalidateReplicationStream(pipeline, nextIndex.get(pipeline.followerId), true);
+            }
+        }
+    }
+
+    int maxObservedReplicationInflight(int followerId) {
+        return maxObservedReplicationInflight.get(followerId);
+    }
+
+    int maxObservedReplicationBatchEntries() {
+        return maxObservedReplicationBatchEntries.get();
     }
 
     // should be inside a lock; walks down from the max matchIndex, so it is
@@ -1077,8 +1386,15 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         electionTimer.shutdown();
         failPendingLeadershipConfirmations();
         replicationWaiters.failAll(new NotLeaderException(-1, "node shut down"));
-        if (sendAppendEntriesScheduler != null) {
-            sendAppendEntriesScheduler.shutdownNow();
+        submitReplicationTask(this::closeReplicationStreams);
+        replicationExecutor.shutdown();
+        try {
+            if (!replicationExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
+                replicationExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            replicationExecutor.shutdownNow();
         }
         waitScheduler.shutdownNow();
         executorService.shutdownNow();

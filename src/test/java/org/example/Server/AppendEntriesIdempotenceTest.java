@@ -10,35 +10,14 @@ import org.example.raft.AppendEntriesResult;
 import org.example.raft.LogEntryProto;
 import org.junit.jupiter.api.Test;
 
-import io.grpc.stub.StreamObserver;
-
 /**
- * Raft 5.3 follower idempotence: the leader fires replication rounds every
- * 30 ms without waiting for responses, so duplicate and reordered rounds are
- * routine. A matching prefix must never be truncated (the 60k TPS sweep
+ * Raft 5.3 follower idempotence: a stream reset can replay an acknowledged
+ * prefix. A matching prefix must never be truncated (the 60k TPS sweep
  * caught an unconditional truncation at prevLogIndex+1: a stale empty probe
  * wiped the log, after which the monotonic wait registries let causal reads
  * serve the emptied view); only a genuine (index, term) conflict truncates.
  */
 class AppendEntriesIdempotenceTest {
-
-    private static final class Capture implements StreamObserver<AppendEntriesResult> {
-        AppendEntriesResult value;
-
-        @Override
-        public void onNext(AppendEntriesResult v) {
-            value = v;
-        }
-
-        @Override
-        public void onError(Throwable t) {
-            throw new AssertionError(t);
-        }
-
-        @Override
-        public void onCompleted() {
-        }
-    }
 
     private static LogEntryProto entry(int index, int term, String key, String value) {
         return LogEntryProto.newBuilder().setLogIndex(index).setTerm(term)
@@ -53,9 +32,7 @@ class AppendEntriesIdempotenceTest {
     }
 
     private static AppendEntriesResult apply(ServerImpl node, AppendEntriesArgument args) {
-        Capture capture = new Capture();
-        node.appendEntries(args, capture);
-        return capture.value;
+        return node.applyAppendEntriesForTest(args);
     }
 
     @Test

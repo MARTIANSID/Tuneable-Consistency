@@ -20,7 +20,7 @@
 # Usage:
 #   ./run_all.sh [label] [config.yaml]     e.g. ./run_all.sh upgrades-on
 #                                               ./run_all.sh pressure my-config.yaml
-# The config file (default: repo config.yaml; .json also accepted) is passed
+# The config file (default: repo config_local.yaml; .json also accepted) is passed
 # to every process and archived alongside the results for provenance.
 #
 set -euo pipefail
@@ -134,8 +134,8 @@ fi
 # ---------------------------------------------------------------------------
 LABEL="${1:-run}"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label must match [A-Za-z0-9._-]+, got: $LABEL"
-CONFIG_PATH="${2:-$REPO_DIR/config.yaml}"
-CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found: ${2:-$REPO_DIR/config.yaml}"
+CONFIG_PATH="${2:-$REPO_DIR/config_local.yaml}"
+CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found: ${2:-$REPO_DIR/config_local.yaml}"
 [[ -f "$CONFIG_PATH" ]] || die "config file not found: $CONFIG_PATH"
 STAMP="$(date '+%Y%m%d_%H%M%S')"
 RUN_DIR="$REPO_DIR/runs/${LABEL}_${STAMP}"

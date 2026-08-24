@@ -29,7 +29,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 HOST="${1:-}"
 KEY="${2:-}"
 LABEL="${3:-run}"
-CONFIG_PATH="${4:-$REPO_DIR/config.yaml}"
+CONFIG_PATH="${4:-$REPO_DIR/config_local.yaml}"
 [[ -n "$HOST" && -n "$KEY" ]] || die "usage: ./run_all_cloudlab.sh <user@host> <ssh-key-path> [label] [config.yaml]"
 [[ -f "$KEY" ]] || die "ssh key not found: $KEY"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label must match [A-Za-z0-9._-]+, got: $LABEL"

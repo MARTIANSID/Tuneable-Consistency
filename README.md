@@ -127,10 +127,10 @@ mvn clean install
 From the repository root:
 
 ```bash
-./run_all.sh [label] [config.yaml]
+./run_all.sh [label] [config_local.yaml]
 ```
 
-This builds the project and launches one `ServerNode` process per Raft node plus a `WorkloadDriver` process inside a tmux session, with all results written to `runs/<label>_<timestamp>/`. To launch the processes by hand instead, start each node with `java -cp <classpath> org.example.Server.ServerNode config.yaml <serverId>` and then run `java -cp <classpath> org.example.Client.WorkloadDriver config.yaml` (the classpath is written to `target-script/classpath.txt` by `run_all.sh`).
+This builds the project and launches one `ServerNode` process per Raft node plus a `WorkloadDriver` process inside a tmux session, with all results written to `runs/<label>_<timestamp>/`. To launch the processes by hand instead, start each node with `java -cp <classpath> org.example.Server.ServerNode config_local.yaml <serverId>` and then run `java -cp <classpath> org.example.Client.WorkloadDriver config_local.yaml` (the classpath is written to `target-script/classpath.txt` by `run_all.sh`).
 
 ---
 

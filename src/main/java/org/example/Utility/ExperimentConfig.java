@@ -52,6 +52,8 @@ public final class ExperimentConfig {
         public Integer maxWaitMs;          // clamp on every server-side wait; expiry falls back / acks what is there
         public Double sMax;                // occupancy slot budget; the hard cap rejects above 1.5x this in every mode
         public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s (universal admission)
+        public Integer maxEntriesPerReplicationBatch; // entries in one ordered replication-stream message
+        public Integer maxInflightReplicationBatchesPerFollower; // bounded speculative pipeline window
         public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round (all modes)
         public Double histogramDecay;      // service-time histogram decay per 100 ms refresh tick, in (0, 1)
     }
@@ -441,6 +443,9 @@ public final class ExperimentConfig {
         requirePositive(server.maxWaitMs, "server.maxWaitMs");
         requirePositive(server.sMax, "server.sMax");
         requirePositive(server.replicationBudgetPerSecond, "server.replicationBudgetPerSecond");
+        requirePositive(server.maxEntriesPerReplicationBatch, "server.maxEntriesPerReplicationBatch");
+        requirePositive(server.maxInflightReplicationBatchesPerFollower,
+                "server.maxInflightReplicationBatchesPerFollower");
         require(server.followerLinearizableReads, "server.followerLinearizableReads");
         require(server.histogramDecay, "server.histogramDecay");
         if (!(server.histogramDecay > 0) || !(server.histogramDecay < 1)) {

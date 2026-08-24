@@ -8,7 +8,10 @@ package raft;
 // ============================================================
 
 service Raft {
-  rpc AppendEntries(AppendEntriesArgument) returns (AppendEntriesResult);
+  // One ordered, persistent replication stream from a leader to each
+  // follower. Requests are bounded, disjoint pipeline batches; responses
+  // acknowledge individual batches by sequence number.
+  rpc Replicate(stream AppendEntriesArgument) returns (stream AppendEntriesResult);
   rpc RequestVote(RequestVoteArguments) returns (RequestVoteResult);
   // Follower linearizable reads (stage 6, behind a config flag): a follower
   // asks the leader for a confirmed read index, then waits for its own commit
@@ -33,12 +36,16 @@ message AppendEntriesArgument {
   int32 prevLogTerm = 4;
   repeated LogEntryProto entries = 5;
   int32 leadersCommit = 6;
+  int64 sequence = 7;
 }
 
 message AppendEntriesResult {
   int32 currentTerm = 1;
   bool isSuccessFull = 2;
   int32 followerId = 3;
+  int64 sequence = 4;
+  // On rejection, the earliest index the leader should retry. -1 otherwise.
+  int32 nextIndexHint = 5;
 }
 
 message RequestVoteArguments {

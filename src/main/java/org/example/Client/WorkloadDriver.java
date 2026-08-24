@@ -233,7 +233,7 @@ public class WorkloadDriver {
     }
 
     public static void main(String[] args) throws InterruptedException {
-        Path configPath = Path.of(args.length > 0 ? args[0] : "config.yaml");
+        Path configPath = Path.of(args.length > 0 ? args[0] : "config_local.yaml");
         ExperimentConfig config = ExperimentConfig.load(configPath);
         applyConfig(config);
         System.out.println("Loaded config from " + configPath.toAbsolutePath());

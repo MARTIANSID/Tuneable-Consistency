@@ -28,7 +28,7 @@ public final class ServiceTimeHistograms {
     public static final double BUCKET_RATIO = 1.15;
 
     // Gap buckets: <= 0 (already satisfiable), two coarse waiting bands sized
-    // to the replication batch (MAX_ENTRIES_PER_RPC-scale), and far behind.
+    // to the configured replication-batch scale, and far behind.
     // Everything at or below zero lands in one bucket whose observed waits are
     // near zero, so "the upgrade is free" emerges from data, not a rule.
     public static final int GAP_BUCKETS = 4;
