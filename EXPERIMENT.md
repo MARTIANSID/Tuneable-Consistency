@@ -2,48 +2,96 @@
 
 Reference configuration for the evaluation.
 
-Every application uses 50 sessions, each belonging to one application and one client site, and holding its own committed and uncommitted counters, shared across that application's SLAs. Key space is disjoint per application. Sessions are long-lived and never reset. An arriving request picks one session of its application uniformly, which also determines where it is issued from. Arrivals are Poisson, open loop, and there is no retry.
+Every application uses 60 sessions, each belonging to one application and one client site, and holding a single counter: the highest log index that session has observed. Key space is disjoint per application. Sessions are long-lived and never reset. An arriving request picks one session of its application uniformly, which also determines where it is issued from. Arrivals are Poisson, open loop, and there is no retry.
 
-## Topology and expected level costs
+## Topologies
 
-Five nodes, one per region, leader in N. Virginia. All delays below are **one-way**, which is what netem injects; double them for a round trip. They are representative of real inter-region latencies rather than a uniform injected value, which matters because a reviewer already objected that uniform netem cannot reproduce asymmetric paths.
+Three configurations, run with identical SLAs and mixes so that the only thing changing is where the nodes are. All delays are **one-way**, which is what netem takes; apply the value at each end of a pair, not double at one end. They are representative of real inter-region latencies rather than a uniform injected value, which matters because a reviewer already objected that uniform netem cannot reproduce asymmetric paths.
 
-| one-way ms | A (N. Virginia) | B (Oregon) | C (Ireland) | D (Singapore) | E (São Paulo) |
+Five nodes in every config, leader always at A. A majority is the leader plus two, so a quorum operation waits for the second acknowledgement to return.
+
+### Local: five AZs in one region
+
+Every server pair at **0.3 ms**. Five client sites, one per AZ, each 0.1 ms to its own node and 0.3 ms to the others. No remote client site: inside one region every node is equidistant, so there is no placement choice to defend and no routing question to ask, which is what makes this the isolation config for capacity.
+
+Quorum cost about **1.2 ms** round trip.
+
+### Regional: five North American regions
+
+Nodes: A Virginia (leader), B Ohio, C Montreal, D N. California, E Oregon.
+
+| server to server | A | B | C | D | E |
 |---|---|---|---|---|---|
-| A | 0 | 30 | 40 | 115 | 60 |
-| B | 30 | 0 | 65 | 85 | 90 |
-| C | 40 | 65 | 0 | 90 | 95 |
-| D | 115 | 85 | 90 | 0 | 160 |
-| E | 60 | 90 | 95 | 160 | 0 |
+| A Virginia | 0 | 6 | 10 | 30 | 35 |
+| B Ohio | 6 | 0 | 12 | 25 | 25 |
+| C Montreal | 10 | 12 | 0 | 38 | 35 |
+| D N. California | 30 | 25 | 38 | 0 | 10 |
+| E Oregon | 35 | 25 | 35 | 10 | 0 |
 
-## Client sites
+Six client sites: one colocated with each node, plus Phoenix with no local replica.
 
-One client site per region, colocated with that region's node at 0.5 ms one-way. A client reaching any other node pays the matrix delay above. Without distributed clients every client would see identical distances and the routing comparison would have nothing to measure, so this is load-bearing rather than decorative.
+| client to server | A | B | C | D | E |
+|---|---|---|---|---|---|
+| Virginia | 0.5 | 6 | 10 | 30 | 35 |
+| Ohio | 6 | 0.5 | 12 | 25 | 25 |
+| Montreal | 10 | 12 | 0.5 | 38 | 35 |
+| N. California | 30 | 25 | 38 | 0.5 | 10 |
+| Oregon | 35 | 25 | 35 | 10 | 0.5 |
+| Phoenix | 25 | 20 | 28 | 10 | 15 |
 
-Sessions carry a site. A1, A2, and A3 spread their 50 sessions evenly across all five sites, ten each, since shopping, feed reading, and login are worldwide. A4 does not: payment processing is regional, so its sessions sit 60 percent in A and 40 percent in B. That is realistic and it also keeps A4's tight thresholds satisfiable, since a Singapore client is 230 ms round trip from the leader and could never meet a 200 ms payment deadline no matter what the system did.
+Quorum is the leader plus Ohio and Montreal, about **20 ms** round trip. Replica lag runs 6 ms at Ohio to 35 ms at Oregon.
+
+### Global: five regions worldwide
+
+Nodes: A Virginia (leader), B Oregon, C Ireland, D Singapore, E São Paulo.
+
+| server to server | A | B | C | D | E |
+|---|---|---|---|---|---|
+| A Virginia | 0 | 30 | 40 | 115 | 60 |
+| B Oregon | 30 | 0 | 65 | 85 | 90 |
+| C Ireland | 40 | 65 | 0 | 90 | 95 |
+| D Singapore | 115 | 85 | 90 | 0 | 160 |
+| E São Paulo | 60 | 90 | 95 | 160 | 0 |
+
+Six client sites: one colocated with each node, plus Tokyo with no local replica.
+
+| client to server | A | B | C | D | E |
+|---|---|---|---|---|---|
+| Virginia | 0.5 | 30 | 40 | 115 | 60 |
+| Oregon | 30 | 0.5 | 65 | 85 | 90 |
+| Ireland | 40 | 65 | 0.5 | 90 | 95 |
+| Singapore | 115 | 85 | 90 | 0.5 | 160 |
+| São Paulo | 60 | 90 | 95 | 160 | 0.5 |
+| Tokyo | 85 | 50 | 110 | 35 | 130 |
+
+Quorum is the leader plus Oregon and Ireland, about **80 ms** round trip. Replica lag runs 30 ms at Oregon to 115 ms at Singapore.
 
 ## Expected level costs
 
-With the leader at A, a majority is the leader plus two, so it waits for the second acknowledgement to return: 60 ms round trip from B, 80 ms from C.
+| Operation | Local | Regional | Global | Why |
+|---|---|---|---|---|
+| eventual-local, eventual-majority | 1 to 3 ms | same | same | Local read, no coordination |
+| causal-local, causal-majority | plus wait | plus wait | plus wait | Local read unless the session's index is ahead of the replica |
+| linearizable | 1.2 ms + | 20 ms + | 80 ms + | ReadIndex confirmation round to a majority |
+| wc:1 | 1 to 3 ms | same | same | Local append |
+| wc:2 | 1.2 ms + | 12 ms + | 60 ms + | One acknowledgement, from the nearest follower |
+| wc:majority | 1.2 ms + | 20 ms + | 80 ms + | Two acknowledgements |
 
-| Operation | Expected cost | Why |
-|---|---|---|
-| eventual-local, eventual-majority | 1 to 3 ms | Local read, no coordination |
-| causal-local, causal-majority | 1 to 3 ms, plus wait | Local read unless the session's floor is ahead of the replica |
-| linearizable | 80 ms and up | ReadIndex confirmation round to a majority |
-| wc:1 | 1 to 3 ms | Local append |
-| wc:2 | 60 ms and up | One acknowledgement, from B |
-| wc:majority | 80 ms and up | Two acknowledgements, from B and C |
+Add the client's own round trip on top. A colocated client pays 1 ms; a Singapore client pays 230 ms just to reach the leader.
 
-Add the client's own round trip on top: a client in A pays 1 ms, one in D pays 230 ms to reach the leader at all.
+Quorum cost across the three configs is roughly 1.2, 20, and 80 ms, about two orders of magnitude. With the SLA thresholds held fixed, that is what makes rungs progressively unreachable and turns the choice of delay into a swept parameter rather than something to defend.
 
-Replicas lag by their one-way distance from the leader plus batching, so roughly 30 ms at B, 40 ms at C, 60 ms at E, and 115 ms at D. D and E are therefore where causal upgrades actually have to wait, and where a client reading locally will often be offered a weaker level than one sitting next to the leader. That heterogeneity across sites, from one SLA, is the Pileus story stated as a measurement.
+Phoenix and Tokyo are the same probe at two scales: in both, the nearest node is also the stalest, so least-RTT routing takes the close-and-lagging option while a freshness-aware policy pays a little more distance for much fresher data. That is the cleanest single test of routing quality in the setup, and it mirrors Pileus's China client, the only one of their four with no local replica.
 
-The single realism error in the previous SLA set was thresholds below these costs. A linearizable rung at 30 ms is not a demanding SLA, it is a dead rung no arm can ever satisfy, and it silently removes the level from the experiment. Every linearizable and majority-write threshold is now above 80 ms plus a client round trip.
+Leader placement is a cheap extra sweep: moving the leader to Singapore in the global config inverts the cost landscape and is the natural configuration for the flash sale.
 
-Leader placement is a cheap extra sweep worth running: moving the leader to D inverts the cost landscape, making writes expensive for the Americas and cheap for Southeast Asia, which is the natural configuration for the flash-sale scenario.
+## Client sites and sessions
 
-Also run a **single-region control** with all five nodes and all clients in one region at about 0.25 ms one-way, where majority operations cost 1 to 2 ms and every rung is achievable. There the price binds on capacity alone rather than on capacity and latency together, which separates the two effects and answers the suspicion that large WAN delays were chosen to make the problem look worse than it is. Scale all thresholds down by roughly 10x for that config.
+Sessions carry a site as well as an application. All four applications spread their 60 sessions evenly across every client site: twelve each across five sites locally, ten each across six sites in the other two configs.
+
+A4 is spread like the others rather than concentrated near the leader. Concentrating it would make its requests both the most valuable and the cheapest to serve, so surviving under load would no longer distinguish value from cost, and its tail rungs already keep distant sites servable.
+
+Without distributed clients every client would see identical distances and the routing comparison would have nothing to measure, so this is load-bearing rather than decorative.
 
 ## A1: online shopping
 
@@ -79,13 +127,14 @@ Write fraction 10 percent.
 
 There is deliberately no eventual rung. The application would rather be refused than oversell, which is what real flash sales do when they put people in a queue. That makes this the one segment where the price cannot economise by downgrading, because the floor forbids it, and admission is the only lever left. Every other segment gives the price the option of serving something cheaper.
 
-**Writes.** Adding to a cart should be acknowledged instantly; the order record itself must be durable.
+**Writes.** Adding to a cart should be acknowledged instantly; the order record itself must be durable. The last rung exists so that distant clients are servable at all: a Singapore client is 230 ms round trip from the leader, so without it every A1 write from that site would miss all three thresholds, earn zero, and be rejected regardless of load. A shopper adding to a US-hosted cart from Singapore really does wait a quarter second, and it really is worth very little.
 
 | Level | Threshold | Profit |
 |---|---|---|
 | wc:majority | 200 | 12 |
 | wc:1 | 40 | 8 |
 | wc:1 | 200 | 2 |
+| wc:1 | 500 | 1 |
 
 ## A2: advertising-funded search or news feed
 
@@ -160,6 +209,18 @@ Write fraction 20 percent.
 |---|---|---|
 | wc:majority | 250 | 150 |
 | wc:majority | 1000 | 60 |
+
+## SLA reachability
+
+A well-formedness condition worth checking at configuration time rather than discovering at runtime: for every SLA and every client site, at least one rung must be reachable using a level that site can actually serve, given the measured level costs above.
+
+State it in terms of cost rather than ladder position. A3's lowest-profit rung is linearizable within 600 ms, which is the most expensive level in the system, so a check that simply asked whether the bottom rung was reachable would pass A3 for the wrong reason and would fail the moment the leader became unavailable to that client even though a perfectly good local option existed.
+
+Two deliberate exemptions. No write SLA can have a leader-free rung, since writes go to the leader by definition, so for writes the condition reduces to whether the loosest threshold clears the client's round trip plus the concern's cost. And A1's flash checkout has no cheap rung on purpose, because the application would rather be refused than oversell, so it is exempt explicitly.
+
+Checked against the global config from Singapore, the worst site, the only violation was A1 writes, which is why that ladder has a fourth rung at 500 ms.
+
+Because this is checkable statically from the topology and the level cost table, the system can tell an operator at startup which SLAs are unservable from which sites, instead of the operator finding out when those requests start being rejected.
 
 ## Scenario mixes
 

@@ -50,7 +50,7 @@ public final class ClientMetricsTracker {
     /** SLAs may register at most this many rungs (fixed satisfied-rung columns). */
     public static final int MAX_RUNGS = 4;
 
-    private record Key(int nodeId, String chosen, String executed) {
+    private record Key(int nodeId, String site, String chosen, String executed) {
     }
 
     private static final class Cell {
@@ -92,8 +92,8 @@ public final class ClientMetricsTracker {
     private static final DoubleAdder runPredictedProfit = new DoubleAdder();
     private static final DoubleAdder runRealizedProfit = new DoubleAdder();
 
-    private static Cell cell(int nodeId, String chosen, String executed) {
-        return cells.computeIfAbsent(new Key(nodeId, chosen, executed), k -> new Cell());
+    private static Cell cell(int nodeId, String site, String chosen, String executed) {
+        return cells.computeIfAbsent(new Key(nodeId, site, chosen, executed), k -> new Cell());
     }
 
     private static int latencyBucketOf(double latencyMs) {
@@ -114,10 +114,10 @@ public final class ClientMetricsTracker {
      * index (-1 = none met); {@code upgraded} means the graded delivery was
      * above the SLA's floor, split into free vs waiting by {@code waited}.
      */
-    public static void recordResponse(int nodeId, String chosen, String executed, double latencyMs,
+    public static void recordResponse(int nodeId, String site, String chosen, String executed, double latencyMs,
             boolean fellBack, boolean deadlineViolation, double predictedProfit, double realizedProfit,
             int satisfiedRung, boolean upgraded, boolean waited) {
-        Cell c = cell(nodeId, chosen, executed);
+        Cell c = cell(nodeId, site, chosen, executed);
         c.count.incrementAndGet();
         c.latencySumMs.add(latencyMs);
         c.latencyBuckets.incrementAndGet(latencyBucketOf(latencyMs));
@@ -143,19 +143,19 @@ public final class ClientMetricsTracker {
         maybeFlush();
     }
 
-    public static void recordRedirect(int nodeId, String chosen) {
-        cell(nodeId, chosen, "-").redirects.incrementAndGet();
+    public static void recordRedirect(int nodeId, String site, String chosen) {
+        cell(nodeId, site, chosen, "-").redirects.incrementAndGet();
         maybeFlush();
     }
 
-    public static void recordFailure(int nodeId, String chosen) {
-        cell(nodeId, chosen, "-").failures.incrementAndGet();
+    public static void recordFailure(int nodeId, String site, String chosen) {
+        cell(nodeId, site, chosen, "-").failures.incrementAndGet();
         maybeFlush();
     }
 
     /** A request or retry was submitted to the asynchronous framed transport. */
-    public static void recordTransportCall(int nodeId, String chosen, double invocationMs) {
-        Cell c = cell(nodeId, chosen, "-");
+    public static void recordTransportCall(int nodeId, String site, String chosen, double invocationMs) {
+        Cell c = cell(nodeId, site, chosen, "-");
         c.transportCalls.incrementAndGet();
         c.transportInvocationLatencySumMs.add(invocationMs);
         c.transportInvocationLatencyBuckets.incrementAndGet(latencyBucketOf(invocationMs));
@@ -163,8 +163,8 @@ public final class ClientMetricsTracker {
     }
 
     /** The per-RPC SLA deadline expired. It is a violation, not a lost request. */
-    public static void recordDeadlineExceeded(int nodeId, String chosen) {
-        Cell c = cell(nodeId, chosen, "-");
+    public static void recordDeadlineExceeded(int nodeId, String site, String chosen) {
+        Cell c = cell(nodeId, site, chosen, "-");
         c.deadlineExceeded.incrementAndGet();
         c.violations.incrementAndGet();
         runViolations.incrementAndGet();
@@ -172,9 +172,9 @@ public final class ClientMetricsTracker {
     }
 
     /** Admission control shed the request; not retried by design. */
-    public static void recordRejected(int nodeId, String chosen, double totalLatencyMs,
+    public static void recordRejected(int nodeId, String site, String chosen, double totalLatencyMs,
             long serverReplyEpochMs, long clientReceiveEpochMs) {
-        Cell c = cell(nodeId, chosen, "-");
+        Cell c = cell(nodeId, site, chosen, "-");
         c.rejected.incrementAndGet();
         c.rejectionTotalLatencySumMs.add(totalLatencyMs);
         c.rejectionTotalLatencyBuckets.incrementAndGet(latencyBucketOf(totalLatencyMs));
@@ -189,8 +189,8 @@ public final class ClientMetricsTracker {
         maybeFlush();
     }
 
-    public static void recordLost(int nodeId, String chosen) {
-        cell(nodeId, chosen, "-").lost.incrementAndGet();
+    public static void recordLost(int nodeId, String site, String chosen) {
+        cell(nodeId, site, chosen, "-").lost.incrementAndGet();
         runLost.incrementAndGet();
         maybeFlush();
     }
@@ -259,7 +259,7 @@ public final class ClientMetricsTracker {
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,NodeId,ChosenLevel,ExecutedLevel,Count,AvgLatencyMs,"
+                out.println("Timestamp,NodeId,Site,ChosenLevel,ExecutedLevel,Count,AvgLatencyMs,"
                         + "P50Ms,P90Ms,P95Ms,P99Ms,PredictedProfitSum,RealizedProfitSum,"
                         + "UpgradesFree,UpgradesWaiting,"
                         + "SatisfiedRung0,SatisfiedRung1,SatisfiedRung2,SatisfiedRung3,SatisfiedNone,"
@@ -319,10 +319,10 @@ public final class ClientMetricsTracker {
                     continue; // no activity this interval
                 }
                 double avg = count == 0 ? 0.0 : latencySum / count;
-                out.printf("%d,%d,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                out.printf("%d,%d,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                                 + "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%d,"
                                 + "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n",
-                        now, k.nodeId(), k.chosen(), k.executed(), count, avg,
+                        now, k.nodeId(), k.site(), k.chosen(), k.executed(), count, avg,
                         quantileMs(buckets, bucketTotal, 0.50), quantileMs(buckets, bucketTotal, 0.90),
                         quantileMs(buckets, bucketTotal, 0.95),
                         quantileMs(buckets, bucketTotal, 0.99),

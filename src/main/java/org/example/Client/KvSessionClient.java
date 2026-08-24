@@ -44,6 +44,11 @@ import io.grpc.Status;
 public final class KvSessionClient implements AutoCloseable {
 
     private final int applicationId;
+    // The client site this session lives at: picks the transport's per-site
+    // connection pools (and thus the site's simulated geo distances) and
+    // labels this session's ledger rows.
+    private final int siteId;
+    private final String siteName;
     private final int numServers;
     private final int majority;
     private final ClientMode mode;
@@ -124,27 +129,35 @@ public final class KvSessionClient implements AutoCloseable {
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
             boolean admissionAwareRouting, double admitRateGamma) {
-        this(applicationId, new KvFramedTransport(hosts, basePort, 1), true, mode,
+        this(applicationId, 0, "-", new KvFramedTransport(hosts, basePort, 1), true, mode,
                 rttWindowSize, retryLimit, lostTimeoutMs, readSlas, writeSlas,
                 explorationFraction, followerLinReads, admissionAwareRouting, admitRateGamma);
     }
 
-    public KvSessionClient(int applicationId, KvFramedTransport transport, ClientMode mode,
+    public KvSessionClient(int applicationId, int siteId, String siteName, KvFramedTransport transport,
+            ClientMode mode,
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
             boolean admissionAwareRouting, double admitRateGamma) {
-        this(applicationId, transport, false, mode, rttWindowSize, retryLimit, lostTimeoutMs,
+        this(applicationId, siteId, siteName, transport, false, mode, rttWindowSize, retryLimit, lostTimeoutMs,
                 readSlas, writeSlas, explorationFraction, followerLinReads,
                 admissionAwareRouting, admitRateGamma);
     }
 
-    private KvSessionClient(int applicationId, KvFramedTransport transport, boolean ownsTransport, ClientMode mode,
+    private KvSessionClient(int applicationId, int siteId, String siteName, KvFramedTransport transport,
+            boolean ownsTransport, ClientMode mode,
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
             boolean admissionAwareRouting, double admitRateGamma) {
         this.applicationId = applicationId;
+        if (siteId < 0 || siteId >= transport.numSites()) {
+            throw new IllegalArgumentException("siteId " + siteId + " is out of range for a transport with "
+                    + transport.numSites() + " sites");
+        }
+        this.siteId = siteId;
+        this.siteName = siteName;
         this.transport = transport;
         this.ownsTransport = ownsTransport;
         this.numServers = transport.numServers();
@@ -380,16 +393,16 @@ public final class KvSessionClient implements AutoCloseable {
         long remainingDeadlineNanos = deadlineNanos - System.nanoTime();
         if (remainingDeadlineNanos <= 0) {
             if (pending.remove(request.getRequestId(), entry)) {
-                ClientMetricsTracker.recordDeadlineExceeded(targetNode, chosenLabel(request));
+                ClientMetricsTracker.recordDeadlineExceeded(targetNode, siteName, chosenLabel(request));
             }
             return;
         }
         long invocationStartedNanos = System.nanoTime();
-        entry.transportHandle = transport.execute(targetNode, withRtt.build(), remainingDeadlineNanos,
+        entry.transportHandle = transport.execute(siteId, targetNode, withRtt.build(), remainingDeadlineNanos,
                 response -> handleResponse(targetNode, response, entry),
                 failure -> handleRpcError(targetNode, entry, failure));
         double invocationMs = (System.nanoTime() - invocationStartedNanos) / 1_000_000.0;
-        ClientMetricsTracker.recordTransportCall(targetNode, chosenLabel(request), invocationMs);
+        ClientMetricsTracker.recordTransportCall(targetNode, siteName, chosenLabel(request), invocationMs);
     }
 
     private double longestDeadlineMs(KvRequest request) {
@@ -416,7 +429,7 @@ public final class KvSessionClient implements AutoCloseable {
 
         if (response.getDeadlineExceeded()) {
             if (pending.remove(response.getRequestId(), entry)) {
-                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosen);
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, siteName, chosen);
             }
             return;
         }
@@ -426,7 +439,7 @@ public final class KvSessionClient implements AutoCloseable {
             if (hinted >= 0 && hinted < numServers) {
                 leaderHint = hinted;
             }
-            ClientMetricsTracker.recordRedirect(nodeId, chosen);
+            ClientMetricsTracker.recordRedirect(nodeId, siteName, chosen);
             if (entry.attempt < retryLimit) {
                 int target = (hinted >= 0 && hinted < numServers)
                         ? hinted
@@ -434,7 +447,7 @@ public final class KvSessionClient implements AutoCloseable {
                 dispatch(request, target, entry.attempt + 1, 0, 0);
             } else {
                 pending.remove(response.getRequestId(), entry);
-                ClientMetricsTracker.recordFailure(nodeId, chosen);
+                ClientMetricsTracker.recordFailure(nodeId, siteName, chosen);
             }
             return;
         }
@@ -464,7 +477,7 @@ public final class KvSessionClient implements AutoCloseable {
                     selector.observeWriteRejected(request.getRequestedWriteConcern());
                 }
             }
-            ClientMetricsTracker.recordRejected(nodeId, chosen, rejectLatencyMs,
+            ClientMetricsTracker.recordRejected(nodeId, siteName, chosen, rejectLatencyMs,
                     response.getServerReplyEpochMs(), responseReceiveEpochMs);
             return;
         }
@@ -475,7 +488,7 @@ public final class KvSessionClient implements AutoCloseable {
                         0, 0);
             } else {
                 pending.remove(response.getRequestId(), entry);
-                ClientMetricsTracker.recordFailure(nodeId, chosen);
+                ClientMetricsTracker.recordFailure(nodeId, siteName, chosen);
             }
             return;
         }
@@ -525,7 +538,7 @@ public final class KvSessionClient implements AutoCloseable {
         }
 
         double predicted = mode.chameleonDecision() ? response.getPredictedProfit() : entry.predictedProfit;
-        ClientMetricsTracker.recordResponse(nodeId, chosen, executed, latencyMs,
+        ClientMetricsTracker.recordResponse(nodeId, siteName, chosen, executed, latencyMs,
                 response.getTimedOutAndFellBack(), verdict.deadlineViolation(),
                 predicted, verdict.realizedProfit(), verdict.satisfiedRung(), upgraded, response.getWaited());
     }
@@ -538,7 +551,7 @@ public final class KvSessionClient implements AutoCloseable {
         }
         if (status.getCode() == Status.Code.DEADLINE_EXCEEDED) {
             if (pending.remove(requestId, entry)) {
-                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosenLabel(entry.request));
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, siteName, chosenLabel(entry.request));
             }
             return;
         }
@@ -559,7 +572,7 @@ public final class KvSessionClient implements AutoCloseable {
                     selector.observeWriteRejected(request.getRequestedWriteConcern());
                 }
             }
-            ClientMetricsTracker.recordRejected(nodeId, chosenLabel(request), rejectLatencyMs,
+            ClientMetricsTracker.recordRejected(nodeId, siteName, chosenLabel(request), rejectLatencyMs,
                     failure.serverReplyEpochMs(), System.currentTimeMillis());
             return;
         }
@@ -570,9 +583,9 @@ public final class KvSessionClient implements AutoCloseable {
         }
         if (pending.remove(requestId, entry)) {
             if (System.nanoTime() >= entry.deadlineNanos) {
-                ClientMetricsTracker.recordDeadlineExceeded(nodeId, chosenLabel(entry.request));
+                ClientMetricsTracker.recordDeadlineExceeded(nodeId, siteName, chosenLabel(entry.request));
             } else {
-                ClientMetricsTracker.recordFailure(nodeId, chosenLabel(entry.request));
+                ClientMetricsTracker.recordFailure(nodeId, siteName, chosenLabel(entry.request));
             }
         }
     }
@@ -598,7 +611,7 @@ public final class KvSessionClient implements AutoCloseable {
                 if (handle != null) {
                     handle.cancel();
                 }
-                ClientMetricsTracker.recordLost(e.getValue().targetNode, chosenLabel(e.getValue().request));
+                ClientMetricsTracker.recordLost(e.getValue().targetNode, siteName, chosenLabel(e.getValue().request));
             }
         }
     }

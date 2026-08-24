@@ -60,6 +60,13 @@ public class WorkloadDriver {
     private static int CLIENT_LOST_TIMEOUT_MS;
     private static int INGRESS_CONNECTIONS_PER_SERVER;
 
+    // Client sites (geo.clientSites): every session belongs to one site and
+    // rides that site's connection pools. When geo is enabled each site's
+    // connections bind their own 127.0.2.x source IP so the netem rules can
+    // apply per-site delays; when disabled the sites differ only in name.
+    private static List<String> CLIENT_SITE_NAMES;
+    private static boolean GEO_ENABLED;
+
     // Number of applications, derived from the registered SLAs (the config
     // loader guarantees applicationIds are exactly 1..N).
     private static int NUM_APPLICATIONS;
@@ -181,6 +188,9 @@ public class WorkloadDriver {
         CLIENT_RETRY_LIMIT = config.client.retryLimit;
         CLIENT_LOST_TIMEOUT_MS = config.client.lostTimeoutMs;
         INGRESS_CONNECTIONS_PER_SERVER = config.client.ingressConnectionsPerServer;
+        CLIENT_SITE_NAMES = config.geo.clientSites.stream()
+                .map(site -> site.name).toList();
+        GEO_ENABLED = config.geo.enabled;
         CLIENT_MODE = ClientMode.fromConfig(config.mode);
         EXPLORATION_FRACTION = config.client.explorationFraction;
         ADMISSION_AWARE_ROUTING = config.client.admissionAwareRouting;
@@ -244,12 +254,24 @@ public class WorkloadDriver {
         waitForClusterReachable();
         applyNodeFailureConfig();
 
+        // One connection pool per (site, server); when geo is enabled every
+        // site binds its own 127.0.2.x source IP so the delay rules can match
+        // per-site (source, destination) pairs. Session s of every application
+        // lives at site s mod #sites, so sessions spread evenly (the loader
+        // rejects configs where they would not divide).
+        int numSites = CLIENT_SITE_NAMES.size();
+        List<String> siteBindHosts = new ArrayList<>();
+        for (int site = 0; site < numSites; site++) {
+            siteBindHosts.add(GEO_ENABLED ? ExperimentConfig.clientSiteBindHost(site) : null);
+        }
         framedTransport = new KvFramedTransport(SERVER_HOSTS, CLIENT_BASE_PORT,
-                INGRESS_CONNECTIONS_PER_SERVER);
+                INGRESS_CONNECTIONS_PER_SERVER, siteBindHosts);
         appSessions = new KvSessionClient[NUM_APPLICATIONS][SESSIONS_PER_APPLICATION];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
             for (int session = 0; session < SESSIONS_PER_APPLICATION; session++) {
-                appSessions[app][session] = new KvSessionClient(app + 1, framedTransport, CLIENT_MODE,
+                int siteId = session % numSites;
+                appSessions[app][session] = new KvSessionClient(app + 1, siteId,
+                        CLIENT_SITE_NAMES.get(siteId), framedTransport, CLIENT_MODE,
                         RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
                         readSlasByApp.get(app + 1), writeSlasByApp.get(app + 1),
                         EXPLORATION_FRACTION, FOLLOWER_LIN_READS,
@@ -257,7 +279,9 @@ public class WorkloadDriver {
             }
         }
         System.out.println("Started " + NUM_APPLICATIONS + " applications x " + SESSIONS_PER_APPLICATION
-                + " sessions (" + (NUM_APPLICATIONS * SESSIONS_PER_APPLICATION) + " session clients)");
+                + " sessions (" + (NUM_APPLICATIONS * SESSIONS_PER_APPLICATION) + " session clients) across "
+                + numSites + " client sites " + CLIENT_SITE_NAMES
+                + (GEO_ENABLED ? " (per-site source IPs bound)" : " (geo disabled; no source binding)"));
 
         Thread coordinator = startPhasedInjection();
         // The coordinator thread ends the run: final report, cluster shutdown,

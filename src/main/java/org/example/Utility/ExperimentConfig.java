@@ -123,20 +123,46 @@ public final class ExperimentConfig {
     }
 
     /**
-     * Simulated geo latency, applied by run_all.sh (Linux tc/netem or macOS
-     * dnctl/pfctt dummynet), not by the Java processes. When enabled,
-     * cluster.serverHosts must be distinct literal loopback IPs (e.g.
-     * 127.0.1.1..127.0.1.5, never 127.0.0.1, which identifies the client):
-     * the (source IP, destination IP) pair is what the delay rules match on.
+     * Simulated geo latency, applied by run_all_cloudlab.sh (Linux tc/netem),
+     * not by the Java processes. The delay rules match on (source IP,
+     * destination IP) pairs: the runner rewrites cluster.serverHosts to
+     * 127.0.1.1..N, and client site k binds its connections to
+     * {@link #clientSiteBindHost} (127.0.2.(k+1)). A local run_all.sh run
+     * refuses geo-enabled configs outright.
      */
     public static final class Geo {
         public Boolean enabled;
         // interServerLatencyMs[i][j]: one-way latency in ms added from server
         // i to server j (numServers x numServers; the diagonal must be 0).
         public Double[][] interServerLatencyMs;
-        // clientToServerLatencyMs[i]: one-way latency in ms added between the
-        // client and server i (numServers entries).
-        public Double[] clientToServerLatencyMs;
+        // Client sites. Every session belongs to one site (sessions are spread
+        // evenly: session s of every application lives at site s mod #sites),
+        // and site k's requests ride connections bound to clientSiteBindHost(k)
+        // so the delay rules can tell sites apart. Defined and used even when
+        // geo is disabled (sites then differ only in name; nothing binds).
+        public List<ClientSite> clientSites;
+    }
+
+    /** One client site: a name for the ledger and its one-way delay to each server. */
+    public static final class ClientSite {
+        public String name;
+        // latencyMs[j]: one-way latency in ms added between this site and
+        // server j (numServers entries).
+        public Double[] latencyMs;
+    }
+
+    /**
+     * The loopback IP client site {@code siteIndex}'s connections bind as
+     * their source when geo is enabled. Fixed convention shared with
+     * run_all_cloudlab.sh (via the key=value printer below): servers own
+     * 127.0.1.x, client sites own 127.0.2.x, and 127.0.0.1 stays the
+     * orchestration address (admin RPCs), which no delay rule matches.
+     */
+    public static String clientSiteBindHost(int siteIndex) {
+        if (siteIndex < 0 || siteIndex > 253) {
+            throw new IllegalArgumentException("client site index must be in [0, 253], got " + siteIndex);
+        }
+        return "127.0.2." + (siteIndex + 1);
     }
 
     /**
@@ -205,11 +231,27 @@ public final class ExperimentConfig {
                 }
             }
             System.out.println("geoInterServerLatencyMs=" + matrix);
-            StringBuilder client = new StringBuilder();
-            for (int i = 0; i < config.geo.clientToServerLatencyMs.length; i++) {
-                client.append(i > 0 ? "," : "").append(config.geo.clientToServerLatencyMs[i]);
+            // One row per client site (';'-separated), plus the loopback IPs
+            // the sites bind - the runner's delay rules key on them.
+            StringBuilder siteRows = new StringBuilder();
+            StringBuilder siteHosts = new StringBuilder();
+            StringBuilder siteNames = new StringBuilder();
+            for (int s = 0; s < config.geo.clientSites.size(); s++) {
+                ClientSite site = config.geo.clientSites.get(s);
+                if (s > 0) {
+                    siteRows.append(';');
+                    siteHosts.append(',');
+                    siteNames.append(',');
+                }
+                for (int j = 0; j < site.latencyMs.length; j++) {
+                    siteRows.append(j > 0 ? "," : "").append(site.latencyMs[j]);
+                }
+                siteHosts.append(clientSiteBindHost(s));
+                siteNames.append(site.name);
             }
-            System.out.println("geoClientToServerLatencyMs=" + client);
+            System.out.println("geoClientSiteLatencyMs=" + siteRows);
+            System.out.println("geoClientSiteHosts=" + siteHosts);
+            System.out.println("geoClientSiteNames=" + siteNames);
         }
     }
 
@@ -573,18 +615,48 @@ public final class ExperimentConfig {
                 }
             }
         }
-        require(geo.clientToServerLatencyMs, "geo.clientToServerLatencyMs");
-        if (geo.clientToServerLatencyMs.length != cluster.numServers) {
-            throw new IllegalArgumentException("geo.clientToServerLatencyMs must have " + cluster.numServers
-                    + " entries (one per server), got " + geo.clientToServerLatencyMs.length);
+        require(geo.clientSites, "geo.clientSites");
+        if (geo.clientSites.isEmpty()) {
+            throw new IllegalArgumentException("geo.clientSites must define at least one client site");
         }
-        for (int i = 0; i < geo.clientToServerLatencyMs.length; i++) {
-            Double v = geo.clientToServerLatencyMs[i];
-            require(v, "geo.clientToServerLatencyMs[" + i + "]");
-            if (!(v >= 0) || !Double.isFinite(v)) {
-                throw new IllegalArgumentException("geo.clientToServerLatencyMs[" + i
-                        + "] must be a non-negative finite number, got " + v);
+        if (geo.clientSites.size() > 254) {
+            throw new IllegalArgumentException("geo.clientSites supports at most 254 sites"
+                    + " (each binds one 127.0.2.x source IP), got " + geo.clientSites.size());
+        }
+        java.util.Set<String> siteNames = new java.util.HashSet<>();
+        for (int s = 0; s < geo.clientSites.size(); s++) {
+            ClientSite site = geo.clientSites.get(s);
+            String sitePrefix = "geo.clientSites[" + s + "]";
+            require(site, sitePrefix);
+            require(site.name, sitePrefix + ".name");
+            // Names end up in CSV cells and shell-parsed key=value lines.
+            if (!site.name.matches("[A-Za-z0-9._-]+")) {
+                throw new IllegalArgumentException(sitePrefix + ".name must match [A-Za-z0-9._-]+, got '"
+                        + site.name + "'");
             }
+            if (!siteNames.add(site.name)) {
+                throw new IllegalArgumentException(sitePrefix + ".name '" + site.name + "' is duplicated");
+            }
+            require(site.latencyMs, sitePrefix + ".latencyMs");
+            if (site.latencyMs.length != cluster.numServers) {
+                throw new IllegalArgumentException(sitePrefix + ".latencyMs must have " + cluster.numServers
+                        + " entries (one per server), got " + site.latencyMs.length);
+            }
+            for (int j = 0; j < site.latencyMs.length; j++) {
+                Double v = site.latencyMs[j];
+                require(v, sitePrefix + ".latencyMs[" + j + "]");
+                if (!(v >= 0) || !Double.isFinite(v)) {
+                    throw new IllegalArgumentException(sitePrefix + ".latencyMs[" + j
+                            + "] must be a non-negative finite number, got " + v);
+                }
+            }
+        }
+        // Sessions are spread evenly across sites (EXPERIMENT.md); an uneven
+        // split would silently skew per-site load, so it is rejected instead.
+        if (workload.sessionsPerApplication % geo.clientSites.size() != 0) {
+            throw new IllegalArgumentException("workload.sessionsPerApplication ("
+                    + workload.sessionsPerApplication + ") must be divisible by the number of client sites ("
+                    + geo.clientSites.size() + ") so sessions spread evenly across sites");
         }
         // No host-shape requirements for geo here: run_all_cloudlab.sh
         // rewrites cluster.serverHosts to distinct literal loopback IPs

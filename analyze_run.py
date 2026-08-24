@@ -4,8 +4,8 @@ Reads the CSVs a run writes into its own directory, renders the six figures,
 and prints the text reports to stdout.
 
 Data sources (per run directory):
-  client_metrics_global.csv  client-side ledger, one row per (node, chosen,
-                             executed) cell per ~1 s interval; counters reset
+  client_metrics_global.csv  client-side ledger, one row per (node, site,
+                             chosen, executed) cell per ~1 s interval; counters reset
                              at every flush, so rows are per-interval activity
                              and the P50/P90/P95/P99 columns are that
                              interval's percentiles - all cross-arm comparison
@@ -50,7 +50,9 @@ LEVEL_COLORS = {
 }
 NODE_COLORS = {n: PALETTE[n % len(PALETTE)] for n in range(8)}
 
-CELL_KEY = ["NodeId", "ChosenLevel", "ExecutedLevel"]
+# Site is the client site the request was issued from (geo.clientSites);
+# ledgers recorded before multi-site clients get a constant "-" on load.
+CELL_KEY = ["NodeId", "Site", "ChosenLevel", "ExecutedLevel"]
 LINE = dict(linewidth=1.8)
 
 
@@ -69,6 +71,8 @@ class Run:
                      "an older git revision")
         if "Violations" not in self.ledger.columns and "SessionViolations" in self.ledger.columns:
             self.ledger = self.ledger.rename(columns={"SessionViolations": "Violations"})
+        if "Site" not in self.ledger.columns:
+            self.ledger["Site"] = "-"
         self.t0 = self.ledger["Timestamp"].min()
         self.ledger["Time_s"] = (self.ledger["Timestamp"] - self.t0) / 1000.0
 

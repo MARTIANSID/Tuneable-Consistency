@@ -99,4 +99,50 @@ class ExperimentConfigTest {
             Files.delete(tmp);
         }
     }
+
+    @Test
+    void clientSiteLatencyRowsMustMatchNumServers() throws IOException {
+        // Drop the first entry of the first site's latency row (the only
+        // "latencyMs: [" occurrences in the config are the site rows).
+        String original = Files.readString(REPO_CONFIG);
+        String yaml = original.replaceFirst("latencyMs: \\[[^,]+, ", "latencyMs: [");
+        assertTrue(!yaml.equals(original), "test setup: the replacement must have matched a site row");
+        Path tmp = Files.createTempFile("config-test", ".yaml");
+        try {
+            Files.writeString(tmp, yaml);
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> ExperimentConfig.load(tmp));
+            assertTrue(e.getMessage().contains("latencyMs"), e.getMessage());
+        } finally {
+            Files.delete(tmp);
+        }
+    }
+
+    @Test
+    void sessionsMustSpreadEvenlyAcrossClientSites() throws IOException {
+        // The repo config's session count divides its site count; one more
+        // session breaks the even spread and must be rejected explicitly.
+        ExperimentConfig valid = ExperimentConfig.load(REPO_CONFIG);
+        int uneven = valid.workload.sessionsPerApplication + 1;
+        String yaml = Files.readString(REPO_CONFIG)
+                .replaceFirst("sessionsPerApplication: \\d+", "sessionsPerApplication: " + uneven)
+                .replaceFirst("injectorThreads: \\d+", "injectorThreads: 1");
+        Path tmp = Files.createTempFile("config-test", ".yaml");
+        try {
+            Files.writeString(tmp, yaml);
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> ExperimentConfig.load(tmp));
+            assertTrue(e.getMessage().contains("divisible"), e.getMessage());
+        } finally {
+            Files.delete(tmp);
+        }
+    }
+
+    @Test
+    void clientSiteBindHostsFollowTheFixedConvention() {
+        assertEquals("127.0.2.1", ExperimentConfig.clientSiteBindHost(0));
+        assertEquals("127.0.2.6", ExperimentConfig.clientSiteBindHost(5));
+        assertThrows(IllegalArgumentException.class, () -> ExperimentConfig.clientSiteBindHost(-1));
+        assertThrows(IllegalArgumentException.class, () -> ExperimentConfig.clientSiteBindHost(254));
+    }
 }

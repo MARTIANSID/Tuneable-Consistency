@@ -101,8 +101,9 @@ client:
   retryLimit: 3
   # No response within this -> the client scores the request as lost.
   lostTimeoutMs: 10000
-  # Shared persistent framed TCP connections per server. Logical sessions
-  # multiplex over them without creating a transport stream per request.
+  # Shared persistent framed TCP connections per (client site, server).
+  # Logical sessions multiplex over their site's pool without creating a
+  # transport stream per request.
   ingressConnectionsPerServer: 16
   # Fraction of reads routed to a uniformly random server instead of the
   # routing policy's pick - applies to the Pileus selector and to lowest-RTT
@@ -306,27 +307,45 @@ timedFailure:
   targetRole: FOLLOWER        # LEADER | FOLLOWER
   afterSeconds: 40
 
-# Geo latency simulation (Linux tc/netem only; requires root or sudo).
-# Simulated geo latency, applied and cleared by run_all.sh (Linux tc/netem or
-# macOS dnctl/pfctl dummynet; needs sudo). When enabled, cluster.serverHosts
-# must be distinct literal loopback IPs (e.g. 127.0.1.1 .. 127.0.1.5, never
-# 127.0.0.1, which identifies the client): the delay rules match on the
-# (source IP, destination IP) pair, and each server binds its outgoing
-# connections to its own address.
+# Simulated geo latency, applied and cleared by run_all_cloudlab.sh (Linux
+# tc/netem on the node's loopback; the runner rewrites cluster.serverHosts to
+# distinct literal loopback IPs 127.0.1.1..N, which the delay rules and the
+# servers' outgoing-connection source binding key on). A local run_all.sh run
+# refuses geo-enabled configs outright; flip enabled to false for a
+# no-delay smoke run on this machine.
 geo:
   enabled: true
   # One-way latency in ms added from server i to server j (row i, column j);
-  # numServers x numServers, the diagonal must be 0. The example topology:
-  # servers 0-1 co-located, 2-3 in a second region, 4 in a third.
+  # numServers x numServers, the diagonal must be 0. Regional topology
+  # (EXPERIMENT.md): five North American regions - A Virginia (leader),
+  # B Ohio, C Montreal, D N. California, E Oregon. Quorum is the leader plus
+  # Ohio and Montreal, about 20 ms round trip; replica lag runs 6 ms at Ohio
+  # to 35 ms at Oregon.
   interServerLatencyMs:
     - [0,  6,  10, 30, 35]
     - [6,  0,  12, 25, 25]
-    - [10, 12, 0,  20,  35]
-    - [30, 25, 20,  0,  10]
+    - [10, 12, 0,  38, 35]
+    - [30, 25, 38, 0,  10]
     - [35, 25, 35, 10, 0]
-  # One-way latency in ms added between the client and each server (the
-  # client sits in the first region in this example).
-  clientToServerLatencyMs: [0, 0, 0, 0, 0]
+  # Client sites: every session belongs to one site (session s of every
+  # application lives at site s mod #sites; sessionsPerApplication must
+  # divide evenly). latencyMs is the one-way delay from the site to each
+  # server. Site k's connections bind source IP 127.0.2.(k+1) when geo is
+  # enabled, which is the address the per-site delay rules match on;
+  # 127.0.0.1 stays rule-free for the driver's admin RPCs.
+  #
+  # Regional topology (EXPERIMENT.md): one site colocated with each node
+  # (0.5 ms to it), plus Phoenix with no local replica - its nearest node
+  # (N. California) is also the stalest, the cleanest single probe of
+  # routing quality (least-RTT takes close-and-lagging; freshness-aware pays
+  # a little more distance for much fresher data).
+  clientSites:
+    - { name: virginia,    latencyMs: [0.5, 6,   10,  30,  35] }
+    - { name: ohio,        latencyMs: [6,   0.5, 12,  25,  25] }
+    - { name: montreal,    latencyMs: [10,  12,  0.5, 38,  35] }
+    - { name: ncalifornia, latencyMs: [30,  25,  38,  0.5, 10] }
+    - { name: oregon,      latencyMs: [35,  25,  35,  10,  0.5] }
+    - { name: phoenix,     latencyMs: [25,  20,  28,  10,  15] }
 
 # The simulated workload: keys, session population, and the phase schedule.
 workload:
@@ -345,15 +364,17 @@ workload:
   # share the framed transport, and each request picks a session
   # uniformly within its application.
   # Sessions persist across phases, so history carries forward. Only the
-  # metrics ledger is shared.
-  sessionsPerApplication: 50
+  # metrics ledger is shared. Sessions spread evenly across the client sites
+  # (geo.clientSites), so this must be divisible by the number of sites:
+  # 60 = 10 per site across the six regional sites.
+  sessionsPerApplication: 60
   # Threads injecting the workload. One thread caps at roughly 200-400k
   # requests/s (per-request cost on a single core); the configured TPS is
   # split evenly across threads each 100ms tick. Sessions are sharded across
   # threads (thread t owns sessions t, t+K, ... of every application), so each
   # session is still driven by exactly one thread. Must be
   # <= sessionsPerApplication.
-  injectorThreads: 25
+  injectorThreads: 15
   # Named weight vectors the phases reference. Each injected request is drawn
   # from the active phase's mix by weight: the entry fixes the application,
   # whether it is a read or a write, and the SLA it names, so the read/write
@@ -462,39 +483,39 @@ workload:
   # headroom, not for the flash sale: normal sits at 0.5C and the sale day
   # exceeds C.
   phases:
-    # - name: WarmUp          # baseline: price on its floor, upgrades free
-    #   durationSeconds: 300
-    #   totalTPS: 200000      # 0.5C
-    #   mix: normal
-    # - name: NormalDay       # baseline: price on its floor, upgrades free
-    #   durationSeconds: 300
-    #   totalTPS: 200000      # 0.5C
-    #   mix: normal
-    # - name: HolidayPlateau  # sustained lift; equilibrium, where oscillation would appear
-    #   durationSeconds: 300
-    #   totalTPS: 320000      # 0.8C
-    #   mix: holiday
-    # - name: SaleDay         # Prime Day scale: rate and value rise together
-    #   durationSeconds: 300
-    #   totalTPS: 720000      # 1.8C
-    #   mix: saleDay
-    # - name: PreFlash        # login surge; write-heavy A3 drives lag up before the burst
-    #   durationSeconds: 120
-    #   totalTPS: 400000      # 1.0C
-    #   mix: preFlash
-    - name: Flash           # ~60% must be refused; floor forbids downgrading
+    - name: WarmUp          # baseline: price on its floor, upgrades free
+      durationSeconds: 60
+      totalTPS: 200000      # 0.5C
+      mix: normal
+    - name: NormalDay       # baseline: price on its floor, upgrades free
+      durationSeconds: 300
+      totalTPS: 200000      # 0.5C
+      mix: normal
+    - name: HolidayPlateau  # sustained lift; equilibrium, where oscillation would appear
+      durationSeconds: 300
+      totalTPS: 320000      # 0.8C
+      mix: holiday
+    - name: SaleDay         # Prime Day scale: rate and value rise together
+      durationSeconds: 300
+      totalTPS: 720000      # 1.8C
+      mix: saleDay
+    - name: PreFlash        # login surge; write-heavy A3 drives lag up before the burst
       durationSeconds: 120
+      totalTPS: 400000      # 1.0C
+      mix: preFlash
+    - name: Flash           # ~60% must be refused; floor forbids downgrading
+      durationSeconds: 60
       totalTPS: 1000000      # 2.5C
       mix: flash
-    # - name: Collapse        # load vanishes: does the price come down promptly
-    #   durationSeconds: 120
-    #   totalTPS: 280000      # 0.7C
-    #   mix: collapse
-    # - name: Payday          # composition shifts, volume barely does; the valuable tenant surges
-    #   durationSeconds: 300
-    #   totalTPS: 240000      # 0.6C
-    #   mix: payday
-    # - name: ReturnToNormal  # recovery, compared directly against the opening segment
-    #   durationSeconds: 300
-    #   totalTPS: 200000      # 0.5C
-    #   mix: normal
+    - name: Collapse        # load vanishes: does the price come down promptly
+      durationSeconds: 120
+      totalTPS: 280000      # 0.7C
+      mix: collapse
+    - name: Payday          # composition shifts, volume barely does; the valuable tenant surges
+      durationSeconds: 300
+      totalTPS: 240000      # 0.6C
+      mix: payday
+    - name: ReturnToNormal  # recovery, compared directly against the opening segment
+      durationSeconds: 300
+      totalTPS: 200000      # 0.5C
+      mix: normal

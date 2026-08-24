@@ -105,8 +105,10 @@ GEO_APPLIED=0
 if [[ "$GEO_ENABLED" == "true" ]]; then
     IFS=',' read -r -a GEO_HOSTS <<< "$(cfg serverHosts)"
     IFS=';' read -r -a GEO_ROWS <<< "$(cfg geoInterServerLatencyMs)"
-    GEO_CLIENT_CSV="$(cfg geoClientToServerLatencyMs)"
+    IFS=';' read -r -a GEO_SITE_ROWS <<< "$(cfg geoClientSiteLatencyMs)"
+    IFS=',' read -r -a GEO_SITE_HOSTS <<< "$(cfg geoClientSiteHosts)"
     GEO_NUM=${#GEO_HOSTS[@]}
+    GEO_SITES=${#GEO_SITE_HOSTS[@]}
 
     GEO_SCRIPT="$(mktemp)"
     GEO_RULE_INDEX=0
@@ -114,14 +116,14 @@ if [[ "$GEO_ENABLED" == "true" ]]; then
         echo "set -euo pipefail"
         echo "tc qdisc del dev lo root 2>/dev/null || true"
         echo "tc qdisc add dev lo root handle 1: htb default 1"
-        echo "tc class add dev lo parent 1: classid 1:1 htb rate 100gbit"
+        echo "tc class add dev lo parent 1: classid 1:1 htb rate 100gbit quantum 200000"
     } > "$GEO_SCRIPT"
     geo_nonzero() { awk "BEGIN{exit !($1 > 0)}"; }
     geo_emit() { # srcIp dstIp delayMs
         GEO_RULE_INDEX=$((GEO_RULE_INDEX + 1))
         local class=$((GEO_RULE_INDEX + 1))
         {
-            echo "tc class add dev lo parent 1: classid 1:$class htb rate 100gbit"
+            echo "tc class add dev lo parent 1: classid 1:$class htb rate 100gbit quantum 200000"
             echo "tc qdisc add dev lo parent 1:$class netem delay $3ms"
             echo "tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src $1/32 match ip dst $2/32 flowid 1:$class"
         } >> "$GEO_SCRIPT"
@@ -133,12 +135,18 @@ if [[ "$GEO_ENABLED" == "true" ]]; then
             geo_nonzero "${GEO_ROW[$j]}" && geo_emit "${GEO_HOSTS[$i]}" "${GEO_HOSTS[$j]}" "${GEO_ROW[$j]}"
         done
     done
-    IFS=',' read -r -a GEO_CLIENT <<< "$GEO_CLIENT_CSV"
-    for ((j = 0; j < GEO_NUM; j++)); do
-        if geo_nonzero "${GEO_CLIENT[$j]}"; then
-            geo_emit 127.0.0.1 "${GEO_HOSTS[$j]}" "${GEO_CLIENT[$j]}"
-            geo_emit "${GEO_HOSTS[$j]}" 127.0.0.1 "${GEO_CLIENT[$j]}"
-        fi
+    # Per-site client delays: each client site binds its own 127.0.2.x source
+    # IP (a fixed convention printed by the config helper), so the rules can
+    # give every (site, server) pair its own one-way delay. 127.0.0.1 stays
+    # rule-free for the driver's admin RPCs.
+    for ((s = 0; s < GEO_SITES; s++)); do
+        IFS=',' read -r -a GEO_SITE_ROW <<< "${GEO_SITE_ROWS[$s]}"
+        for ((j = 0; j < GEO_NUM; j++)); do
+            if geo_nonzero "${GEO_SITE_ROW[$j]}"; then
+                geo_emit "${GEO_SITE_HOSTS[$s]}" "${GEO_HOSTS[$j]}" "${GEO_SITE_ROW[$j]}"
+                geo_emit "${GEO_HOSTS[$j]}" "${GEO_SITE_HOSTS[$s]}" "${GEO_SITE_ROW[$j]}"
+            fi
+        done
     done
 
     echo "Applying simulated geo latency on $HOST ($GEO_RULE_INDEX delay rules)..."

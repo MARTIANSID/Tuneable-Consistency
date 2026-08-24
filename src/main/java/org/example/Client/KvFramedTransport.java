@@ -35,7 +35,15 @@ import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.flush.FlushConsolidationHandler;
 
-/** Shared persistent framed transport for every logical client session. */
+/**
+ * Shared persistent framed transport for every logical client session.
+ *
+ * Connections are pooled per (client site, server). A site models one client
+ * location: when {@code siteBindHosts} provides an address for a site, that
+ * site's connections bind it as their source IP so per-site delay rules
+ * (run_all_cloudlab.sh's tc/netem filters, matching on source/destination IP
+ * pairs) can tell the sites apart; a null entry leaves the source unbound.
+ */
 public final class KvFramedTransport implements AutoCloseable {
 
     public record RpcFailure(Status status, long serverReplyEpochMs) {
@@ -47,18 +55,28 @@ public final class KvFramedTransport implements AutoCloseable {
 
     private final EventLoopGroup ioGroup;
     private final ExecutorService callbackExecutor;
-    private final Connection[][] connections;
-    private final AtomicInteger[] nextConnection;
+    // connections[site][node][index]; one shared IO group serves every site.
+    private final Connection[][][] connections;
+    private final AtomicInteger[][] nextConnection;
     private final AtomicLong correlationIds = new AtomicLong();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final List<Channel> allChannels = new ArrayList<>();
 
+    /** Single anonymous site with an unbound source address. */
     public KvFramedTransport(List<String> hosts, int clientBasePort, int connectionsPerServer) {
+        this(hosts, clientBasePort, connectionsPerServer, java.util.Collections.singletonList(null));
+    }
+
+    public KvFramedTransport(List<String> hosts, int clientBasePort, int connectionsPerServer,
+            List<String> siteBindHosts) {
         if (hosts.isEmpty()) {
             throw new IllegalArgumentException("hosts must not be empty");
         }
         if (connectionsPerServer <= 0) {
             throw new IllegalArgumentException("connectionsPerServer must be positive");
+        }
+        if (siteBindHosts.isEmpty()) {
+            throw new IllegalArgumentException("siteBindHosts must define at least one client site");
         }
         AtomicInteger ioThreadId = new AtomicInteger();
         ioGroup = new NioEventLoopGroup(0, runnable -> {
@@ -87,38 +105,52 @@ public final class KvFramedTransport implements AutoCloseable {
                     task.run();
                 });
 
-        connections = new Connection[hosts.size()][connectionsPerServer];
-        nextConnection = new AtomicInteger[hosts.size()];
+        connections = new Connection[siteBindHosts.size()][hosts.size()][connectionsPerServer];
+        nextConnection = new AtomicInteger[siteBindHosts.size()][hosts.size()];
         Bootstrap bootstrap = new Bootstrap()
                 .group(ioGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.SO_KEEPALIVE, true);
         try {
-            for (int node = 0; node < hosts.size(); node++) {
-                nextConnection[node] = new AtomicInteger();
-                for (int index = 0; index < connectionsPerServer; index++) {
-                    Connection connection = new Connection(node);
-                    bootstrap.handler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        protected void initChannel(SocketChannel channel) {
-                            channel.pipeline()
-                                    .addLast(new LengthFieldBasedFrameDecoder(
-                                            KvWireProtocol.MAX_FRAME_BYTES,
-                                            0,
-                                            KvWireProtocol.LENGTH_FIELD_BYTES,
-                                            0,
-                                            KvWireProtocol.LENGTH_FIELD_BYTES))
-                                    .addLast(new FlushConsolidationHandler(256, true))
-                                    .addLast(connection);
+            for (int site = 0; site < siteBindHosts.size(); site++) {
+                String bindHost = siteBindHosts.get(site);
+                java.net.InetSocketAddress localAddress = bindHost == null
+                        ? null
+                        : new java.net.InetSocketAddress(bindHost, 0);
+                for (int node = 0; node < hosts.size(); node++) {
+                    nextConnection[site][node] = new AtomicInteger();
+                    java.net.InetSocketAddress remoteAddress =
+                            new java.net.InetSocketAddress(hosts.get(node), clientBasePort + node + 1);
+                    for (int index = 0; index < connectionsPerServer; index++) {
+                        Connection connection = new Connection(node);
+                        bootstrap.handler(new ChannelInitializer<SocketChannel>() {
+                            @Override
+                            protected void initChannel(SocketChannel channel) {
+                                channel.pipeline()
+                                        .addLast(new LengthFieldBasedFrameDecoder(
+                                                KvWireProtocol.MAX_FRAME_BYTES,
+                                                0,
+                                                KvWireProtocol.LENGTH_FIELD_BYTES,
+                                                0,
+                                                KvWireProtocol.LENGTH_FIELD_BYTES))
+                                        .addLast(new FlushConsolidationHandler(256, true))
+                                        .addLast(connection);
+                            }
+                        });
+                        Channel channel;
+                        try {
+                            channel = bootstrap.connect(remoteAddress, localAddress)
+                                    .syncUninterruptibly().channel();
+                        } catch (RuntimeException e) {
+                            throw new IllegalStateException("failed to connect site " + site
+                                    + (bindHost == null ? "" : " (source " + bindHost + ")")
+                                    + " to server " + node + " at " + remoteAddress, e);
                         }
-                    });
-                    Channel channel = bootstrap
-                            .connect(hosts.get(node), clientBasePort + node + 1)
-                            .syncUninterruptibly().channel();
-                    connection.channel = channel;
-                    connections[node][index] = connection;
-                    allChannels.add(channel);
+                        connection.channel = channel;
+                        connections[site][node][index] = connection;
+                        allChannels.add(channel);
+                    }
                 }
             }
         } catch (RuntimeException e) {
@@ -128,16 +160,33 @@ public final class KvFramedTransport implements AutoCloseable {
     }
 
     public int numServers() {
+        return connections[0].length;
+    }
+
+    public int numSites() {
         return connections.length;
     }
 
+    /** Single-site convenience; rejects multi-site transports explicitly. */
     public RequestHandle execute(int nodeId, KvRequest request, long remainingDeadlineNanos,
+            Consumer<KvResponse> onResponse, Consumer<RpcFailure> onError) {
+        if (connections.length != 1) {
+            throw new IllegalStateException("this transport has " + connections.length
+                    + " client sites; the caller must pick one via execute(siteId, nodeId, ...)");
+        }
+        return execute(0, nodeId, request, remainingDeadlineNanos, onResponse, onError);
+    }
+
+    public RequestHandle execute(int siteId, int nodeId, KvRequest request, long remainingDeadlineNanos,
             Consumer<KvResponse> onResponse, Consumer<RpcFailure> onError) {
         if (closed.get()) {
             onError.accept(new RpcFailure(Status.UNAVAILABLE.withDescription("framed transport is closed"), 0));
             return () -> { };
         }
-        if (nodeId < 0 || nodeId >= connections.length) {
+        if (siteId < 0 || siteId >= connections.length) {
+            throw new IllegalArgumentException("invalid siteId " + siteId);
+        }
+        if (nodeId < 0 || nodeId >= connections[siteId].length) {
             throw new IllegalArgumentException("invalid nodeId " + nodeId);
         }
         if (remainingDeadlineNanos <= 0) {
@@ -145,8 +194,9 @@ public final class KvFramedTransport implements AutoCloseable {
                     Status.DEADLINE_EXCEEDED.withDescription("SLA deadline expired before dispatch"), 0));
             return () -> { };
         }
-        int index = Math.floorMod(nextConnection[nodeId].getAndIncrement(), connections[nodeId].length);
-        Connection connection = connections[nodeId][index];
+        int index = Math.floorMod(nextConnection[siteId][nodeId].getAndIncrement(),
+                connections[siteId][nodeId].length);
+        Connection connection = connections[siteId][nodeId][index];
         long correlationId = correlationIds.incrementAndGet();
         long sendEpochMs = System.currentTimeMillis();
         long remainingMs = Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingDeadlineNanos)
