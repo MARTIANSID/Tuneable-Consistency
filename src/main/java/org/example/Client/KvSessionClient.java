@@ -66,6 +66,9 @@ public final class KvSessionClient implements AutoCloseable {
     // samples.
     private final Map<Integer, AdmitRates> readAdmitRates;
     private final Map<Integer, AdmitRates> writeAdmitRates;
+    // Per-second decay shared by the admit/reject counters and the selector's
+    // delivery-rate feedback (both are evidence with the same freshness needs).
+    private final double admitRateGamma;
 
     // Full SLA tables (the application's own registration) and their floors.
     private final Map<Integer, List<RungScorer.Rung>> readSlas;
@@ -105,14 +108,21 @@ public final class KvSessionClient implements AutoCloseable {
         final int attempt;
         final long deadlineNanos;
         // Client-side profit prediction and the target rung's threshold for
-        // recomputing the wait bound on retries.
+        // recomputing the wait bound on retries. targetStrength is the
+        // targeted read level (-1 = untargeted) for the selector's delivery
+        // feedback; suppressServerWait caps the server-side wait at 1 ms when
+        // the selector already scored the target infeasible, so a doomed wait
+        // does not burn occupancy.
         final double predictedProfit;
         final double targetThresholdMs;
+        final int targetStrength;
+        final boolean suppressServerWait;
         volatile KvFramedTransport.RequestHandle transportHandle;
 
         Pending(KvRequest request, long firstSendNanos, long firstSendMs, int targetNode, int attempt,
                 long deadlineNanos,
-                double predictedProfit, double targetThresholdMs) {
+                double predictedProfit, double targetThresholdMs,
+                int targetStrength, boolean suppressServerWait) {
             this.request = request;
             this.firstSendNanos = firstSendNanos;
             this.firstSendMs = firstSendMs;
@@ -121,6 +131,8 @@ public final class KvSessionClient implements AutoCloseable {
             this.deadlineNanos = deadlineNanos;
             this.predictedProfit = predictedProfit;
             this.targetThresholdMs = targetThresholdMs;
+            this.targetStrength = targetStrength;
+            this.suppressServerWait = suppressServerWait;
         }
     }
 
@@ -173,6 +185,7 @@ public final class KvSessionClient implements AutoCloseable {
         this.explorationFraction = explorationFraction;
         this.readAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.readSlas, admitRateGamma) : null;
         this.writeAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.writeSlas, admitRateGamma) : null;
+        this.admitRateGamma = admitRateGamma;
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
         this.selector = mode.pileusRouting()
                 ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
@@ -229,6 +242,7 @@ public final class KvSessionClient implements AutoCloseable {
         int targetNode;
         RungScorer.Rung targetRung = null;
         double predicted = 0;
+        boolean targetFeasible = true;
         switch (mode) {
             case CHAMELEON -> targetNode = lowestRttNode(admitRates);
             case CHAMELEON_PILEUS -> {
@@ -245,6 +259,7 @@ public final class KvSessionClient implements AutoCloseable {
                     targetNode = choice.node();
                     targetRung = sla.get(choice.rungIndex());
                     predicted = choice.expectedProfit();
+                    targetFeasible = choice.feasible();
                 }
             }
             default -> { // HIGHEST_PROFIT / LOWEST_PROFIT
@@ -267,7 +282,10 @@ public final class KvSessionClient implements AutoCloseable {
         if (targetRung != null) {
             request.setWantLinearizable(targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber());
         }
-        dispatch(request.build(), targetNode, 1, predicted, targetRung == null ? 0 : targetRung.thresholdMs());
+        dispatch(request.build(), targetNode, 1, predicted,
+                targetRung == null ? 0 : targetRung.thresholdMs(),
+                targetRung == null ? -1 : targetRung.strength(),
+                !targetFeasible);
     }
 
     public void sendWrite(String key, String value, int slaId) {
@@ -303,7 +321,8 @@ public final class KvSessionClient implements AutoCloseable {
         if (targetRung != null) {
             request.setRequestedWriteConcern(Math.min(Math.max(1, targetRung.strength()), majority));
         }
-        dispatch(request.build(), targetNode, 1, predicted, targetRung == null ? 0 : targetRung.thresholdMs());
+        dispatch(request.build(), targetNode, 1, predicted,
+                targetRung == null ? 0 : targetRung.thresholdMs(), -1, false);
     }
 
     /** The max-profit or floor rung; profit ties go to the weakest requirement. */
@@ -363,7 +382,8 @@ public final class KvSessionClient implements AutoCloseable {
     }
 
     private void dispatch(KvRequest request, int targetNode, int attempt,
-            double predictedProfit, double targetThresholdMs) {
+            double predictedProfit, double targetThresholdMs,
+            int targetStrength, boolean suppressServerWait) {
         long nowNanos = System.nanoTime();
         long nowMs = System.currentTimeMillis();
         Pending previous = pending.get(request.getRequestId());
@@ -376,10 +396,12 @@ public final class KvSessionClient implements AutoCloseable {
                 // to end and the prediction stays the first.
                 ? new Pending(request, previous.firstSendNanos, previous.firstSendMs, targetNode, attempt,
                         deadlineNanos,
-                        previous.predictedProfit, previous.targetThresholdMs)
+                        previous.predictedProfit, previous.targetThresholdMs,
+                        previous.targetStrength, previous.suppressServerWait)
                 : new Pending(request, nowNanos, nowMs, targetNode, attempt,
                         deadlineNanos,
-                        predictedProfit, targetThresholdMs);
+                        predictedProfit, targetThresholdMs,
+                        targetStrength, suppressServerWait);
         pending.put(request.getRequestId(), entry);
 
         // The RTT estimate rides every request (the scorer's rho); in the
@@ -387,7 +409,12 @@ public final class KvSessionClient implements AutoCloseable {
         // rung's threshold minus the network's share of it.
         double rtt = rttEstimator.estimateMs(targetNode);
         KvRequest.Builder withRtt = request.toBuilder().setRttEstimateMs(rtt);
-        if (entry.targetThresholdMs > 0) {
+        if (entry.suppressServerWait) {
+            // The selector scored this target's consistency infeasible: the
+            // wait cannot succeed, so do not buy it (1 ms is the smallest
+            // bound the wire encodes; <= 0 would mean the maxWaitMs default).
+            withRtt.setWaitBoundMs(1.0);
+        } else if (entry.targetThresholdMs > 0) {
             withRtt.setWaitBoundMs(Math.max(1.0, entry.targetThresholdMs - rtt));
         }
         long remainingDeadlineNanos = deadlineNanos - System.nanoTime();
@@ -444,7 +471,7 @@ public final class KvSessionClient implements AutoCloseable {
                 int target = (hinted >= 0 && hinted < numServers)
                         ? hinted
                         : Math.floorMod(roundRobin.getAndIncrement(), numServers);
-                dispatch(request, target, entry.attempt + 1, 0, 0);
+                dispatch(request, target, entry.attempt + 1, 0, 0, -1, false);
             } else {
                 pending.remove(response.getRequestId(), entry);
                 ClientMetricsTracker.recordFailure(nodeId, siteName, chosen);
@@ -485,7 +512,7 @@ public final class KvSessionClient implements AutoCloseable {
         if (!response.getOk()) {
             if (entry.attempt < retryLimit) {
                 dispatch(request, Math.floorMod(roundRobin.getAndIncrement(), numServers), entry.attempt + 1,
-                        0, 0);
+                        0, 0, -1, false);
             } else {
                 pending.remove(response.getRequestId(), entry);
                 ClientMetricsTracker.recordFailure(nodeId, siteName, chosen);
@@ -520,6 +547,12 @@ public final class KvSessionClient implements AutoCloseable {
             verdict = ClientGrader.gradeRead(slaOf(readSlas, request.getSlaId()), response,
                     request.getUncommittedSessionIndex(), latencyMs);
             upgraded = verdict.gradedStrength() > readFloors.get(request.getSlaId());
+            if (selector != null && entry.targetStrength >= 0) {
+                // Close the served-below-target loop: the latency window
+                // cannot see a wait that expired into a weaker level.
+                selector.observeReadDelivery(nodeId, entry.targetStrength,
+                        verdict.gradedStrength() >= entry.targetStrength);
+            }
         } else {
             int index = response.getValueIndex();
             executed = "W:" + response.getDeliveredWriteConcern();
@@ -578,7 +611,7 @@ public final class KvSessionClient implements AutoCloseable {
         }
         if (entry.attempt < retryLimit && System.nanoTime() < entry.deadlineNanos) {
             dispatch(entry.request, Math.floorMod(roundRobin.getAndIncrement(), numServers),
-                    entry.attempt + 1, 0, 0);
+                    entry.attempt + 1, 0, 0, -1, false);
             return;
         }
         if (pending.remove(requestId, entry)) {
@@ -600,6 +633,11 @@ public final class KvSessionClient implements AutoCloseable {
         }
         if (writeAdmitRates != null) {
             writeAdmitRates.values().forEach(AdmitRates::decay);
+        }
+        if (selector != null) {
+            // Same forgetting horizon as the admission evidence: a condemned
+            // (server, level) drifts back to neutral and can win again.
+            selector.decayDeliveryRates(admitRateGamma);
         }
         long now = System.currentTimeMillis();
         Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator();

@@ -1,6 +1,8 @@
 package org.example.Client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.Random;
@@ -20,10 +22,12 @@ class PileusSelectorTest {
     }
 
     @Test
-    void coldStartIsOptimisticAndTiesBreakToTheWeakestRequirement() {
+    void coldStartIsOptimisticAndTiesBreakByRungOrder() {
         // Empty windows read every candidate as certain, so expected profit
         // is just the rung profit; the LIN rung pays most but is only legal
-        // on the leader; equal-profit ties go to the weaker requirement.
+        // on the leader; equal-profit ties resolve by registration order
+        // (rungs are listed in decreasing preference, the paper's subSLA
+        // ordering).
         PileusSelector selector = selector();
         List<RungScorer.Rung> sla = List.of(
                 new RungScorer.Rung(LIN, 300, 10),
@@ -34,9 +38,67 @@ class PileusSelectorTest {
         assertEquals(0, choice.rungIndex());
         assertEquals(10.0, choice.expectedProfit(), 1e-9);
 
-        // Without the LIN rung, CM and EL tie at 6: the weaker EL rung wins.
+        // Without the LIN rung, CM and EL tie at 6: the earlier-listed
+        // (more preferred) CM rung wins the tie.
         PileusSelector.Choice tie = selector.chooseRead(sla.subList(1, 3), -1, 1, null);
-        assertEquals(2, tie.rungIndex() + 1, "profit tie must resolve to the weakest requirement");
+        assertEquals(0, tie.rungIndex(), "profit ties resolve by registration order");
+    }
+
+    @Test
+    void allZeroExpectationsTargetTheMostPreferredRung() {
+        // Overload despair: the causal rungs are infeasible (no server has
+        // committed the anchor) and the LIN latency window is saturated far
+        // beyond its threshold, so every rung scores exactly 0. The choice
+        // must be the first-listed rung - under the old weakest-requirement
+        // tie-break this degenerated to targeting an undeliverable CM rung.
+        PileusSelector selector = new PileusSelector(3, 2, 16, true, 0.0, new Random(7));
+        List<RungScorer.Rung> sla = List.of(
+                new RungScorer.Rung(LIN, 300, 70),
+                new RungScorer.Rung(CM, 300, 52),
+                new RungScorer.Rung(CM, 1500, 30));
+        for (int node = 0; node < 3; node++) {
+            for (int i = 0; i < 16; i++) {
+                selector.observeRead(node, true, 1e9);
+            }
+        }
+        PileusSelector.Choice choice = selector.chooseRead(sla, 1000, 0, null);
+        assertEquals(0, choice.rungIndex(), "despair must target the most preferred rung");
+        assertEquals(0.0, choice.expectedProfit(), 1e-9);
+    }
+
+    @Test
+    void infeasibleChoicesAreFlaggedForWaitSuppression() {
+        // The anchor is beyond every observed commit index: the only rung is
+        // causal-majority, so it wins by default but carries feasible=false,
+        // which the session uses to suppress the doomed server-side wait.
+        PileusSelector selector = selector();
+        List<RungScorer.Rung> sla = List.of(new RungScorer.Rung(CM, 300, 52));
+        PileusSelector.Choice choice = selector.chooseRead(sla, 1000, 0, null);
+        assertEquals(0, choice.rungIndex());
+        assertFalse(choice.feasible());
+        // A server reports the anchor committed: the flag clears there.
+        selector.observeIndices(1, 1200, 1100);
+        assertTrue(selector.chooseRead(sla, 1000, 0, null).feasible());
+    }
+
+    @Test
+    void deliveryFailuresDemoteATargetAndDecayRestoresIt() {
+        // Served-below-target feedback: reads targeted at LIN keep grading
+        // below it (wait-expiry fallbacks the latency window cannot see).
+        // Expected profit must collapse, and decay must restore optimism so
+        // the target can win its way back after the lag drains.
+        PileusSelector selector = new PileusSelector(2, 2, 16, true, 0.0, new Random(7));
+        List<RungScorer.Rung> sla = List.of(new RungScorer.Rung(LIN, 300, 70));
+        for (int i = 0; i < 50; i++) {
+            selector.observeReadDelivery(0, LIN, false);
+            selector.observeReadDelivery(1, LIN, false);
+        }
+        double depressed = selector.chooseRead(sla, -1, -1, null).expectedProfit();
+        assertTrue(depressed < 70 * 0.05, "delivery failures must collapse expected profit, got " + depressed);
+        for (int i = 0; i < 200; i++) {
+            selector.decayDeliveryRates(0.9);
+        }
+        assertEquals(70.0, selector.chooseRead(sla, -1, -1, null).expectedProfit(), 1.0);
     }
 
     @Test
