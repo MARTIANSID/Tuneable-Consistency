@@ -17,6 +17,18 @@ class PriceControllerTest {
     }
 
     @Test
+    void zeroFloorPinsThePriceAtZeroForever() {
+        // The priceless-chameleon ablation: with lambdaMin = 0, zero is an
+        // absorbing fixed point, so even sustained extreme overload never
+        // raises the price.
+        PriceController controller = new PriceController(0.85, 1.0, 0.0);
+        for (int i = 0; i < 1000; i++) {
+            controller.update(1.5);
+        }
+        assertEquals(0.0, controller.lambda(), 0.0, "zero must be absorbing when the floor is 0");
+    }
+
+    @Test
     void risesMultiplicativelyAboveTargetAndDecaysBelow() {
         PriceController controller = new PriceController(0.85, 1.0, 0.0001);
         controller.update(0.85); // bootstrap to the floor

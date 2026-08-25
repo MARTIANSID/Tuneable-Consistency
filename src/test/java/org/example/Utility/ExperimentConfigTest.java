@@ -139,6 +139,24 @@ class ExperimentConfigTest {
     }
 
     @Test
+    void lambdaMinZeroIsAcceptedButNegativeIsNot() throws IOException {
+        // lambdaMin: 0 is the priceless-chameleon ablation (the price stays
+        // pinned at zero); a negative floor stays rejected.
+        String base = Files.readString(REPO_CONFIG);
+        Path tmp = Files.createTempFile("config-test", ".yaml");
+        try {
+            Files.writeString(tmp, base.replaceFirst("lambdaMin: [0-9.]+", "lambdaMin: 0"));
+            assertEquals(0.0, ExperimentConfig.load(tmp).chameleon.lambdaMin, 0.0);
+            Files.writeString(tmp, base.replaceFirst("lambdaMin: [0-9.]+", "lambdaMin: -0.1"));
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> ExperimentConfig.load(tmp));
+            assertTrue(e.getMessage().contains("lambdaMin"), e.getMessage());
+        } finally {
+            Files.delete(tmp);
+        }
+    }
+
+    @Test
     void clientSiteBindHostsFollowTheFixedConvention() {
         assertEquals("127.0.2.1", ExperimentConfig.clientSiteBindHost(0));
         assertEquals("127.0.2.6", ExperimentConfig.clientSiteBindHost(5));

@@ -12,6 +12,11 @@ package org.example.Server;
  * zero unchanged forever) and it stops lambda decaying so far during idle
  * periods that recovery takes many intervals.
  *
+ * lambda_min = 0 is therefore a deliberate ablation switch: zero is an
+ * absorbing fixed point, so the price stays exactly 0 for the whole run -
+ * the scorer still picks levels, but nothing is ever priced out ("priceless
+ * chameleon": upgrades free, admission reduced to the hard occupancy cap).
+ *
  * Requests never read u; they read the published lambda, which is up to one
  * interval stale by design.
  */

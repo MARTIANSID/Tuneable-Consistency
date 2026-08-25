@@ -499,7 +499,16 @@ public final class ExperimentConfig {
         requirePositive(chameleon.controlIntervalMs, "chameleon.controlIntervalMs");
         requirePositive(chameleon.uTarget, "chameleon.uTarget");
         requirePositive(chameleon.eta, "chameleon.eta");
-        requirePositive(chameleon.lambdaMin, "chameleon.lambdaMin");
+        // lambdaMin = 0 is a deliberate ablation, not a degenerate config:
+        // zero is absorbing under the multiplicative price update, so the
+        // shadow price stays exactly 0 for the whole run - a "priceless"
+        // chameleon where the scorer still decides levels but admission is
+        // only the hard occupancy cap and every upgrade is free.
+        require(chameleon.lambdaMin, "chameleon.lambdaMin");
+        if (!(chameleon.lambdaMin >= 0) || !Double.isFinite(chameleon.lambdaMin)) {
+            throw new IllegalArgumentException("chameleon.lambdaMin must be a non-negative finite number"
+                    + " (0 pins the price at zero for the whole run), got " + chameleon.lambdaMin);
+        }
 
         require(client, "client");
         requirePositive(client.rttWindowSize, "client.rttWindowSize");

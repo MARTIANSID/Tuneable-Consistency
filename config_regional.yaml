@@ -87,7 +87,11 @@ chameleon:
   eta: 0.1
   # Price floor. It lets lambda start from zero and stops it decaying so far
   # during idle periods that recovery takes many intervals; only its order of
-  # magnitude matters relative to the rung profits.
+  # magnitude matters relative to the rung profits. Setting it to 0 is the
+  # "priceless chameleon" ablation: zero is absorbing under the
+  # multiplicative update, so the price stays exactly 0 all run - the scorer
+  # still decides levels, upgrades are free, and admission is only the hard
+  # occupancy cap.
   lambdaMin: 0.0001
 
 # Mode-independent client mechanics.
