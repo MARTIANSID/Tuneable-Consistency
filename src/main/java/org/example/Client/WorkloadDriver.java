@@ -627,10 +627,18 @@ public class WorkloadDriver {
         }
         long localSeq = 0;
 
+        // Ticks are anchored to an absolute schedule (nextTickMs += TICK_MS)
+        // so sleep overshoot cannot accumulate into rate loss: a wake that
+        // lands 1 ms late sleeps 1 ms less before the next tick, keeping the
+        // average period exactly TICK_MS. A genuine stall (more than one full
+        // period behind) re-anchors instead of catching up: the missed budget
+        // is dropped deliberately, because injecting it late would burst-load
+        // the system at exactly the moments it is already struggling (the
+        // offered process stays open loop, with no compensating bursts).
+        long nextTickMs = System.currentTimeMillis();
         while (!Thread.currentThread().isInterrupted() && experimentRunning) {
             try {
                 Phase phase = currentPhase;
-                long tickStart = System.currentTimeMillis();
                 int perTick = Math.max(1, phase.totalTPS * TICK_MS / 1000);
                 int share = perTick / INJECTOR_THREADS + (shard < perTick % INJECTOR_THREADS ? 1 : 0);
 
@@ -655,10 +663,13 @@ public class WorkloadDriver {
                     totalInjected.increment();
                 }
 
-                long elapsed = System.currentTimeMillis() - tickStart;
-                long sleepTime = TICK_MS - elapsed;
+                nextTickMs += TICK_MS;
+                long sleepTime = nextTickMs - System.currentTimeMillis();
                 if (sleepTime > 0) {
                     Thread.sleep(sleepTime);
+                } else if (-sleepTime >= TICK_MS) {
+                    // Stalled a full period or more: drop the missed ticks.
+                    nextTickMs = System.currentTimeMillis();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

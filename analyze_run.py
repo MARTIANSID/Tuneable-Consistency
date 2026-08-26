@@ -17,10 +17,11 @@ Data sources (per run directory):
                              response submission/transport counters
   config.yaml                the exact config of this run (mode, phases)
 
-By default the figures open in interactive windows; pass --save (or --out) to
-write them as PNGs into <run_dir>/graphs/ instead.
+By default only the text reports are printed - no figures are shown or
+written. Pass --plot to open the figures in interactive windows, or --save
+(or --out) to write them as PNGs into <run_dir>/graphs/ instead.
 
-Usage:  python3 analyze_run.py runs/<label>_<stamp> [--save] [--out DIR]
+Usage:  python3 analyze_run.py runs/<label>_<stamp> [--plot] [--save] [--out DIR]
 Needs:  pandas, matplotlib
 """
 
@@ -30,9 +31,10 @@ import json
 import os
 import sys
 
-import matplotlib
 import pandas as pd
 
+# matplotlib is imported in main() only when plotting was requested, so the
+# default text-only mode needs nothing but pandas.
 plt = None  # bound in main() once the backend is chosen (Agg only when saving)
 
 # Fixed color per entity (never cycled): the same level or node keeps the same
@@ -432,9 +434,9 @@ def plot_level_mix(run, out):
 
 
 def plot_latency(run, out):
-    # Count-weighted P50/P90 across the interval's cells (an approximation of
-    # the pooled percentile; exact pooling would need the raw buckets).
-    cols = run.percentile_cols()
+    # Count-weighted P50/P90/P99 across the interval's cells (an approximation
+    # of the pooled percentile; exact pooling would need the raw buckets).
+    cols = run.percentile_cols() + (["P99Ms"] if "P99Ms" in run.ledger.columns else [])
     lat = run.ledger.copy()
     for col in cols:
         lat[col + "_w"] = lat[col] * lat["Count"]
@@ -443,9 +445,10 @@ def plot_latency(run, out):
         by_t[col] = by_t[col + "_w"] / by_t["Count"].clip(lower=1)
     by_t.index = (by_t.index - run.t0) / 1000.0
     fig, ax = plt.subplots(figsize=(12, 4))
-    for col, color in zip(cols, [PALETTE[0], PALETTE[6]]):
+    colors = {"P50Ms": PALETTE[0], "P90Ms": PALETTE[6], "P99Ms": PALETTE[1]}
+    for col in cols:
         ax.plot(by_t.index, by_t[col],
-                label=col.replace("Ms", "").lower(), color=color, **LINE)
+                label=col.replace("Ms", "").lower(), color=colors[col], **LINE)
     run.phase_lines(ax)
     style(ax, "time [s]", "latency [ms]",
           f"Client-observed latency per interval ({run.mode})")
@@ -515,7 +518,7 @@ def print_tables(run):
     print("\n--- Latency per busy cell (whole run; P50/P90 = count-weighted "
           "interval percentiles, P95/P99 = worst 1 s interval) ---")
     busy = totals[totals["Count"] > 0.01 * totals["Count"].sum()]
-    cols = (["NodeId", "ChosenLevel", "ExecutedLevel", "Count"]
+    cols = (["NodeId", "Site", "ChosenLevel", "ExecutedLevel", "Count"]
             + run.percentile_cols() + ["P95Ms", "P99Ms"])
     print(busy.sort_values("Count", ascending=False)[cols].to_string(index=False))
 
@@ -555,7 +558,12 @@ def print_phase_tables(run):
     (ChosenLevel, e.g. R:A1S1): the outcome counts, average served/s over the
     phase, the execution rate (served / its own attempts), its share of the
     phase's served requests, upgrades and their free fraction, predicted and
-    realized profit, and its share of the phase's realized profit."""
+    realized profit, and its share of the phase's realized profit. Each
+    phase header carries the phase-aggregate client-observed latency:
+    p50/p95/p99 are count-weighted means of the per-interval percentiles (a
+    "typical interval" figure - true percentiles cannot be merged across
+    intervals without the raw buckets), plus the worst single cell-interval
+    P99 for the tail."""
     if not run.phases:
         return
     # Terminal outcomes (the ExecRate denominator); redirects/fallbacks/
@@ -619,9 +627,20 @@ def print_phase_tables(run):
         table = pd.DataFrame(columns)
         table.index.name = "SubSLA"
 
+        # Phase-aggregate latency: count-weighted means of the per-interval
+        # percentiles across every served cell (a "typical interval" figure;
+        # true percentiles cannot be merged without the raw buckets), plus
+        # the single worst cell-interval P99 so the tail is not hidden - a
+        # raw max would let one tiny slow cell dominate the whole phase.
+        weight = sub["Count"].clip(lower=0)
+        total = max(weight.sum(), 1)
+        p50, p95, p99 = ((sub[c] * weight).sum() / total for c in ("P50Ms", "P95Ms", "P99Ms"))
+
         end = "end" if bins[i + 1] == float("inf") else f"{edges[i + 1]:.0f}s"
         print(f"\n--- Phase {name} (t={edges[i]:.0f}s-{end}): "
               f"served={g['Count'].sum():,.0f} ({phase_served / duration:,.0f}/s)  "
+              f"p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms "
+              f"(worst 1s-interval p99={sub['P99Ms'].max():.0f}ms)  "
               f"profit={phase_profit:,.0f} ---")
         print(table.sort_values("Profit", ascending=False).to_string())
 
@@ -630,46 +649,52 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dir", help="run directory (contains client_metrics_global.csv)")
+    parser.add_argument("--plot", action="store_true",
+                        help="open the figures in interactive windows (default: text reports only)")
     parser.add_argument("--save", action="store_true",
                         help="save the figures as PNGs instead of showing them interactively")
     parser.add_argument("--out", help="output directory for PNGs (implies --save; default: <run_dir>/graphs)")
     args = parser.parse_args()
     save = args.save or args.out is not None
-
-    # The backend must be chosen before pyplot is imported: Agg (headless)
-    # when saving, the platform's interactive backend when showing.
-    if save:
-        matplotlib.use("Agg")
-    global plt
-    import matplotlib.pyplot as plt
+    plotting = args.plot or save
 
     ledger_path = os.path.join(args.run_dir, "client_metrics_global.csv")
     if not os.path.exists(ledger_path):
         sys.exit(f"ERROR: {ledger_path} not found - is this a run directory?")
 
     run = Run(args.run_dir)
-    if save:
-        out_dir = args.out or os.path.join(args.run_dir, "graphs")
-        os.makedirs(out_dir, exist_ok=True)
-        out = lambda name: os.path.join(out_dir, name)  # noqa: E731
-    else:
-        out = None
 
-    plot_throughput(run, out)
-    plot_profit(run, out)
-    plot_occupancy(run, out)
-    has_drain_plot = plot_server_drain(run, out)
-    plot_level_mix(run, out)
-    plot_latency(run, out)
-    plot_upgrades(run, out)
-    plot_leadership(run, out)
-    if save:
-        print(f"wrote {8 if has_drain_plot else 7} figures to {out_dir}/")
+    if plotting:
+        # The backend must be chosen before pyplot is imported: Agg (headless)
+        # when saving, the platform's interactive backend when showing.
+        import matplotlib
+        if save:
+            matplotlib.use("Agg")
+        global plt
+        import matplotlib.pyplot as plt
+
+        if save:
+            out_dir = args.out or os.path.join(args.run_dir, "graphs")
+            os.makedirs(out_dir, exist_ok=True)
+            out = lambda name: os.path.join(out_dir, name)  # noqa: E731
+        else:
+            out = None
+
+        plot_throughput(run, out)
+        plot_profit(run, out)
+        plot_occupancy(run, out)
+        has_drain_plot = plot_server_drain(run, out)
+        plot_level_mix(run, out)
+        plot_latency(run, out)
+        plot_upgrades(run, out)
+        plot_leadership(run, out)
+        if save:
+            print(f"wrote {8 if has_drain_plot else 7} figures to {out_dir}/")
 
     print_tables(run)
     print_phase_tables(run)
 
-    if not save:
+    if plotting and not save:
         plt.show()
 
 

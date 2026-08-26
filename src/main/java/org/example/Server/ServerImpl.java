@@ -111,8 +111,8 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private static final int HEARTBEAT_INTERVAL_MS = 20;
     private static volatile int MAX_ENTRIES_PER_REPLICATION_BATCH = 4000;
     private static volatile int MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER = 4;
-    private static final int ELECTION_TIMEOUT_BASE_MS = 2000;
-    private static final int ELECTION_TIMEOUT_JITTER_MS = 700;
+    private static final int ELECTION_TIMEOUT_BASE_MS = 5000;
+    private static final int ELECTION_TIMEOUT_JITTER_MS = 1000;
 
     // Cluster wiring (from config; see ExperimentConfig.cluster)
     private static volatile List<String> SERVER_HOSTS = List.of("localhost", "localhost", "localhost");
