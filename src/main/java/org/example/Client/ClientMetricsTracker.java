@@ -259,7 +259,8 @@ public final class ClientMetricsTracker {
         boolean writeHeader = !file.exists() || file.length() == 0;
         try (FileWriter fw = new FileWriter(file, true); PrintWriter out = new PrintWriter(fw)) {
             if (writeHeader) {
-                out.println("Timestamp,NodeId,Site,ChosenLevel,ExecutedLevel,Count,AvgLatencyMs,"
+                StringBuilder header = new StringBuilder(
+                        "Timestamp,NodeId,Site,ChosenLevel,ExecutedLevel,Count,AvgLatencyMs,"
                         + "P50Ms,P90Ms,P95Ms,P99Ms,PredictedProfitSum,RealizedProfitSum,"
                         + "UpgradesFree,UpgradesWaiting,"
                         + "SatisfiedRung0,SatisfiedRung1,SatisfiedRung2,SatisfiedRung3,SatisfiedNone,"
@@ -268,6 +269,16 @@ public final class ClientMetricsTracker {
                         + "P90RejectTotalMs,P99RejectTotalMs,AvgRejectFeedbackMs,P50RejectFeedbackMs,"
                         + "P90RejectFeedbackMs,P99RejectFeedbackMs,InvalidRejectFeedbackTimestamps,"
                         + "Lost,DeadlineExceeded,Violations");
+                // Raw client-latency histogram (served responses), one column
+                // per geometric bucket: bucket i's upper edge is
+                // 0.5 * 1.15^(i+1) ms, the last bucket is the overflow.
+                // Unlike the percentile columns these are additive, so any
+                // later aggregation (per phase, site, arm, or whole run) can
+                // sum the vectors and read exact pooled percentiles.
+                for (int i = 0; i <= LATENCY_BUCKETS; i++) {
+                    header.append(",LatBucket").append(i);
+                }
+                out.println(header);
             }
             for (Map.Entry<Key, Cell> e : cells.entrySet()) {
                 Key k = e.getKey();
@@ -319,9 +330,13 @@ public final class ClientMetricsTracker {
                     continue; // no activity this interval
                 }
                 double avg = count == 0 ? 0.0 : latencySum / count;
+                StringBuilder bucketCols = new StringBuilder();
+                for (int i = 0; i <= LATENCY_BUCKETS; i++) {
+                    bucketCols.append(',').append(buckets[i]);
+                }
                 out.printf("%d,%d,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                                 + "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%d,"
-                                + "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%n",
+                                + "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d%s%n",
                         now, k.nodeId(), k.site(), k.chosen(), k.executed(), count, avg,
                         quantileMs(buckets, bucketTotal, 0.50), quantileMs(buckets, bucketTotal, 0.90),
                         quantileMs(buckets, bucketTotal, 0.95),
@@ -342,7 +357,8 @@ public final class ClientMetricsTracker {
                         quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.50),
                         quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.90),
                         quantileMs(rejectionFeedbackBuckets, rejectionFeedbackBucketCount, 0.99),
-                        invalidRejectionFeedbackTimestamps, lost, deadlineExceeded, violations);
+                        invalidRejectionFeedbackTimestamps, lost, deadlineExceeded, violations,
+                        bucketCols);
             }
         } catch (IOException e) {
             System.err.println("Failed to write " + CSV_PATH + ": " + e.getMessage());

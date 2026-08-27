@@ -15,7 +15,7 @@
 #
 # Usage:
 #   ./run_all_cloudlab_sweep.sh <user@host> <ssh-key-path> [label] \
-#       --modes "chameleon;chameleonPileus;pileus;highestProfit;lowestProfit" \
+#       --modes "chameleon;chameleonPileus;pileus;strongest;weakest" \
 #       <config.yaml>
 #
 # --modes takes a ';'-separated list and may appear anywhere among the

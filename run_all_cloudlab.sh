@@ -200,12 +200,17 @@ fi
 # --- Fetch results ---
 ssh_run "test -f $REMOTE_RUN/run_info.txt" \
     || die "remote run ended without run_info.txt (session died?); inspect $HOST:$REMOTE_RUN"
+# The ledgers carry dense latency-histogram columns and compress ~10:1;
+# gzip on the node before the transfer (analyze_run.py reads .csv.gz
+# directly, so the files stay compressed locally too).
+echo "Compressing CSVs on $HOST..."
+ssh_run "gzip -f $REMOTE_RUN/*.csv"
 echo "Fetching results into runs/$RUN_NAME/..."
 mkdir -p "$REPO_DIR/runs"
 scp -q -r "${SSH_OPTS[@]}" "$HOST:$REMOTE_RUN" "$REPO_DIR/runs/"
 
 RUN_EXIT="$(sed -nE 's/^exit_code: *//p' "$REPO_DIR/runs/$RUN_NAME/run_info.txt")"
-CSV_COUNT="$(find "$REPO_DIR/runs/$RUN_NAME" -maxdepth 1 -name "*.csv" | wc -l | tr -d ' ')"
+CSV_COUNT="$(find "$REPO_DIR/runs/$RUN_NAME" -maxdepth 1 \( -name "*.csv" -o -name "*.csv.gz" \) | wc -l | tr -d ' ')"
 echo
 if [[ "$RUN_EXIT" == "0" ]]; then
     echo "Run complete: $CSV_COUNT CSV files in runs/$RUN_NAME"

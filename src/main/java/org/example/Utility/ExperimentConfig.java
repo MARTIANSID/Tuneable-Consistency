@@ -407,11 +407,11 @@ public final class ExperimentConfig {
      * chameleon        - server scorer decides, lowest-RTT routing
      * chameleonPileus  - server scorer decides, Pileus routing
      * pileus           - client picks (server, rung) by expected profit
-     * highestProfit    - client targets the max-profit rung, lowest-RTT routing
-     * lowestProfit     - client targets the floor rung, lowest-RTT routing
+     * strongest        - client targets the strongest consistency rung, lowest-RTT routing
+     * weakest          - client targets the weakest consistency rung, lowest-RTT routing
      */
     private static final Set<String> MODES = Set.of(
-            "chameleon", "chameleonPileus", "pileus", "highestProfit", "lowestProfit");
+            "chameleon", "chameleonPileus", "pileus", "strongest", "weakest");
 
     /** Keep in sync with ClientMetricsTracker.MAX_RUNGS (fixed CSV columns). */
     private static final int MAX_RUNGS_PER_SLA = 4;

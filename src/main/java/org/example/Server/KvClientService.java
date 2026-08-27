@@ -159,7 +159,7 @@ public final class KvClientService implements KvRequestHandler, AutoCloseable {
         }
     }
 
-    // ===== Dumb path (pileus / highestProfit / lowestProfit modes) =====
+    // ===== Dumb path (pileus / strongest / weakest modes) =====
     //
     // The client resolved the subSLA target; the server serves what it has.
     // Reads return both views immediately; the only read wait is the

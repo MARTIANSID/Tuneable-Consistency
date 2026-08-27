@@ -11,18 +11,25 @@ public enum ClientMode {
     CHAMELEON_PILEUS,
     /** Client picks (server, rung) jointly by expected profit. */
     PILEUS,
-    /** Client statically targets the max-profit rung; lowest-RTT routing. */
-    HIGHEST_PROFIT,
-    /** Client statically targets the floor rung; lowest-RTT routing. */
-    LOWEST_PROFIT;
+    /**
+     * Client statically targets each SLA's strongest consistency rung
+     * (reads by level, writes by concern; profit breaks ties within a
+     * level); lowest-RTT routing.
+     */
+    STRONGEST,
+    /**
+     * Client statically targets each SLA's weakest consistency rung (the
+     * floor; upgrades happen only by luck); lowest-RTT routing.
+     */
+    WEAKEST;
 
     public static ClientMode fromConfig(String mode) {
         return switch (mode) {
             case "chameleon" -> CHAMELEON;
             case "chameleonPileus" -> CHAMELEON_PILEUS;
             case "pileus" -> PILEUS;
-            case "highestProfit" -> HIGHEST_PROFIT;
-            case "lowestProfit" -> LOWEST_PROFIT;
+            case "strongest" -> STRONGEST;
+            case "weakest" -> WEAKEST;
             default -> throw new IllegalArgumentException("Unknown mode '" + mode + "'");
         };
     }

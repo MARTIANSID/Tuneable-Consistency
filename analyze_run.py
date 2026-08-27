@@ -57,6 +57,61 @@ NODE_COLORS = {n: PALETTE[n % len(PALETTE)] for n in range(8)}
 CELL_KEY = ["NodeId", "Site", "ChosenLevel", "ExecutedLevel"]
 LINE = dict(linewidth=1.8)
 
+# The tracker's geometric latency histogram: bucket i's upper edge is
+# BASE * RATIO^(i+1) ms; the last bucket is the overflow. Ledgers written
+# since the dense-bucket export carry one LatBucket<i> column per bucket.
+LAT_BUCKET_BASE_MS = 0.5
+LAT_BUCKET_RATIO = 1.15
+
+
+def read_csv_maybe_gz(path):
+    """Read path or path.gz, whichever exists (runs are fetched gzipped)."""
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    if os.path.exists(path + ".gz"):
+        return pd.read_csv(path + ".gz")
+    raise FileNotFoundError(path)
+
+
+def lat_bucket_cols(df):
+    return [c for c in df.columns if c.startswith("LatBucket")]
+
+
+def pooled_quantiles(df, qs):
+    """Pooled client-latency quantiles over the rows of df.
+
+    Exact (to histogram-bucket resolution) when the ledger carries the raw
+    LatBucket columns: the vectors are additive, so summing them over any
+    slice and reading off the cumulative distribution is the true pooled
+    percentile. For older ledgers, falls back to a merged-sketch estimate
+    that treats each row's percentile columns as a 4-point CDF - unlike a
+    count-weighted mean of per-cell percentiles, the sketch still lands
+    inside a concentrated tail (a small slow class larger than 1% of
+    traffic dominates a pooled p99 but barely moves a weighted mean).
+
+    Returns (values, exact) where exact says which path was taken.
+    """
+    cols = lat_bucket_cols(df)
+    if cols:
+        vec = df[cols].to_numpy(dtype=float).sum(axis=0)
+        total = vec.sum()
+        if total <= 0:
+            return [0.0] * len(qs), True
+        cum = vec.cumsum() / total
+        edges = [LAT_BUCKET_BASE_MS * LAT_BUCKET_RATIO ** (i + 1) for i in range(len(cols))]
+        return [edges[int((cum >= q).argmax())] for q in qs], True
+    served = df[df["Count"] > 0]
+    if served.empty:
+        return [0.0] * len(qs), False
+    has_p90 = "P90Ms" in served.columns
+    spans = ([(0.50, "P50Ms"), (0.40, "P90Ms"), (0.05, "P95Ms"), (0.04, "P99Ms")]
+             if has_p90 else [(0.50, "P50Ms"), (0.45, "P95Ms"), (0.04, "P99Ms")])
+    lat = pd.concat([pd.DataFrame({"lat": served[c], "n": served["Count"] * f})
+                     for f, c in spans]).sort_values("lat")
+    cum = lat["n"].cumsum() / lat["n"].sum()
+    return [lat["lat"][(cum >= q)].iloc[0] if (cum >= q).any() else lat["lat"].iloc[-1]
+            for q in qs], False
+
 
 class Run:
     def __init__(self, run_dir):
@@ -66,7 +121,7 @@ class Run:
         # phases moved under workload; fall back to top-level for old runs.
         self.phases = self.config.get("workload", {}).get("phases", self.config.get("phases", []))
 
-        self.ledger = pd.read_csv(os.path.join(run_dir, "client_metrics_global.csv"))
+        self.ledger = read_csv_maybe_gz(os.path.join(run_dir, "client_metrics_global.csv"))
         if "CountTotal" in self.ledger.columns:
             sys.exit("ERROR: this run's ledger uses the old cumulative schema "
                      "(CountTotal columns); analyze it with analyze_run.py from "
@@ -79,14 +134,14 @@ class Run:
         self.ledger["Time_s"] = (self.ledger["Timestamp"] - self.t0) / 1000.0
 
         self.occupancy = {}
-        for path in sorted(glob.glob(os.path.join(run_dir, "occupancy_*.csv"))):
+        for path in sorted(glob.glob(os.path.join(run_dir, "occupancy_*.csv*"))):
             node = int(path.split("_")[-1].split(".")[0])
             df = pd.read_csv(path)
             df["Time_s"] = (df["Timestamp"] - self.t0) / 1000.0
             self.occupancy[node] = df
 
         self.drain = {}
-        for path in sorted(glob.glob(os.path.join(run_dir, "server_drain_*.csv"))):
+        for path in sorted(glob.glob(os.path.join(run_dir, "server_drain_*.csv*"))):
             node = int(path.split("_")[-1].split(".")[0])
             df = pd.read_csv(path)
             df["Time_s"] = (df["Timestamp"] - self.t0) / 1000.0
@@ -434,24 +489,41 @@ def plot_level_mix(run, out):
 
 
 def plot_latency(run, out):
-    # Count-weighted P50/P90/P99 across the interval's cells (an approximation
-    # of the pooled percentile; exact pooling would need the raw buckets).
-    cols = run.percentile_cols() + (["P99Ms"] if "P99Ms" in run.ledger.columns else [])
-    lat = run.ledger.copy()
-    for col in cols:
-        lat[col + "_w"] = lat[col] * lat["Count"]
-    by_t = lat.groupby("Timestamp")[[c + "_w" for c in cols] + ["Count"]].sum()
-    for col in cols:
-        by_t[col] = by_t[col + "_w"] / by_t["Count"].clip(lower=1)
-    by_t.index = (by_t.index - run.t0) / 1000.0
+    # Pooled per-interval P50/P90/P99: exact from the raw histogram buckets
+    # when the ledger has them; otherwise a count-weighted mean of the
+    # cells' percentiles (an approximation that undershoots when the tail
+    # is concentrated in a small class).
+    bcols = lat_bucket_cols(run.ledger)
+    qs = [(0.50, "p50", PALETTE[0]), (0.90, "p90", PALETTE[6]), (0.99, "p99", PALETTE[1])]
+    if bcols:
+        import numpy as np
+        mat = run.ledger.groupby("Timestamp")[bcols].sum()
+        times = (mat.index - run.t0) / 1000.0
+        vecs = mat.to_numpy(dtype=float)
+        totals = vecs.sum(axis=1).clip(min=1)
+        cum = vecs.cumsum(axis=1) / totals[:, None]
+        edges = np.array([LAT_BUCKET_BASE_MS * LAT_BUCKET_RATIO ** (i + 1)
+                          for i in range(len(bcols))])
+        series = {label: edges[(cum >= q).argmax(axis=1)] for q, label, _ in qs}
+        exact = True
+    else:
+        cols = run.percentile_cols() + (["P99Ms"] if "P99Ms" in run.ledger.columns else [])
+        lat = run.ledger.copy()
+        for col in cols:
+            lat[col + "_w"] = lat[col] * lat["Count"]
+        by_t = lat.groupby("Timestamp")[[c + "_w" for c in cols] + ["Count"]].sum()
+        times = (by_t.index - run.t0) / 1000.0
+        series = {col.replace("Ms", "").lower(): by_t[col + "_w"] / by_t["Count"].clip(lower=1)
+                  for col in cols}
+        exact = False
     fig, ax = plt.subplots(figsize=(12, 4))
-    colors = {"P50Ms": PALETTE[0], "P90Ms": PALETTE[6], "P99Ms": PALETTE[1]}
-    for col in cols:
-        ax.plot(by_t.index, by_t[col],
-                label=col.replace("Ms", "").lower(), color=colors[col], **LINE)
+    for q, label, color in qs:
+        if label in series:
+            ax.plot(times, series[label], label=label, color=color, **LINE)
     run.phase_lines(ax)
     style(ax, "time [s]", "latency [ms]",
-          f"Client-observed latency per interval ({run.mode})")
+          f"Client-observed latency per interval ({run.mode})"
+          + ("" if exact else " - weighted-mean approximation"))
     ax.legend()
     fig.tight_layout()
     if out:
@@ -559,11 +631,11 @@ def print_phase_tables(run):
     phase, the execution rate (served / its own attempts), its share of the
     phase's served requests, upgrades and their free fraction, predicted and
     realized profit, and its share of the phase's realized profit. Each
-    phase header carries the phase-aggregate client-observed latency:
-    p50/p95/p99 are count-weighted means of the per-interval percentiles (a
-    "typical interval" figure - true percentiles cannot be merged across
-    intervals without the raw buckets), plus the worst single cell-interval
-    P99 for the tail."""
+    phase header carries the phase-aggregate client-observed latency as
+    pooled p50/p95/p99: exact (to histogram-bucket resolution) when the
+    ledger carries the raw LatBucket columns, otherwise a merged-sketch
+    estimate marked with "~". The worst single cell-interval P99 is kept
+    alongside for the tail."""
     if not run.phases:
         return
     # Terminal outcomes (the ExecRate denominator); redirects/fallbacks/
@@ -627,19 +699,17 @@ def print_phase_tables(run):
         table = pd.DataFrame(columns)
         table.index.name = "SubSLA"
 
-        # Phase-aggregate latency: count-weighted means of the per-interval
-        # percentiles across every served cell (a "typical interval" figure;
-        # true percentiles cannot be merged without the raw buckets), plus
-        # the single worst cell-interval P99 so the tail is not hidden - a
-        # raw max would let one tiny slow cell dominate the whole phase.
-        weight = sub["Count"].clip(lower=0)
-        total = max(weight.sum(), 1)
-        p50, p95, p99 = ((sub[c] * weight).sum() / total for c in ("P50Ms", "P95Ms", "P99Ms"))
+        # Phase-aggregate latency: pooled quantiles (exact from the raw
+        # histogram buckets when the ledger has them, a merged-sketch
+        # estimate otherwise), plus the worst cell-interval P99 so a
+        # single slow interval stays visible.
+        (p50, p95, p99), exact = pooled_quantiles(sub, (0.50, 0.95, 0.99))
+        tag = "" if exact else "~"
 
         end = "end" if bins[i + 1] == float("inf") else f"{edges[i + 1]:.0f}s"
         print(f"\n--- Phase {name} (t={edges[i]:.0f}s-{end}): "
               f"served={g['Count'].sum():,.0f} ({phase_served / duration:,.0f}/s)  "
-              f"p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms "
+              f"pooled p50={tag}{p50:.1f}ms p95={tag}{p95:.1f}ms p99={tag}{p99:.1f}ms "
               f"(worst 1s-interval p99={sub['P99Ms'].max():.0f}ms)  "
               f"profit={phase_profit:,.0f} ---")
         print(table.sort_values("Profit", ascending=False).to_string())
@@ -659,8 +729,8 @@ def main():
     plotting = args.plot or save
 
     ledger_path = os.path.join(args.run_dir, "client_metrics_global.csv")
-    if not os.path.exists(ledger_path):
-        sys.exit(f"ERROR: {ledger_path} not found - is this a run directory?")
+    if not os.path.exists(ledger_path) and not os.path.exists(ledger_path + ".gz"):
+        sys.exit(f"ERROR: {ledger_path}[.gz] not found - is this a run directory?")
 
     run = Run(args.run_dir)
 

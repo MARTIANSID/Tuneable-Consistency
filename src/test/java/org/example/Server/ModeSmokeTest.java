@@ -81,12 +81,12 @@ class ModeSmokeTest {
     }
 
     @Test
-    void highestProfit() throws Exception {
-        smoke(ClientMode.HIGHEST_PROFIT, 20300);
+    void strongest() throws Exception {
+        smoke(ClientMode.STRONGEST, 20300);
     }
 
     @Test
-    void lowestProfit() throws Exception {
-        smoke(ClientMode.LOWEST_PROFIT, 20400);
+    void weakest() throws Exception {
+        smoke(ClientMode.WEAKEST, 20400);
     }
 }

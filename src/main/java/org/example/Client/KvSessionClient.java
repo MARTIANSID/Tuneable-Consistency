@@ -34,7 +34,7 @@ import io.grpc.Status;
  * - pileus: the selector picks (server, rung); the request carries the
  *   target (wantLinearizable / requestedWriteConcern) plus a wait bound of
  *   threshold minus RTT, the client's d_max analog.
- * - highestProfit / lowestProfit: static rung target, lowest-RTT routing.
+ * - strongest / weakest: static consistency-strength target, lowest-RTT routing.
  *
  * Every served response is graded client-side ({@link ClientGrader}) against
  * both returned views with client-observed latency; the verdict feeds the
@@ -262,8 +262,8 @@ public final class KvSessionClient implements AutoCloseable {
                     targetFeasible = choice.feasible();
                 }
             }
-            default -> { // HIGHEST_PROFIT / LOWEST_PROFIT
-                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.HIGHEST_PROFIT));
+            default -> { // STRONGEST / WEAKEST
+                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.STRONGEST));
                 predicted = targetRung.profit();
                 boolean linOnLeaderOnly = targetRung.strength() == ReadLevel.LINEARIZABLE.getNumber()
                         && !followerLinReads;
@@ -302,8 +302,8 @@ public final class KvSessionClient implements AutoCloseable {
                 targetRung = sla.get(choice.rungIndex());
                 predicted = choice.expectedProfit();
             }
-            default -> {
-                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.HIGHEST_PROFIT));
+            default -> { // STRONGEST / WEAKEST
+                targetRung = sla.get(staticTargetIndex(sla, mode == ClientMode.STRONGEST));
                 predicted = targetRung.profit();
             }
         }
@@ -325,14 +325,24 @@ public final class KvSessionClient implements AutoCloseable {
                 targetRung == null ? 0 : targetRung.thresholdMs(), -1, false);
     }
 
-    /** The max-profit or floor rung; profit ties go to the weakest requirement. */
-    private static int staticTargetIndex(List<RungScorer.Rung> sla, boolean highest) {
+    /**
+     * The strongest or weakest consistency rung: reads compare ladder levels
+     * (EVENTUAL_LOCAL < EVENTUAL_MAJORITY < CAUSAL_LOCAL < CAUSAL_MAJORITY
+     * < LINEARIZABLE), writes compare concerns (more acks = stronger).
+     * Profit breaks ties within a level: strongest keeps the best-paying
+     * rung of the top level, weakest the floor's cheapest.
+     */
+    private static int staticTargetIndex(List<RungScorer.Rung> sla, boolean strongest) {
         int best = 0;
         for (int i = 1; i < sla.size(); i++) {
             RungScorer.Rung rung = sla.get(i);
             RungScorer.Rung current = sla.get(best);
-            boolean betterProfit = highest ? rung.profit() > current.profit() : rung.profit() < current.profit();
-            if (betterProfit || (rung.profit() == current.profit() && rung.strength() < current.strength())) {
+            boolean betterStrength = strongest
+                    ? rung.strength() > current.strength()
+                    : rung.strength() < current.strength();
+            boolean tieBetterProfit = rung.strength() == current.strength()
+                    && (strongest ? rung.profit() > current.profit() : rung.profit() < current.profit());
+            if (betterStrength || tieBetterProfit) {
                 best = i;
             }
         }
