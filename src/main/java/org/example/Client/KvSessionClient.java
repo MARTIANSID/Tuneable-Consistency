@@ -7,7 +7,6 @@ import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -80,6 +79,10 @@ public final class KvSessionClient implements AutoCloseable {
     private final boolean ownsTransport;
     private final RttEstimator rttEstimator;
     private final PileusSelector selector; // null unless the mode routes with Pileus
+    // Seeded per session; used for routing exploration and tie-breaks.
+    // java.util.Random is thread-safe, so retries dispatched from response
+    // threads share it with the injector thread without corruption.
+    private final Random random;
 
     private final AtomicLong requestIdGen = new AtomicLong();
     private final AtomicInteger roundRobin = new AtomicInteger();
@@ -143,7 +146,7 @@ public final class KvSessionClient implements AutoCloseable {
             boolean admissionAwareRouting, double admitRateGamma) {
         this(applicationId, 0, "-", new KvFramedTransport(hosts, basePort, 1), true, mode,
                 rttWindowSize, retryLimit, lostTimeoutMs, readSlas, writeSlas,
-                explorationFraction, followerLinReads, admissionAwareRouting, admitRateGamma);
+                explorationFraction, followerLinReads, admissionAwareRouting, admitRateGamma, 42L);
     }
 
     public KvSessionClient(int applicationId, int siteId, String siteName, KvFramedTransport transport,
@@ -151,10 +154,10 @@ public final class KvSessionClient implements AutoCloseable {
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
-            boolean admissionAwareRouting, double admitRateGamma) {
+            boolean admissionAwareRouting, double admitRateGamma, long seed) {
         this(applicationId, siteId, siteName, transport, false, mode, rttWindowSize, retryLimit, lostTimeoutMs,
                 readSlas, writeSlas, explorationFraction, followerLinReads,
-                admissionAwareRouting, admitRateGamma);
+                admissionAwareRouting, admitRateGamma, seed);
     }
 
     private KvSessionClient(int applicationId, int siteId, String siteName, KvFramedTransport transport,
@@ -162,7 +165,7 @@ public final class KvSessionClient implements AutoCloseable {
             int rttWindowSize, int retryLimit, long lostTimeoutMs,
             Map<Integer, List<RungScorer.Rung>> readSlas, Map<Integer, List<RungScorer.Rung>> writeSlas,
             double explorationFraction, boolean followerLinReads,
-            boolean admissionAwareRouting, double admitRateGamma) {
+            boolean admissionAwareRouting, double admitRateGamma, long seed) {
         this.applicationId = applicationId;
         if (siteId < 0 || siteId >= transport.numSites()) {
             throw new IllegalArgumentException("siteId " + siteId + " is out of range for a transport with "
@@ -187,9 +190,12 @@ public final class KvSessionClient implements AutoCloseable {
         this.writeAdmitRates = admissionAwareRouting ? admitRatesPerSla(this.writeSlas, admitRateGamma) : null;
         this.admitRateGamma = admitRateGamma;
         this.rttEstimator = new RttEstimator(numServers, rttWindowSize);
+        // Routing and selector draw from independent deterministic streams
+        // (~seed differs from seed under Random's internal scrambling).
+        this.random = new Random(seed);
         this.selector = mode.pileusRouting()
                 ? new PileusSelector(numServers, majority, rttWindowSize, followerLinReads,
-                        explorationFraction, new Random())
+                        explorationFraction, new Random(~seed))
                 : null;
 
         this.lostSweeper = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -364,8 +370,8 @@ public final class KvSessionClient implements AutoCloseable {
      * 0 and win their first probes through the random tie-break.
      */
     private int lowestRttNode(AdmitRates admitRates) {
-        if (explorationFraction > 0 && ThreadLocalRandom.current().nextDouble() < explorationFraction) {
-            return ThreadLocalRandom.current().nextInt(numServers);
+        if (explorationFraction > 0 && random.nextDouble() < explorationFraction) {
+            return random.nextInt(numServers);
         }
         double best = Double.MAX_VALUE;
         int count = 0;
@@ -379,7 +385,7 @@ public final class KvSessionClient implements AutoCloseable {
                 best = score;
                 count = 1;
                 pick = i;
-            } else if (score == best && ThreadLocalRandom.current().nextInt(++count) == 0) {
+            } else if (score == best && random.nextInt(++count) == 0) {
                 pick = i;
             }
         }

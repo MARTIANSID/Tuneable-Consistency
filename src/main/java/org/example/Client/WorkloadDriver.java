@@ -165,6 +165,9 @@ public class WorkloadDriver {
     private static int INJECTOR_THREADS;
     private static ClientMode CLIENT_MODE;
     private static double EXPLORATION_FRACTION;
+    // Base PRNG seed (config `seed`); every Random here derives from it so
+    // two runs of the same config face the same request stream.
+    private static long SEED = 42;
     private static boolean ADMISSION_AWARE_ROUTING;
     private static double ADMIT_RATE_GAMMA;
     private static boolean FOLLOWER_LIN_READS;
@@ -192,6 +195,7 @@ public class WorkloadDriver {
                 .map(site -> site.name).toList();
         GEO_ENABLED = config.geo.enabled;
         CLIENT_MODE = ClientMode.fromConfig(config.mode);
+        SEED = config.seed;
         EXPLORATION_FRACTION = config.client.explorationFraction;
         ADMISSION_AWARE_ROUTING = config.client.admissionAwareRouting;
         ADMIT_RATE_GAMMA = config.client.admitRateGamma;
@@ -275,7 +279,9 @@ public class WorkloadDriver {
                         RTT_WINDOW_SIZE, CLIENT_RETRY_LIMIT, CLIENT_LOST_TIMEOUT_MS,
                         readSlasByApp.get(app + 1), writeSlasByApp.get(app + 1),
                         EXPLORATION_FRACTION, FOLLOWER_LIN_READS,
-                        ADMISSION_AWARE_ROUTING, ADMIT_RATE_GAMMA);
+                        ADMISSION_AWARE_ROUTING, ADMIT_RATE_GAMMA,
+                        // Distinct deterministic seed per (application, session).
+                        SEED + ((long) (app + 1) << 32) + session);
             }
         }
         System.out.println("Started " + NUM_APPLICATIONS + " applications x " + SESSIONS_PER_APPLICATION
@@ -615,7 +621,9 @@ public class WorkloadDriver {
      * lowest shards so the per-tick total stays exact.
      */
     private static void injectShard(int shard, LongAdder totalInjected) {
-        Random random = new Random();
+        // Distinct deterministic stream per shard; Random scrambles the seed
+        // internally, so sequential seeds do not correlate the streams.
+        Random random = new Random(SEED * 1_000_003L + shard);
         KvSessionClient[][] ownSessions = new KvSessionClient[NUM_APPLICATIONS][];
         for (int app = 0; app < NUM_APPLICATIONS; app++) {
             int count = (SESSIONS_PER_APPLICATION - shard + INJECTOR_THREADS - 1) / INJECTOR_THREADS;

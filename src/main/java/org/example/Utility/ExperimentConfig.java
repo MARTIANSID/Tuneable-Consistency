@@ -29,6 +29,7 @@ public final class ExperimentConfig {
     // --- Schema (wrapper types so that missing keys are detectable as null) ---
 
     public String mode;
+    public Long seed; // base seed for every PRNG (workload mix/keys, routing exploration, election jitter)
     public Cluster cluster;
     public ServerConfig server;
     public Chameleon chameleon;
@@ -54,6 +55,7 @@ public final class ExperimentConfig {
         public Double replicationBudgetPerSecond; // leader replication rate budget in entries/s (universal admission)
         public Integer maxEntriesPerReplicationBatch; // entries in one ordered replication-stream message
         public Integer maxInflightReplicationBatchesPerFollower; // bounded speculative pipeline window
+        public Integer replicationFlowControlWindowBytes; // HTTP/2 flow-control window on the server-server path (both directions); must hold the inflight batch window in bytes
         public Boolean followerLinearizableReads; // followers serve LIN via a leader read-index round (all modes)
         public Double histogramDecay;      // service-time histogram decay per 100 ms refresh tick, in (0, 1)
     }
@@ -477,6 +479,7 @@ public final class ExperimentConfig {
         }
 
         require(mode, "mode");
+        require(seed, "seed");
         if (!MODES.contains(mode)) {
             throw new IllegalArgumentException("mode must be one of " + MODES + ", got '" + mode + "'");
         }
@@ -488,6 +491,13 @@ public final class ExperimentConfig {
         requirePositive(server.maxEntriesPerReplicationBatch, "server.maxEntriesPerReplicationBatch");
         requirePositive(server.maxInflightReplicationBatchesPerFollower,
                 "server.maxInflightReplicationBatchesPerFollower");
+        requirePositive(server.replicationFlowControlWindowBytes,
+                "server.replicationFlowControlWindowBytes");
+        if (server.replicationFlowControlWindowBytes < 65536) {
+            throw new IllegalArgumentException(
+                    "server.replicationFlowControlWindowBytes must be at least 65536 (the HTTP/2 default); got "
+                            + server.replicationFlowControlWindowBytes);
+        }
         require(server.followerLinearizableReads, "server.followerLinearizableReads");
         require(server.histogramDecay, "server.histogramDecay");
         if (!(server.histogramDecay > 0) || !(server.histogramDecay < 1)) {

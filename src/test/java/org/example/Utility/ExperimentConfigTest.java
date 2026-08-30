@@ -29,6 +29,7 @@ class ExperimentConfigTest {
         assertTrue(config.slas.size() >= 1);
         assertTrue(config.server.maxEntriesPerReplicationBatch > 0);
         assertTrue(config.server.maxInflightReplicationBatchesPerFollower > 0);
+        assertTrue(config.server.replicationFlowControlWindowBytes >= 65536);
         // The mode helpers agree with the mode string.
         assertEquals(config.mode.startsWith("chameleon"), config.chameleonDecision());
     }
@@ -151,6 +152,23 @@ class ExperimentConfigTest {
             IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                     () -> ExperimentConfig.load(tmp));
             assertTrue(e.getMessage().contains("lambdaMin"), e.getMessage());
+        } finally {
+            Files.delete(tmp);
+        }
+    }
+
+    @Test
+    void replicationFlowControlWindowBelowHttp2DefaultIsRejected() throws IOException {
+        // A window below the HTTP/2 default 64 KiB could not even hold one
+        // replication batch and must fail fast rather than throttle silently.
+        String yaml = Files.readString(REPO_CONFIG).replaceFirst(
+                "replicationFlowControlWindowBytes: \\d+", "replicationFlowControlWindowBytes: 1024");
+        Path tmp = Files.createTempFile("config-test", ".yaml");
+        try {
+            Files.writeString(tmp, yaml);
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> ExperimentConfig.load(tmp));
+            assertTrue(e.getMessage().contains("replicationFlowControlWindowBytes"), e.getMessage());
         } finally {
             Files.delete(tmp);
         }

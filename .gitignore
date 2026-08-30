@@ -6,4 +6,6 @@ pom.xml
 .idea/
 runs/
 target-script/
+target-sweep-*/
+target-agent/
 __pycache__/

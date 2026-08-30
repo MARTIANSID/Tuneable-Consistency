@@ -635,7 +635,8 @@ def print_phase_tables(run):
     pooled p50/p95/p99: exact (to histogram-bucket resolution) when the
     ledger carries the raw LatBucket columns, otherwise a merged-sketch
     estimate marked with "~". The worst single cell-interval P99 is kept
-    alongside for the tail."""
+    alongside for the tail, and each phase lists every node's mean
+    utilization U over the phase window."""
     if not run.phases:
         return
     # Terminal outcomes (the ExecRate denominator); redirects/fallbacks/
@@ -712,6 +713,15 @@ def print_phase_tables(run):
               f"pooled p50={tag}{p50:.1f}ms p95={tag}{p95:.1f}ms p99={tag}{p99:.1f}ms "
               f"(worst 1s-interval p99={sub['P99Ms'].max():.0f}ms)  "
               f"profit={phase_profit:,.0f} ---")
+        # Per-node mean utilization over the phase window (occupancy rows are
+        # uniform 100 ms control intervals, so a plain mean is time-weighted).
+        u_parts = []
+        for node, odf in sorted(run.occupancy.items()):
+            window = odf[(odf["Time_s"] >= edges[i]) & (odf["Time_s"] < bins[i + 1])]
+            if not window.empty:
+                u_parts.append(f"{node}={window['U'].mean():.2f}")
+        if u_parts:
+            print(f"    avg U per node: {'  '.join(u_parts)}")
         print(table.sort_values("Profit", ascending=False).to_string())
 
 

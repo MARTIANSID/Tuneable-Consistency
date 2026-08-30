@@ -10,7 +10,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.example.Utility.ExperimentConfig;
 
 import io.grpc.Server;
-import io.grpc.ServerBuilder;
 
 /**
  * Entry point for a single Raft node running in its own OS process. Raft and
@@ -82,7 +81,11 @@ public final class ServerNode {
         Server server;
         try {
             ingressServer.start();
-            server = ServerBuilder.forPort(port)
+            // The receiver grants the HTTP/2 flow-control window, so the Raft
+            // server side is what actually sizes the leader-to-follower
+            // replication pipeline in bytes; it must match the channel side.
+            server = io.grpc.netty.NettyServerBuilder.forPort(port)
+                    .flowControlWindow(ServerImpl.replicationFlowControlWindowBytes())
                     .addService(serverImpl)
                     .addService(new AdminService(serverImpl, shutdownAction))
                     .build()

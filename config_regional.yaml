@@ -13,11 +13,19 @@
 #   pileus          - client picks (server, rung) jointly by expected profit;
 #                     requests carry the target (wantLinearizable / write
 #                     concern) and the server serves without deciding anything
-#   highestProfit   - client statically targets the max-profit rung of each
-#                     SLA; lowest-RTT routing (greedy baseline)
-#   lowestProfit    - client statically targets the floor rung; lowest-RTT
-#                     routing (dumb baseline; upgrades happen only by luck)
-mode: chameleonPileus
+#   strongest       - client statically targets each SLA's strongest
+#                     consistency rung (reads by level, writes by concern;
+#                     profit breaks ties within a level); lowest-RTT routing
+#   weakest         - client statically targets each SLA's weakest rung (the
+#                     floor; upgrades happen only by luck); lowest-RTT routing
+mode: weakest
+
+# Base PRNG seed. Seeds the workload generators (mix sampling, key draws,
+# session picks), client routing exploration and tie-breaks, the Pileus
+# selector, and the election-timeout jitter, so two runs of the same config
+# face the same request stream. Timing nondeterminism still varies between
+# runs; the seed removes only the RNG component.
+seed: 42
 
 cluster:
   # Number of Raft nodes. Majority = numServers/2 + 1 (write concerns and the
@@ -46,13 +54,13 @@ server:
   # acks). A request whose wait expires falls back to the strongest no-wait
   # level of the same view (reads) or acks with the replication reached so
   # far (writes). Client-sent wait bounds are clamped to this too.
-  maxWaitMs: 400
+  maxWaitMs: 500
   # Occupancy slot budget: the time-weighted average number of requests in
   # flight the node is calibrated for (sweep_smax.sh measures it at the
   # latency knee). Utilization u = framed-admission-to-terminal slot-time /
   # (sMax * interval). The ingress event loop accepts at most 1.5x sMax
   # requests from fixed frame headers before protobuf parsing - in every mode.
-  sMax: 13500
+  sMax: 4500
   # Leader-side write admission: entries per second charged one per admitted
   # write, refilled continuously, never returned. Calibrated from the
   # measured max commit rate (sweep_smax.sh, ~80% of it). Universal.
@@ -60,9 +68,15 @@ server:
   # Maximum entries carried by one ordered message on a leader-to-follower
   # replication stream.
   maxEntriesPerReplicationBatch: 4000
-  # Maximum unacknowledged replication messages per follower. Four batches
-  # cover the configured WAN bandwidth-delay product with headroom.
-  maxInflightReplicationBatchesPerFollower: 4
+  # Maximum unacknowledged replication messages per follower.
+  maxInflightReplicationBatchesPerFollower: 16
+  # HTTP/2 flow-control window on the server-server path, announced by the
+  # Raft server and assumed by the replication channels. Sized to hold the
+  # full batch window in bytes: 32 batches x 4000 entries x ~60 B/entry
+  # ~= 7.5 MB, so 8 MiB covers it - otherwise the byte window, not the
+  # batch cap, limits pipelining. Explicit value disables gRPC BDP
+  # auto-tuning, making the window a fixed experiment parameter.
+  replicationFlowControlWindowBytes: 4194304
   # Followers may serve linearizable reads by fetching a confirmed read index
   # from the leader (batched rounds) and waiting for their own commit index
   # to catch up. Relieves leader concentration at the cost of an extra hop.
@@ -200,6 +214,9 @@ slas:
           - concern: 1
             latencyMs: 200
             profit: 2
+          - concern: 1
+            latencyMs: 500
+            profit: 1
   # A2: advertising-funded search/news feed. Results may be stale but the
   # reader must not see their own feed go backwards: session ordering, not
   # durability, so causal-local everywhere and the ladder varies only in the
@@ -487,8 +504,8 @@ workload:
   # headroom, not for the flash sale: normal sits at 0.5C and the sale day
   # exceeds C.
   phases:
-    - name: WarmUp          # baseline: price on its floor, upgrades free
-      durationSeconds: 60
+    - name: WarmUp          # warm up the cluster
+      durationSeconds: 30
       totalTPS: 200000      # 0.5C
       mix: normal
     - name: NormalDay       # baseline: price on its floor, upgrades free
@@ -521,5 +538,9 @@ workload:
       mix: payday
     - name: ReturnToNormal  # recovery, compared directly against the opening segment
       durationSeconds: 300
+      totalTPS: 200000      # 0.5C
+      mix: normal
+    - name: CoolDown        # cool down to handle shutdown delays
+      durationSeconds: 30
       totalTPS: 200000      # 0.5C
       mix: normal

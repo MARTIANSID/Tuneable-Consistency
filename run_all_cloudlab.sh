@@ -19,6 +19,16 @@
 #
 # Usage: ./run_all_cloudlab.sh <user@host> <ssh-key-path> [label] [config.yaml]
 #
+# --jar <path>: use this prebuilt fat jar instead of building one (the
+# caller vouches that it matches the working tree). The sweep passes the jar
+# it built and validated with, so concurrent sweeps never share a build
+# directory and every run executes the exact jar its config was validated
+# against.
+#
+# --seed <n>: override the config's top-level `seed:` (the base PRNG seed
+# for workload generation, routing exploration, and election jitter).
+# Without the flag the config's own value stands (42 in the repo configs).
+#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,11 +36,43 @@ SESSION="tuneable"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-HOST="${1:-}"
-KEY="${2:-}"
-LABEL="${3:-run}"
-CONFIG_PATH="${4:-$REPO_DIR/config_local.yaml}"
-[[ -n "$HOST" && -n "$KEY" ]] || die "usage: ./run_all_cloudlab.sh <user@host> <ssh-key-path> [label] [config.yaml]"
+JAR_ARG=""
+SEED_ARG=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --jar)
+            [[ $# -ge 2 ]] || die "--jar requires a path to a prebuilt fat jar"
+            JAR_ARG="$2"
+            shift 2
+            ;;
+        --jar=*)
+            JAR_ARG="${1#--jar=}"
+            shift
+            ;;
+        --seed)
+            [[ $# -ge 2 ]] || die "--seed requires an integer"
+            SEED_ARG="$2"
+            shift 2
+            ;;
+        --seed=*)
+            SEED_ARG="${1#--seed=}"
+            shift
+            ;;
+        --*)
+            die "unknown flag: $1"
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+HOST="${POSITIONAL[0]:-}"
+KEY="${POSITIONAL[1]:-}"
+LABEL="${POSITIONAL[2]:-run}"
+CONFIG_PATH="${POSITIONAL[3]:-$REPO_DIR/config_local.yaml}"
+[[ -n "$HOST" && -n "$KEY" ]] || die "usage: ./run_all_cloudlab.sh <user@host> <ssh-key-path> [label] [config.yaml] [--jar prebuilt-all.jar] [--seed n]"
 [[ -f "$KEY" ]] || die "ssh key not found: $KEY"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "label must match [A-Za-z0-9._-]+, got: $LABEL"
 CONFIG_PATH="$(cd "$(dirname "$CONFIG_PATH")" 2>/dev/null && pwd)/$(basename "$CONFIG_PATH")" || die "config file not found"
@@ -55,6 +97,16 @@ awk '
 ' "$CONFIG_PATH" > "$CLOUD_CONFIG"
 trap 'rm -f "$CLOUD_CONFIG" "${CLOUD_CONFIG%.yaml}"' EXIT
 
+# --seed overrides the config's top-level seed: line (without the flag the
+# config's own value - 42 in the repo configs - stands).
+if [[ -n "$SEED_ARG" ]]; then
+    [[ "$SEED_ARG" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer, got: $SEED_ARG"
+    [[ "$(grep -Ec '^seed: ' "$CLOUD_CONFIG")" == 1 ]] \
+        || die "expected exactly one top-level 'seed:' line in $CONFIG_PATH"
+    sed -E -i.bak "s/^seed: .*/seed: $SEED_ARG/" "$CLOUD_CONFIG" && rm -f "$CLOUD_CONFIG.bak"
+    grep -q "^seed: $SEED_ARG\$" "$CLOUD_CONFIG" || die "failed to rewrite seed: line"
+fi
+
 # One multiplexed ssh connection for everything (auth once, fast polling).
 CTRL_PATH="/tmp/tuneable-cloudlab-$$"
 SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30
@@ -67,11 +119,17 @@ JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/
 JAVA_FLAGS=()
 [[ "$JAVA_MAJOR" =~ ^[0-9]+$ && "$JAVA_MAJOR" -ge 24 ]] && JAVA_FLAGS+=(--sun-misc-unsafe-memory-access=allow)
 
-# --- Build the fat jar ---
-echo "Building fat jar (tests skipped)..."
-mvn -q clean package -Dbuild.dir=target-script -DskipTests
-JAR="$(ls target-script/*-all.jar 2>/dev/null | head -1)"
-[[ -n "$JAR" && -f "$JAR" ]] || die "fat jar not found in target-script/ (expected *-all.jar)"
+# --- Build the fat jar (or take the caller's prebuilt one) ---
+if [[ -n "$JAR_ARG" ]]; then
+    [[ -f "$JAR_ARG" ]] || die "prebuilt jar not found: $JAR_ARG"
+    JAR="$JAR_ARG"
+    echo "Using prebuilt jar: $JAR"
+else
+    echo "Building fat jar (tests skipped)..."
+    mvn -q clean package -Dbuild.dir=target-script -DskipTests
+    JAR="$(ls target-script/*-all.jar 2>/dev/null | head -1)"
+    [[ -n "$JAR" && -f "$JAR" ]] || die "fat jar not found in target-script/ (expected *-all.jar)"
+fi
 
 # --- Validate the rewritten config and read what the orchestration needs ---
 CONFIG_INFO="$(java ${JAVA_FLAGS[@]+"${JAVA_FLAGS[@]}"} -cp "$JAR" org.example.Utility.ExperimentConfig "$CLOUD_CONFIG")" \

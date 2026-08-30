@@ -111,6 +111,14 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     private static final int HEARTBEAT_INTERVAL_MS = 20;
     private static volatile int MAX_ENTRIES_PER_REPLICATION_BATCH = 4000;
     private static volatile int MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER = 4;
+    // HTTP/2 flow-control window for the server-server path, set on both the
+    // replication channels and the Raft server (the receiver grants the
+    // window, so the server side is the one that governs leader-to-follower
+    // data). Must hold maxInflight x maxEntries batches in serialized bytes,
+    // or the byte window - not the batch cap - limits pipelining. Setting it
+    // explicitly disables gRPC's BDP auto-tuning, which is intended: the
+    // window is then a fixed, reproducible experiment parameter.
+    private static volatile int REPLICATION_FLOW_CONTROL_WINDOW_BYTES = 1 << 20; // gRPC's own default
     private static final int ELECTION_TIMEOUT_BASE_MS = 5000;
     private static final int ELECTION_TIMEOUT_JITTER_MS = 1000;
 
@@ -125,6 +133,9 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     // preference also reapplies on timer resets, so a recovered preferred
     // node tends to win the leadership back at the next election it sees.
     private static volatile int PREFERRED_LEADER_ID = -1;
+    // Base PRNG seed (config `seed`); the only server-side randomness is the
+    // election-timeout jitter.
+    private static volatile long SEED = 42;
 
     private record InflightBatch(long sequence, int startIndex, int endExclusive,
             int term, long sendStartNanos) {
@@ -161,9 +172,16 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
     public static void applyConfig(org.example.Utility.ExperimentConfig config) {
         applyClusterSettings(config.cluster.serverHosts, config.cluster.serverBasePort);
         PREFERRED_LEADER_ID = config.cluster.preferredLeaderId;
+        SEED = config.seed;
         MAX_ENTRIES_PER_REPLICATION_BATCH = config.server.maxEntriesPerReplicationBatch;
         MAX_INFLIGHT_REPLICATION_BATCHES_PER_FOLLOWER =
                 config.server.maxInflightReplicationBatchesPerFollower;
+        REPLICATION_FLOW_CONTROL_WINDOW_BYTES = config.server.replicationFlowControlWindowBytes;
+    }
+
+    /** The Raft server must announce the same window the channels assume. */
+    public static int replicationFlowControlWindowBytes() {
+        return REPLICATION_FLOW_CONTROL_WINDOW_BYTES;
     }
 
     static void applyReplicationSettingsForTest(int maxEntriesPerBatch, int maxInflightBatches) {
@@ -223,7 +241,10 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
         if (serverId == PREFERRED_LEADER_ID) {
             return ELECTION_TIMEOUT_BASE_MS / 2;
         }
-        return ELECTION_TIMEOUT_BASE_MS + new Random().nextInt(ELECTION_TIMEOUT_JITTER_MS);
+        // Seeded per node: the jitter spread across nodes is deterministic
+        // for a given config seed (constant per node, which is all the
+        // jitter is for - separating the nodes' timeouts).
+        return ELECTION_TIMEOUT_BASE_MS + new Random(SEED + serverId).nextInt(ELECTION_TIMEOUT_JITTER_MS);
     }
 
     public void setUpStubs() {
@@ -241,6 +262,7 @@ public class ServerImpl extends RaftGrpc.RaftImplBase {
             if (i != serverId) {
                 io.grpc.netty.NettyChannelBuilder builder = io.grpc.netty.NettyChannelBuilder
                         .forAddress(SERVER_HOSTS.get(i), SERVER_BASE_PORT + (i + 1)).enableRetry()
+                        .flowControlWindow(REPLICATION_FLOW_CONTROL_WINDOW_BYTES)
                         .usePlaintext();
                 if (ownSource != null) {
                     builder.localSocketPicker(new io.grpc.netty.NettyChannelBuilder.LocalSocketPicker() {

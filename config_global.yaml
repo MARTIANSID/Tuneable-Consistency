@@ -68,7 +68,11 @@ server:
   # Maximum entries carried by one ordered message on a leader-to-follower
   # replication stream.
   maxEntriesPerReplicationBatch: 4000
-  # Maximum unacknowledged replication messages per follower.
+  # Maximum unacknowledged replication messages per follower. The window
+  # must cover the farthest follower's bandwidth-delay product or that
+  # follower is pipeline-capped below the write budget and lags unboundedly:
+  # Singapore at 230 ms RTT x 160k entries/s = 36,800 entries in flight;
+  # 32 x 4000-entry batches (128,000) covers it with ~3.5x headroom.
   maxInflightReplicationBatchesPerFollower: 16
   # HTTP/2 flow-control window on the server-server path, announced by the
   # Raft server and assumed by the replication channels. Sized to hold the
@@ -337,15 +341,17 @@ timedFailure:
 geo:
   enabled: true
   # One-way latency in ms added from server i to server j (row i, column j);
-  # numServers x numServers, the diagonal must be 0. Local topology
-  # (EXPERIMENT.md): five AZs in one region, every server pair at 0.3 ms, so
-  # a quorum operation costs about 1.2 ms round trip.
+  # numServers x numServers, the diagonal must be 0. Global topology
+  # (EXPERIMENT.md): five regions worldwide - A Virginia (leader), B Oregon,
+  # C Ireland, D Singapore, E Sao Paulo. Quorum is the leader plus Oregon
+  # and Ireland, about 80 ms round trip; replica lag runs 30 ms at Oregon to
+  # 115 ms at Singapore.
   interServerLatencyMs:
-    - [0,   0.3, 0.3, 0.3, 0.3]
-    - [0.3, 0,   0.3, 0.3, 0.3]
-    - [0.3, 0.3, 0,   0.3, 0.3]
-    - [0.3, 0.3, 0.3, 0,   0.3]
-    - [0.3, 0.3, 0.3, 0.3, 0  ]
+    - [0,   30,  40,  115, 60]
+    - [30,  0,   65,  85,  90]
+    - [40,  65,  0,   90,  95]
+    - [115, 85,  90,  0,   160]
+    - [60,  90,  95,  160, 0]
   # Client sites: every session belongs to one site (session s of every
   # application lives at site s mod #sites; sessionsPerApplication must
   # divide evenly). latencyMs is the one-way delay from the site to each
@@ -353,16 +359,18 @@ geo:
   # enabled, which is the address the per-site delay rules match on;
   # 127.0.0.1 stays rule-free for the driver's admin RPCs.
   #
-  # Local topology (EXPERIMENT.md): one site per AZ, 0.1 ms to its own node,
-  # 0.3 ms to the others. No remote site: inside one region every node is
-  # equidistant, so there is no placement choice to defend and no routing
-  # question to ask - the isolation config for capacity.
+  # Global topology (EXPERIMENT.md): one site colocated with each node
+  # (0.5 ms to it), plus Tokyo with no local replica - its nearest node
+  # (Singapore, 35 ms) is also the stalest (115 ms behind the leader), the
+  # same routing-quality probe as Phoenix at a larger scale, mirroring
+  # Pileus's China client.
   clientSites:
-    - { name: az0, latencyMs: [0.1, 0.3, 0.3, 0.3, 0.3] }
-    - { name: az1, latencyMs: [0.3, 0.1, 0.3, 0.3, 0.3] }
-    - { name: az2, latencyMs: [0.3, 0.3, 0.1, 0.3, 0.3] }
-    - { name: az3, latencyMs: [0.3, 0.3, 0.3, 0.1, 0.3] }
-    - { name: az4, latencyMs: [0.3, 0.3, 0.3, 0.3, 0.1] }
+    - { name: virginia,  latencyMs: [0.5, 30,  40,  115, 60] }
+    - { name: oregon,    latencyMs: [30,  0.5, 65,  85,  90] }
+    - { name: ireland,   latencyMs: [40,  65,  0.5, 90,  95] }
+    - { name: singapore, latencyMs: [115, 85,  90,  0.5, 160] }
+    - { name: saopaulo,  latencyMs: [60,  90,  95,  160, 0.5] }
+    - { name: tokyo,     latencyMs: [85,  50,  110, 35,  130] }
 
 # The simulated workload: keys, session population, and the phase schedule.
 workload:
@@ -383,8 +391,7 @@ workload:
   # Sessions persist across phases, so history carries forward. Only the
   # metrics ledger is shared. Sessions spread evenly across the client sites
   # (geo.clientSites), so this must be divisible by the number of sites:
-  # 60 = 12 per site across five sites (and 10 across six in the regional
-  # and global configs).
+  # 60 = 10 per site across the six global sites.
   sessionsPerApplication: 60
   # Threads injecting the workload. One thread caps at roughly 200-400k
   # requests/s (per-request cost on a single core); the configured TPS is
